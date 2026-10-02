@@ -1,0 +1,6 @@
+services:
+  app:
+    build: .
+    volumes:
+      - .:/app          # host project <-> /app in the container (must match pathMappings)
+    command: sleep infinity

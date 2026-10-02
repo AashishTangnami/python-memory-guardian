@@ -1,0 +1,12 @@
+{
+  // Option B: editor on the host, Python in the container (no Dev Containers).
+  // Rename to settings.json to use it. Run `docker compose up -d` first.
+  "pythonMemoryGuardian.container.execPrefix": ["docker", "compose", "exec", "-T", "app"],
+  "pythonMemoryGuardian.container.interpreter": "python",
+  "pythonMemoryGuardian.container.pathMappings": [
+    { "local": "${workspaceFolder}", "container": "/app" }
+  ],
+  // The language server itself runs on the host: use the Rust backend if the host
+  // has no Python 3.9+, otherwise the default Python backend is fine.
+  "pythonMemoryGuardian.backend": "rust"
+}

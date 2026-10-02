@@ -1,0 +1,14 @@
+{
+  // Option A (recommended): open this folder with "Dev Containers: Reopen in Container".
+  // The whole extension then runs inside the container - no path mappings needed.
+  "name": "containerized-app",
+  "dockerComposeFile": "../compose.yaml",
+  "service": "app",
+  "workspaceFolder": "/app",
+  "customizations": {
+    "vscode": {
+      "extensions": ["your-publisher-id.python-memory-guardian"],
+      "settings": { "pythonMemoryGuardian.interpreter": "/usr/local/bin/python" }
+    }
+  }
+}

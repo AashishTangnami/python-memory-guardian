@@ -1,0 +1,55 @@
+{
+  "_comment": "Shared by the Python and Rust servers. {placeholders} come from probe.py facts or the finding itself. The 'sized' variant is used only when every placeholder in it is known; otherwise 'neutral' is used. Sources: docs.python.org (whatsnew 3.12, c-api/memory, stdtypes, faq/programming, library/threading, library/asyncio-dev, howto/free-threading-python), peps.python.org (PEP 393, 623, 703, 779), CPython Misc/NEWS 2.5a1.",
+
+  "heap-inflation": {
+    "sized": "⚠️ Heap Inflation (CPython {py_version}): fetchall() and row-at-a-time cursor loops box every cell as its own PyObject — measured on your interpreter: {int_size} B per int, {str_empty} B for an empty str (+1 B per ASCII char), plus {ptr_size} B per tuple slot — and keep the whole result set alive at once. Stream columnar Arrow batches instead (ADBC/DuckDB fetch_record_batch(), turbodbc fetcharrowbatches()) or load with Polars pl.read_database / ConnectorX.",
+    "neutral": "⚠️ Heap Inflation: fetchall() and row-at-a-time cursor loops box every cell as its own PyObject (each with a refcount + type header) plus a pointer per tuple slot, and keep the whole result set alive at once. Stream columnar Arrow batches instead (ADBC/DuckDB fetch_record_batch(), turbodbc fetcharrowbatches()) or load with Polars pl.read_database / ConnectorX."
+  },
+  "pointer-chasing": {
+    "neutral": "⚠️ Pointer Chasing Hazard: Pandas object-dtype columns (strings, mixed types) are arrays of PyObject* pointers to scattered heap allocations, defeating CPU cache lines and prefetching. For large or wide data, prefer Polars (import polars as pl) and its lazy streaming API, e.g. pl.scan_ndjson(...).sink_parquet(...)."
+  },
+  "cyclic-reference": {
+    "neutral": "⚠️ Cyclic Reference Risk: bidirectional links (e.g. child.parent = self) form reference cycles. Their refcounts never reach 0, so they are not freed immediately; they wait for the cyclic garbage collector, which adds pause time when many are created in a loop. Use flat arrays/index-based structs, or weakref.ref/proxy for the back-pointer."
+  },
+
+  "ram-fragmentation.append": {
+    "sized": "⚠️ RAM Fragmentation (CPython {py_version}): appending a fresh dict/tuple/list per iteration creates one small heap object per row — measured on your interpreter: a 3-key dict ≈ {dict3} B, a 3-tuple ≈ {tuple3} B, before counting the values. These blocks come from {allocator}; an arena is handed back only when every block in it is unused, and even then the C library may keep the memory, so a few long-lived survivors can hold RSS high after the data is dropped. Accumulate per-column lists or array.array buffers, or build a polars.DataFrame / pyarrow.RecordBatch per batch.",
+    "neutral": "⚠️ RAM Fragmentation: appending a fresh dict/tuple/list per iteration creates one small heap object per row. CPython's small-object allocator hands an arena back only when every block in it is unused, and even then the C library may keep the memory, so a few long-lived survivors can hold RSS high after the data is dropped. Accumulate per-column lists or array.array buffers, or build a polars.DataFrame / pyarrow.RecordBatch per batch."
+  },
+  "ram-fragmentation.no-slots": {
+    "sized": "ℹ️ RAM Fragmentation (CPython {py_version}): class {name} has no __slots__ and is instantiated in a loop. Measured on your interpreter, a 3-attribute instance costs ≈ {instance3} B vs ≈ {slots3} B with __slots__ (a dict per row: ≈ {dict3} B), and each instance is a separate heap block. Add __slots__ (or @dataclass(slots=True), 3.10+); for millions of records store fields as columns (array.array, NumPy, Arrow, Polars) instead of objects.",
+    "neutral": "ℹ️ RAM Fragmentation: class {name} has no __slots__ and is instantiated in a loop. Each instance is a separate heap block carrying per-instance attribute storage; __slots__ (or @dataclass(slots=True), 3.10+) removes the instance __dict__. For millions of records store fields as columns (array.array, NumPy, Arrow, Polars) instead of objects."
+  },
+
+  "text-inflation.concat": {
+    "neutral": "⚠️ Text Inflation: `+=` on a str inside a loop. str is immutable, so each concatenation can create a new object and copy everything built so far; the Python docs warn the total cost is quadratic in the final length (CPython's occasional in-place resize is an implementation detail, not a guarantee). Collect pieces in a list and ''.join() them once, or write to io.StringIO."
+  },
+  "text-inflation.whole-file": {
+    "sized": "⚠️ Text Inflation (CPython {py_version}): {call} decodes the whole file into memory, then creates one str per line/token, each with its own header ({str_empty} B empty on your interpreter). Since PEP 393 a string's width follows its widest character: 1,000 ASCII chars take {str_ascii_1000} B, but a single emoji makes the same string {str_wide_1000} B. Iterate lazily (for line in f), process bytes, or use Polars/PyArrow CSV/NDJSON readers that parse into Arrow buffers.",
+    "neutral": "⚠️ Text Inflation: {call} decodes the whole file into memory, then creates one str object per line/token, each with its own header. Since PEP 393 a string's width follows its widest character (1, 2 or 4 bytes per char), so one non-Latin-1 character widens the whole string. Iterate lazily (for line in f), process bytes, or use Polars/PyArrow CSV/NDJSON readers that parse into Arrow buffers."
+  },
+
+  "memory-swell.list-arg": {
+    "neutral": "⚠️ Memory Swell: {call}([...]) materialises the entire list before {call} sees the first item (and any()/all() can no longer stop early, because every element was already computed). Drop the brackets to pass a generator expression, which yields one item at a time."
+  },
+  "memory-swell.list-copy": {
+    "neutral": "⚠️ Memory Swell: iterating {call} builds a full in-memory copy before the loop starts. Iterate the original iterable or a generator directly, unless you need a snapshot (e.g. you mutate the source inside the loop)."
+  },
+  "memory-swell.method-cache": {
+    "neutral": "⚠️ Memory Swell: an unbounded cache (@cache / lru_cache(maxsize=None)) on a method stores `self` in its keys, so every instance it ever sees stays alive until cache_clear(). Per the Python FAQ (\"How do I cache method calls?\"), use functools.cached_property for per-instance results or a bounded lru_cache(maxsize=N)."
+  },
+  "memory-swell.unbounded-cache": {
+    "neutral": "ℹ️ Memory Swell: @cache / lru_cache(maxsize=None) never evicts; every distinct argument tuple and its result live for the rest of the process. Fine for a small, fixed input domain; if the inputs come from data, set maxsize."
+  },
+
+  "single-thread-stall.async-blocking": {
+    "neutral": "⚠️ Single-Threaded Stall: {call} blocks inside `async def`. The event loop runs all tasks on one thread, so while this call blocks every other task and I/O operation waits. Use the async equivalent (asyncio.sleep, an async HTTP client, asyncio.create_subprocess_exec) or offload it with await asyncio.to_thread(...) (3.9+)."
+  },
+  "single-thread-stall.list-membership": {
+    "neutral": "⚠️ Single-Threaded Stall: `in {name}` scans the list element by element on every loop iteration (O(n) per check, O(n·m) overall, all on one core). Build a set or frozenset once before the loop for O(1) average lookups."
+  },
+  "single-thread-stall.cpu-thread": {
+    "sized": "ℹ️ Single-Threaded Stall (CPython {py_version}, GIL {gil_state}): {func}() runs a pure-Python loop over the data it is given and makes no I/O or GIL-releasing native calls, so these threads take turns on the GIL instead of running in parallel. Threads are the right tool for I/O-bound work (network, disk, database) and for native libraries that release the GIL (hashing, compression, NumPy, Polars, PyArrow). For CPU-bound Python use ProcessPoolExecutor, move the loop into Polars/NumPy, or run on a free-threaded build (3.13t/3.14t).",
+    "neutral": "ℹ️ Single-Threaded Stall: {func}() runs a pure-Python loop over the data it is given and makes no I/O or GIL-releasing native calls. On standard (GIL) CPython builds only one thread executes Python code at a time, so these threads take turns instead of running in parallel. Threads are the right tool for I/O-bound work and for native libraries that release the GIL. For CPU-bound Python use ProcessPoolExecutor, move the loop into Polars/NumPy, or run on a free-threaded build (3.13t/3.14t)."
+  }
+}

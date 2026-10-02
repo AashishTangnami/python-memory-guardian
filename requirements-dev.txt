@@ -1,0 +1,15 @@
+# Python Memory Guardian - tools for DEVELOPING the extension (never bundled).
+#   uv pip install --system -r requirements-dev.txt
+#
+# The runtime dependencies (requirements.txt) are not listed here on purpose: they are
+# vendored into server/libs/ by `npm run vendor:python`, and the tests load them from
+# there, exactly as the shipped extension does.
+
+# Debugging the Python language server (PMG_DEBUGPY=5678, see README section 3.4).
+debugpy==1.8.22
+
+# Inspecting tree-sitter node shapes when porting a rule to the Rust server
+# (README section 3.6). Keep the grammar version in step with rust-server/Cargo.toml
+# (tree-sitter-python = "0.23").
+tree-sitter==0.26.0
+tree-sitter-python==0.25.0

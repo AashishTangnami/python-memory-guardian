@@ -1,0 +1,202 @@
+{
+  "name": "python-memory-guardian",
+  "displayName": "Python Memory Guardian",
+  "description": "Static + runtime analysis for CPython: flags heap inflation, RAM fragmentation, text inflation, memory swell and single-threaded stalls as you type, and measures per-line time (Python / native / system) and memory with a built-in low-overhead profiler.",
+  "version": "1.3.0",
+  "publisher": "your-publisher-id",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Linters",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "python",
+    "memory",
+    "cpython",
+    "gil",
+    "polars",
+    "pyarrow",
+    "performance",
+    "profiler",
+    "memory-leak"
+  ],
+  "activationEvents": [
+    "onLanguage:python"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pythonMemoryGuardian.restart",
+        "title": "Python Memory Guardian: Restart Server"
+      },
+      {
+        "command": "pythonMemoryGuardian.profileFile",
+        "title": "Python Memory Guardian: Profile Current File",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "pythonMemoryGuardian.toggleProfileOverlay",
+        "title": "Python Memory Guardian: Toggle Profile Overlay"
+      },
+      {
+        "command": "pythonMemoryGuardian.clearProfile",
+        "title": "Python Memory Guardian: Clear Profile"
+      }
+    ],
+    "configuration": {
+      "title": "Python Memory Guardian",
+      "properties": {
+        "pythonMemoryGuardian.backend": {
+          "type": "string",
+          "enum": [
+            "python",
+            "rust"
+          ],
+          "default": "python",
+          "description": "Language server implementation. Both apply identical rules and messages."
+        },
+        "pythonMemoryGuardian.interpreter": {
+          "type": "string",
+          "default": "",
+          "description": "Interpreter your code runs on. It is probed at startup (object sizes, GIL state, allocator) so diagnostics quote numbers for that exact Python; the Python backend also runs on it (3.9+). Empty = python3/python on PATH."
+        },
+        "pythonMemoryGuardian.profile.memoryMode": {
+          "type": "string",
+          "enum": [
+            "fast",
+            "precise",
+            "off"
+          ],
+          "default": "fast",
+          "enumDescriptions": [
+            "Time split + RSS growth per line, ~5% overhead",
+            "tracemalloc: per-line allocations, held memory, leaks; ~2-5x slower",
+            "Time only"
+          ],
+          "description": "Default memory mode shown first when profiling."
+        },
+        "pythonMemoryGuardian.profile.hotShare": {
+          "type": "number",
+          "default": 0.05,
+          "minimum": 0,
+          "maximum": 1,
+          "description": "A line using at least this fraction of runtime is 'hot': its static diagnostics are raised one severity level."
+        },
+        "pythonMemoryGuardian.profile.hotMB": {
+          "type": "number",
+          "default": 50,
+          "minimum": 0,
+          "description": "A line allocating at least this many MB is 'hot'."
+        },
+        "pythonMemoryGuardian.container.execPrefix": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "**Only for plain Docker/Compose with the editor on the host.** Command prefix that runs a program inside your container, e.g. `[\"docker\", \"compose\", \"exec\", \"-T\", \"app\"]`. When set, the interpreter probe and the profiler run inside the container. Leave empty for Dev Containers, Codespaces, WSL and Remote-SSH."
+        },
+        "pythonMemoryGuardian.container.interpreter": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python executable inside the container (container mode only)."
+        },
+        "pythonMemoryGuardian.container.pathMappings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "properties": {
+              "local": {
+                "type": "string"
+              },
+              "container": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "local",
+              "container"
+            ]
+          },
+          "markdownDescription": "Host \u2194 container path pairs for container mode, e.g. `[{\"local\": \"${workspaceFolder}\", \"container\": \"/app\"}]` (the folder your compose file bind-mounts)."
+        },
+        "pythonMemoryGuardian.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Log LSP traffic between VS Code and the language server to the 'Python Memory Guardian' output channel."
+        },
+        "pythonMemoryGuardian.profile.frames": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 64,
+          "markdownDescription": "Precise mode: traceback depth `tracemalloc` records per allocation. Higher values tie more memory allocated inside libraries back to your lines, but slow profiling (measured on `import pandas`: 2 frames 1.3 s, 8 frames 2.9 s, 32 frames 7.5 s)."
+        }
+      }
+    },
+    "menus": {
+      "editor/title": [
+        {
+          "command": "pythonMemoryGuardian.profileFile",
+          "when": "resourceLangId == python",
+          "group": "navigation"
+        }
+      ]
+    },
+    "taskDefinitions": [
+      {
+        "type": "pmg-profile",
+        "properties": {}
+      }
+    ]
+  },
+  "scripts": {
+    "vendor:python": "node -e \"require('fs').rmSync('server/libs',{recursive:true,force:true})\" && uv pip install --python-version 3.9 --target server/libs --no-deps --only-binary=:all: -r requirements.txt",
+    "build:rust": "cargo build --release --manifest-path rust-server/Cargo.toml",
+    "compile": "tsc -p ./ && npm run bundle",
+    "watch": "tsc -watch -p ./",
+    "test:parity": "node scripts/py.js test-fixtures/parity_test.py",
+    "vscode:prepublish": "npm run vendor:python && npm run compile",
+    "package": "vsce package",
+    "test": "npm run compile && npm run test:parity && npm run test:runtime",
+    "test:runtime": "node scripts/py.js test-fixtures/profiler_test.py && node test-fixtures/test_model.js && node test-fixtures/test_container.js",
+    "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node18 --sourcemap"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.82.0",
+    "@vscode/vsce": "^3.2.0",
+    "typescript": "^5.4.0",
+    "esbuild": "^0.25.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/python-memory-guardian.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/python-memory-guardian/issues"
+  },
+  "homepage": "https://github.com/your-org/python-memory-guardian#readme",
+  "icon": "images/icon.png",
+  "galleryBanner": {
+    "color": "#1b2b3a",
+    "theme": "dark"
+  },
+  "pricing": "Free"
+}
