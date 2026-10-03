@@ -1,6 +1,6 @@
 const assert = require('assert');
 const m = require('../out/profileModel');
-const { diagnose, callTree } = require('../out/reportModel');
+const { diagnose, callTree, overview } = require('../out/reportModel');
 const { remapProfileKeys, toLocal } = require('../out/containerPaths');
 const { reportHtml } = require('../out/reportWebview');
 const file = '/app/work.py';
@@ -34,6 +34,23 @@ assert(d[1].recommendations.some(r => r.includes('TTL')));
 assert(!d[1].evidence.some(r => r.includes('trailing')));
 assert(d[2].recommendations[0].includes('released'));
 assert.deepStrictEqual(diagnose({ ...p, memory_mode: 'fast' }), []);
+const visual = { ...p, cpu_s: 2.4, samples: 30, rss_kind: 'current', rss_start_mb: 10, rss_end_mb: 30,
+  timeline: [[0, 0, 10], [1, 12, 24], [3, 20, 30]],
+  files: { [file]: { ...p.files[file], 2: { ...p.files[file][2], time_s: 2, share: .5 } } } };
+assert(m.parseProfile(JSON.stringify(visual)), 'profile timeline is accepted');
+const summary = overview(visual);
+assert.deepStrictEqual(summary.timeline, visual.timeline);
+assert.strictEqual(summary.cpuS, 2.4);
+assert.strictEqual(summary.rssKind, 'current');
+assert.strictEqual(summary.topLines[0].line, 2, 'hotspots sort by sampled time');
+assert.strictEqual(summary.topLines[0].memory, '12.0 MB held');
+const longTimeline = Array.from({ length: 1001 }, (_, i) => [i / 10, i / 100, 10 + i / 100]);
+const bounded = overview({ ...visual, timeline: longTimeline }).timeline;
+assert(bounded.length <= 300 && bounded.at(-1)[0] === 100, 'chart payload remains bounded and keeps the final sample');
+assert.strictEqual(overview({ ...visual, memory_mode: 'off' }).topLines[0].memory, '');
+assert.strictEqual(m.parseProfile(JSON.stringify({ ...visual, timeline: [[0, null, 10]] })), undefined);
+assert.strictEqual(m.parseProfile(JSON.stringify({ ...visual, timeline: [[1, 1, 10], [0, 2, 11]] })), undefined);
+assert.strictEqual(m.parseProfile(JSON.stringify({ ...visual, rss_kind: 'unknown' })), undefined);
 const idx = new m.ProfileIndex(p);
 assert(idx.insideSampledFunction(file, 10), 'unsampled function tail remains inside sampled function');
 assert(!idx.insideSampledFunction(file, 11));
@@ -60,6 +77,7 @@ for (const bad of [{ schema: 3, files: {} }, { ...p, wall_s: 'oops' }, { ...p, s
 }
 const html = reportHtml('abcdef');
 assert(html.includes("default-src 'none'"));
+assert(html.includes('id="overviewTab"') && html.includes('id="memoryTimeline"') && html.includes('id="hotspots"'));
 assert(!html.includes('innerHTML'), 'profile strings must not be interpreted as HTML');
 new (require('vm').Script)(html.match(/<script nonce="abcdef">([\s\S]*?)<\/script>/)[1]);
-console.log('PASS memory diagnoses, recommendations, call-path accounting, recursion, filters, report validation, and webview script syntax');
+console.log('PASS overview data, memory diagnoses, call-path accounting, filters, report validation, and webview script syntax');

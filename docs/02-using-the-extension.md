@@ -26,13 +26,13 @@ Run **Python Memory Guardian: Profile Current File** or use the editor's pulse i
 |---|---|---|
 | **fast** | Sampled time, call stacks, and RSS growth | Lower overhead; RSS cannot identify individual retained objects |
 | **precise** | Per-line allocations, retained memory, suspected growth, and holder evidence | Tracing can slow allocation-heavy programs |
-| **time only** | Sampled time and call stacks | No memory measurements |
+| **time only** | Sampled time and call stacks | No per-line memory display; the profiler may still record process RSS fields |
 
 Use **fast** for timing comparisons and **precise** when investigating who retains memory. The profiler reports evidence and likely causes; memory growth alone does not establish a leak. You can stop a run with **Ctrl+C** and inspect the partial profile if one was saved.
 
 ## Read the results
 
-The **Memory Guardian Report** separates suspected growing retention, memory held at the end, and memory released during the run. It also shows call stacks and function totals. Inline labels mark measured time, allocations or RSS growth, and suspected holders. Open the report again with **Python Memory Guardian: Open Profile Report** or the status bar item.
+The **Memory Guardian Report** opens on **Overview**, with run totals, a chart of process RSS over time (plus traced Python memory in precise mode), and bars for the top sampled lines. Click a line to open its source when the file still matches the profile. The chart is hidden in time-only mode. A high RSS value at exit does not by itself mean objects are still held; compare it with the **Memory diagnosis** tab's exit snapshots. That tab separates suspected growing retention, memory held at the end, and memory released during the run. **Stack Explorer** shows sampled call stacks and function totals. Inline labels mark measured time, allocations or RSS growth, and suspected holders. Open the loaded report again with **Python Memory Guardian: Open Profile Report** or the status bar item. To view a saved profile JSON from any location, run **Python Memory Guardian: Open Saved Profile Report** and select the file.
 
 Profiling can change a static diagnostic's severity: measured hot lines become more prominent, while eligible cold lines become hints. After a source edit, the old profile is marked stale so measurements are not attached to the wrong lines. Re-run the profile after changing code.
 

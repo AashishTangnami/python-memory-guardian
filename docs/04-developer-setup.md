@@ -6,7 +6,7 @@ This guide is for working on the extension, its Python and Rust language servers
 
 | Tool | Purpose |
 |---|---|
-| Node.js 20+ and npm | TypeScript build, bundle, tests, packaging |
+| Node.js 22+ and npm | TypeScript build, bundle, tests, packaging (`@vscode/vsce@4.0.0` requires Node 22+) |
 | Python 3.9+ | Python server, profiler, tests |
 | `uv` | Vendor the pinned Python server dependencies |
 | Rust 1.80+ | Optional Rust server and full backend parity |
@@ -23,6 +23,7 @@ npm run compile
 ```
 
 `vendor:python` installs the pinned runtime packages into `server/libs/`. `compile` type-checks the TypeScript and bundles `dist/extension.js`. The packaging command also invokes these steps through `vscode:prepublish`.
+Keep `@types/vscode` pinned to the minimum supported `engines.vscode` minor version in `package.json`; `vsce package` validates this match. Upgrade the editor minimum only when the extension uses an API that requires it.
 
 To work on the Rust backend, build it separately:
 

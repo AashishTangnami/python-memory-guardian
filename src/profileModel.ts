@@ -31,7 +31,11 @@ export interface StackSample { thread: string; thread_name: string; frames: numb
 
 export interface Profile {
   schema: number; script: string; python: string; gil_split: boolean;
-  wall_s: number; cpu_s: number; memory_mode: "fast" | "precise" | "off";
+  wall_s: number; cpu_s?: number; memory_mode: "fast" | "precise" | "off";
+  samples?: number; interval_s?: number; snapshots?: number;
+  rss_kind?: "current" | "peak" | null;
+  rss_start_mb?: number | null; rss_end_mb?: number | null;
+  timeline?: [number, number, number][]; // elapsed seconds, traced MB, process RSS MB
   peak_traced_mb: number | null; rss_peak_mb: number; native_untraced_mb: number | null;
   /** precise mode: MB held at the peak whose tracebacks never reached the user's code. */
   unattributed_peak_mb?: number | null; frames?: number | null;
@@ -71,6 +75,13 @@ export function parseProfile(json: string): Profile | undefined {
       || !number(p.wall_s) || !['fast', 'precise', 'off'].includes(p.memory_mode)
       || !record(p.files) || !record(p.functions ?? {}) || !record(p.file_hashes ?? {})) return undefined;
     if (![p.peak_traced_mb, p.rss_peak_mb, p.unattributed_peak_mb].every(v => v == null || number(v))) return undefined;
+    if (!['cpu_s', 'samples', 'interval_s', 'snapshots', 'rss_start_mb', 'rss_end_mb']
+      .every(k => p[k] == null || number(p[k]))) return undefined;
+    if (p.rss_kind != null && !['current', 'peak'].includes(p.rss_kind)) return undefined;
+    if (p.timeline != null && (!Array.isArray(p.timeline) || p.timeline.length > 10000
+      || !p.timeline.every((point: unknown) => Array.isArray(point) && point.length === 3
+        && point.every(number))
+      || p.timeline.some((point: [number, number, number], i: number) => i > 0 && point[0] < p.timeline[i - 1][0]))) return undefined;
     if (!Object.values(p.file_hashes ?? {}).every(v => typeof v === 'string')) return undefined;
     for (const entries of Object.values(p.files)) {
       if (!record(entries)) return undefined;

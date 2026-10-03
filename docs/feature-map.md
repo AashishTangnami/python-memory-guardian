@@ -15,7 +15,7 @@ flowchart TD
     Runtime -->|writes profile JSON| Profile["Validated profile"]
     Profile -->|renders| Inline["Line and function annotations"]
     Profile -->|adjusts fresh findings| Problems
-    Profile -->|renders| Report["Memory diagnosis and Stack Explorer"]
+    Profile -->|renders| Report["Overview charts, memory diagnosis and Stack Explorer"]
     Profile -->|publishes suspected leaks| Problems
 ```
 
@@ -132,7 +132,7 @@ flowchart TD
     Main -->|script exits or raises; finalizes partial run| JSON
 ```
 
-`--memory fast` attributes sampled RSS growth; `precise` adds `tracemalloc` allocation, held-memory and retention evidence plus a bounded holder search; `off` records time without memory attribution. Timing is sampled per thread and classified as Python, native, waiting or unsplit where clocks/GIL signals permit; these are estimates at Python lines, not native stack captures. Optional `--monitoring lines` uses Python 3.12+ `sys.monitoring` for execution counts and reports why it could not activate. The CLI also accepts `--root`, `--out`, `--interval`, `--frames` and target-script arguments. The profiler writes JSON after normal exit, `SystemExit`, `KeyboardInterrupt` or an exception; a failure before/during profiler setup or report writing can prevent output.
+`--memory fast` attributes sampled RSS growth; `precise` adds `tracemalloc` allocation, held-memory and retention evidence plus a bounded holder search; `off` omits memory from line labels and heat while the profiler still records process RSS fields. Timing is sampled per thread and classified as Python, native, waiting or unsplit where clocks/GIL signals permit; these are estimates at Python lines, not native stack captures. Optional `--monitoring lines` uses Python 3.12+ `sys.monitoring` for execution counts and reports why it could not activate. The CLI also accepts `--root`, `--out`, `--interval`, `--frames` and target-script arguments. Current profiles append a post-script RSS/traced-memory sample and retain it when bounding the timeline to 300 points. The profiler writes JSON after normal exit, `SystemExit`, `KeyboardInterrupt` or an exception; a failure before/during profiler setup or report writing can prevent output.
 
 ### 2.4 Profile loading, freshness, annotations, prioritization and report
 
@@ -147,6 +147,7 @@ flowchart TD
       Fresh["Compare file_hashes with current editor text"]
       Feedback["render; adjust; refreshDiagnostics"]
       Report["GuardianReport and reportWebview"]
+      Models["reportModel: overview, diagnose, callTree"]
     end
     Load -->|validates schema 2 or 3| Parse
     Load -->|invalid profile shows warning| Invalid["No new profile loaded"]
@@ -154,15 +155,18 @@ flowchart TD
     Fresh -->|fresh: renders and adjusts diagnostics| Feedback
     Fresh -->|stale: hides editor evidence; shows stale status| Stale["Re-run cue"]
     Feedback -->|renders| Editor["Line/function decorations and Problems"]
-    Parse -->|calls diagnose and callTree| Report
-    Report -->|renders| Webview["Memory cards and interactive time Stack Explorer"]
+    Parse -->|passes validated profile| Report
+    Report -->|calls| Models
+    Models -->|returns view data| Report
+    Report -->|posts data to| Webview["Overview timeline and hotspots; memory cards; Stack Explorer"]
     Edit["Edit Python document"] -->|calls freshness refresh| Fresh
     Open["Open Profile Report command or status click"] -->|calls| Report
+    Saved["Open Saved Profile Report command"] -->|selects JSON and calls load| Load
     Toggle["Toggle overlay command"] -->|calls| Feedback
     Clear["Clear Profile command or file delete"] -->|clears| Feedback
 ```
 
-Freshness requires a verified SHA-1 of normalized source text and a matching mapped file path. Edits clear current runtime warnings and decorations for stale files and restore unadjusted static diagnostics. The overlay toggle controls decorations; `render` still publishes runtime leak warnings. Hot static findings rise one severity level; cold non-errors become hints; sampled-function gaps and lines with execution events stay unknown. This is an **inferred runtime prioritization**, not a new server finding. Only precise profiles produce memory diagnosis cards (`growing`, `retained`, `released`) and recommendations. The Stack Explorer aggregates sampled Python call stacks by metric and thread, including library frames; missing stacks leave it empty. Source navigation from the webview requires a report-listed location and a fresh file hash. Opening a report without a loaded profile shows an information message. The report may display stale historical measurements with a warning, while editor evidence is gated on freshness.
+Freshness requires a verified SHA-1 of normalized source text and a matching mapped file path. Edits clear current runtime warnings and decorations for stale files and restore unadjusted static diagnostics. The overlay toggle controls decorations; `render` still publishes runtime leak warnings. Hot static findings rise one severity level; cold non-errors become hints; sampled-function gaps and lines with execution events stay unknown. This is an **inferred runtime prioritization**, not a new server finding. The report Overview renders bounded process RSS and traced-memory timeline samples plus top sampled lines; time-only mode hides the memory chart. Only precise profiles produce memory diagnosis cards (`growing`, `retained`, `released`) and recommendations. The Stack Explorer aggregates sampled Python call stacks by metric and thread, including library frames; missing stacks leave it empty. Source navigation from the webview requires a report-listed location and a fresh file hash. Opening a report without a loaded profile shows an information message. The report may display stale historical measurements with a warning, while editor evidence is gated on freshness.
 
 ### 2.5 Container path and execution branch
 
@@ -266,6 +270,7 @@ flowchart TD
     Sample -->|precise mode takes snapshots| Snapshot["Profiler._snapshot"]
     Snapshot -->|supplies held-memory series| Report
     Main -->|finish or atexit calls| Stop["Profiler.stop"]
+    Stop -->|supplies exit RSS and traced-memory sample| Report
     Stop -->|precise mode checks leaks and possible holders| Leak["Profiler._leaks / _find_holders"]
     Leak -->|supplies leak_runs and held_by| Report
     Report -->|writes schema 3 via main.finish| PROFILE["PROFILE: .pmg/profile.json"]
@@ -280,6 +285,7 @@ Evidence: [task setup, modes and argv](../src/profileView.ts#L77), [CLI parsing 
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
 flowchart TD
     PROFILE["PROFILE: .pmg/profile.json"] -->|watcher reads file| Load["src/profileView.ts: ProfileView.load"]
+    Saved["Saved schema 2/3 JSON"] -->|selected by openSavedReport; read by load| Load
     Load -->|calls validator| Parse["src/profileModel.ts: parseProfile"]
     Parse -->|constructs directly for local profile| Index["src/profileModel.ts: ProfileIndex"]
     PATHS["PATHS: container path contract"] -->|calls toLocal for profile keys| Remap["src/containerPaths.ts: remapProfileKeys"]
@@ -293,7 +299,7 @@ flowchart TD
     State -->|stale result makes adjust return raw findings| Stale["Unadjusted static diagnostics"]
 ```
 
-Evidence: [file watcher, `load`, remap, prior-index behavior and refresh](../src/profileView.ts#L44), [schema validator](../src/profileModel.ts#L63), [path normalization and freshness](../src/profileModel.ts#L130), [container key rewrite](../src/containerPaths.ts#L72), [profiler source identity check and decoded-text hash](../server/pmg_profile.py#L266), [editor hash implementation](../src/profileModel.ts#L59), and [report navigation freshness check](../src/reportView.ts#L61). The Python producer hashes unchanged decoded source text after CRLF normalization; the TypeScript consumer hashes current editor text the same way. This duplicated cross-process algorithm is necessary for the freshness gate. If the hash is absent or mismatched, editor evidence is withheld. `load` warns on malformed JSON and returns before replacing its previous `index`; the old report remains loaded, a concrete failure propagation rather than a claim that the schema is generally harmful.
+Evidence: [file watcher, saved-report picker, `load`, remap, prior-index behavior and refresh](../src/profileView.ts#L44), [schema validator](../src/profileModel.ts#L63), [path normalization and freshness](../src/profileModel.ts#L130), [container key rewrite](../src/containerPaths.ts#L72), [profiler source identity check and decoded-text hash](../server/pmg_profile.py#L266), [editor hash implementation](../src/profileModel.ts#L59), and [report navigation freshness check](../src/reportView.ts#L61). The Python producer hashes unchanged decoded source text after CRLF normalization; the TypeScript consumer hashes current editor text the same way. This duplicated cross-process algorithm is necessary for the freshness gate. If the hash is absent or mismatched, editor evidence is withheld. A selected unreadable file or malformed JSON warns; `load` returns before replacing its previous `index`, so the old report remains loaded. This is a concrete failure propagation rather than a claim that the schema is generally harmful.
 
 ### 3.5 Editor annotations, runtime warnings and static priority
 
@@ -328,13 +334,18 @@ Evidence: [LSP middleware uses `ProfileView.adjust`](../src/extension.ts#L153), 
 flowchart TD
     PROFILE["PROFILE: indexed profile"] -->|passed on load| Update["GuardianReport.update / refresh"]
     SOURCE["SOURCE: file_hashes and current text"] -->|checked by| Fresh["GuardianReport.fresh"]
+    Update -->|calls for timeline and top lines| Overview["reportModel.ts: overview"]
     Update -->|calls for precise profile| Diagnose["reportModel.ts: diagnose / recommendations"]
     Update -->|calls for stack samples| Tree["reportModel.ts: callTree"]
+    Overview -->|returns bounded chart and hotspot data| Update
     Diagnose -->|returns cards to refresh| Update
     Tree -->|returns weighted tree to refresh| Update
     WEBVIEW["WEBVIEW: postMessage report/filter/open"]
     Html["reportWebview.ts: reportHtml"] -->|renders HTML in| Panel["GuardianReport.show panel"]
     Command["ProfileView.showReport / status command"] -->|calls show| Panel
+    Saved["ProfileView.openSavedReport command"] -->|selects JSON and calls load| Load["ProfileView.load"]
+    Load -->|updates indexed profile| Update
+    Load -->|calls show after valid load| Panel
     Auto["ProfileView.load: showNextReport"] -->|calls show after valid load| Panel
     Update -->|posts report payload| WEBVIEW
     WEBVIEW -->|filter message selects metric/thread| Update
@@ -344,7 +355,7 @@ flowchart TD
     Fresh -->|stale or absent source warns| Reject["Navigation warning"]
 ```
 
-Evidence: [report/status command registration](../src/profileView.ts#L59), [auto-open after valid profile load](../src/profileView.ts#L145), [`GuardianReport.update`, `show`, message validation and navigation](../src/reportView.ts#L14), [`fresh` and `refresh` payload](../src/reportView.ts#L61), [precise retention diagnosis and recommendations](../src/reportModel.ts#L10), [sampled call-tree aggregation](../src/reportModel.ts#L62), and [webview filter/open messages and rendering](../src/reportWebview.ts#L26). The report uses the same profile and freshness contract as editor feedback, but it can show stale historical measurements with a warning; navigation still requires verified source. The webview messages form a separate two-way contract: its `filter`/`open` payloads and the extension's validation must change together.
+Evidence: [report/status command registration](../src/profileView.ts#L59), [auto-open after valid profile load](../src/profileView.ts#L145), [`GuardianReport.update`, `show`, message validation and navigation](../src/reportView.ts#L14), [`fresh` and `refresh` payload](../src/reportView.ts#L70), [overview projection and payload bound](../src/reportModel.ts#L17), [precise retention diagnosis and recommendations](../src/reportModel.ts#L49), [sampled call-tree aggregation](../src/reportModel.ts#L101), and [webview chart, hotspot, filter and source rendering](../src/reportWebview.ts#L36). The report uses the same profile and freshness contract as editor feedback, but it can show stale historical measurements with a warning; navigation still requires verified source. The webview messages form a separate two-way contract: its report overview and `filter`/`open` payloads and the extension's validation must change together. The timeline is a persisted `PROFILE` field produced by [the sampler and exit path](../server/pmg_profile.py#L571), bounded in [`Profiler.report`](../server/pmg_profile.py#L834), and validated by [`profileModel.parseProfile`](../src/profileModel.ts#L63); adding or changing a timeline field requires coordinated changes in those producers and consumers.
 
 ### 3.7 Container execution and path translation
 
@@ -410,11 +421,11 @@ The local TypeScript source imports point from `extension.ts` to `profileView.ts
 | Add or alter a static rule | [Python `Visitor`/`analyze`](../server/rules.py#L351), [Rust `Visitor`/`analyze`](../rust-server/src/main.rs#L717), [message keys/text](../server/messages.json), [parity fixtures](../test-fixtures/parity_test.py) | Coordinated edits are required because the two implementations intentionally target equivalent diagnostics; drift is possible and parity tests are the check. |
 | Edit diagnostic text only | [Python loads JSON at import](../server/rules.py#L35); [Rust embeds it with `include_str!`](../rust-server/src/main.rs#L24); [Rust build script](../package.json#L176) | Intentional shared wording with different load times; rebuild Rust before comparing or packaging. |
 | Change interpreter fact names or meaning | [probe producer](../server/probe.py#L51), [initialization bridge](../src/extension.ts#L146), [Python initialization/rendering](../server/guardian_server.py#L29), [Rust initialization/rendering](../rust-server/src/main.rs#L1176), [message placeholders](../server/messages.json) | Cross-process contract. Missing facts select neutral wording; GIL-state facts also affect CPU-thread findings. |
-| Change profile fields, mode names or schema | [Python `Profiler.report`](../server/pmg_profile.py#L743), [TypeScript `Profile`/`parseProfile`](../src/profileModel.ts#L32), [editor consumer](../src/profileView.ts#L131), [report consumers](../src/reportModel.ts#L10) | Cross-process persisted contract. Validator rejection prevents the new profile from loading; backward compatibility with schema 2 is explicit. |
+| Change profile fields, mode names or schema | [Python `Profiler.report`](../server/pmg_profile.py#L743), [TypeScript `Profile`/`parseProfile`](../src/profileModel.ts#L32), [editor consumer](../src/profileView.ts#L131), [report consumers](../src/reportModel.ts#L17) | Cross-process persisted contract. `timeline` and `rss_kind` also feed the report Overview. Validator rejection prevents the new profile from loading; backward compatibility with schema 2 is explicit. |
 | Change runtime leak criteria or advice | [profiler `_leaks`](../server/pmg_profile.py#L665) and [`_find_holders`](../server/pmg_profile.py#L597), [runtime `leakMessage`](../src/profileModel.ts#L278), [report `diagnose`/`recommendations`](../src/reportModel.ts#L10) | Coordinated semantics across produced `leak_runs`, editor warning text and report cards. These are separate consumers, not one shared message formatter. |
 | Change file identity or hash normalization | [profiler `_remember_sources`/`_text_hash`](../server/pmg_profile.py#L270), [extension `textHash`/`ProfileIndex.state`](../src/profileModel.ts#L59), [report `fresh`](../src/reportView.ts#L61) | Duplicated algorithm is intentional verification. A mismatch suppresses editor evidence and report navigation. |
 | Change container paths or profile path fields | [mapping and remap functions](../src/containerPaths.ts#L24), [probe branch](../src/extension.ts#L77), [task/load branches](../src/profileView.ts#L99), [profiler report keys](../server/pmg_profile.py#L855) | Intentional shared path contract. A missing outbound mapping errors; a missing inbound mapping prevents freshness matches. |
-| Change webview payloads | [report postMessage and handlers](../src/reportView.ts#L29), [webview messages and rendering](../src/reportWebview.ts#L26) | Coordinated two-way message contract; source navigation is validated again after the message crosses the boundary. |
+| Change webview payloads | [report postMessage and handlers](../src/reportView.ts#L29), [webview overview, filters and rendering](../src/reportWebview.ts#L36) | Coordinated two-way message contract; source navigation is validated again after the message crosses the boundary. |
 | Change command IDs, settings or packaging | [manifest](../package.json#L26), [extension registrations and server options](../src/extension.ts#L112), [profile registrations/task](../src/profileView.ts#L59), [vendored import path](../server/_vendor.py#L14) | Manifest and consumers must agree. `serverOptions` expects `bin/guardian-server`; `build:rust` creates `rust-server/target/release/guardian-server`, so packaging must place the binary at the expected path. |
 | Invalid profile or failed server start | [`ProfileView.load` returns before replacing `index`](../src/profileView.ts#L131); [`startClient` catches and reports startup error](../src/extension.ts#L163) | These failures propagate differently: invalid profile retains prior report state, while failed server start removes static analysis. Neither alone proves harmful coupling between otherwise shared modules. |
 | Profiler task fails before a valid profile loads | [`runProfiler` sets `showNextReport` before task execution](../src/profileView.ts#L123); [invalid `load` returns before clearing it](../src/profileView.ts#L138); [next valid `load` clears it and opens the report](../src/profileView.ts#L145) | A later valid watcher event can auto-open the report after the original task failed. This is a specific UI lifecycle coupling, evidenced by the flag's set/clear paths, rather than a general claim about shared modules. |
@@ -433,9 +444,10 @@ Paths are relative to the repository root. Tests listed are relevant checks, not
 | Runtime profiler task and standalone CLI | `pythonMemoryGuardian.profileFile`; direct `pmg_profile.py` invocation | `src/profileView.ts` `ProfileView.runProfiler`; `server/pmg_profile.py` `main`, `Profiler.start`, `Profiler._run`, `Profiler.stop`, `Profiler.report` | VS Code task output and schema-3 `.pmg/profile.json` | Saved script, target interpreter, profile settings, standard-library clocks/RSS readers | `test-fixtures/profiler_test.py`, `test-fixtures/profiler_regression_test.py` |
 | Precise retention and holder evidence | Profile with `--memory precise` | `server/pmg_profile.py` `Profiler._snapshot`, `Profiler._leaks`, `Profiler._find_holders`, `Profiler.report`; `src/reportModel.ts` `diagnose` | Retention trend, suspected leak data, memory cards and recommendations | `tracemalloc`, profile JSON, source metadata | `test-fixtures/profiler_test.py`, `test-fixtures/profiler_regression_test.py`, `test-fixtures/test_report.js` |
 | Optional line execution coverage | `pythonMemoryGuardian.profile.monitoring=lines` or CLI `--monitoring lines` | `server/pmg_profile.py` `Profiler._enable_monitoring`, `Profiler._on_line_event`, `Profiler.report` | Line-event counts and activation/failure status in profile | Python 3.12+ `sys.monitoring`, profile schema | `test-fixtures/profiler_regression_test.py`, `test-fixtures/test_model.js` |
-| Profile discovery, validation and freshness | `.pmg/profile.json` create/change/delete, extension startup, source edit | `src/profileView.ts` `ProfileView.load`, `clear`; `src/profileModel.ts` `parseProfile`, `ProfileIndex.state`, `textHash` | Loaded/cleared profile, stale status, warning on invalid JSON | Profile schema 2/3, `file_hashes`, normalized paths | `test-fixtures/test_model.js`, `test-fixtures/test_report.js`, `test-fixtures/profiler_regression_test.py` |
+| Profile discovery, validation and freshness | `.pmg/profile.json` create/change/delete, extension startup, saved JSON selection, source edit | `src/profileView.ts` `ProfileView.openSavedReport`, `load`, `clear`; `src/profileModel.ts` `parseProfile`, `ProfileIndex.state`, `textHash` | Loaded/cleared profile, stale status, warning on invalid JSON | Profile schema 2/3, `file_hashes`, normalized paths | `test-fixtures/test_model.js`, `test-fixtures/test_report.js`, `test-fixtures/profiler_regression_test.py` |
 | Inline annotations, runtime warnings and diagnostic prioritization | Fresh profile; editor visibility/change; `pythonMemoryGuardian.toggleProfileOverlay` | `src/profileView.ts` `ProfileView.render`, `adjust`, `refreshDiagnostics`; `src/profileModel.ts` `lineLabel`, `funcLabel`, `heat`, `adjustSeverity`, `leakMessage` | End-of-line labels, function totals, status bar, runtime leak warnings, adjusted static diagnostics | ProfileIndex, source hashes, hot thresholds, LSP diagnostic collection | `test-fixtures/test_model.js`, `test-fixtures/test_report.js` |
-| Interactive report and source navigation | `pythonMemoryGuardian.showReport`; status-bar click; auto-open after task profile loads | `src/reportView.ts` `GuardianReport.show`, `refresh`, `fresh`; `src/reportModel.ts` `diagnose`, `callTree`; `src/reportWebview.ts` `reportHtml` | Memory diagnosis cards and time-weighted Stack Explorer with metric/thread filters | ProfileIndex, stack samples, freshness validation, webview messages | `test-fixtures/test_report.js` |
+| Profile Overview visualizations | Report auto-open; `pythonMemoryGuardian.showReport`; `pythonMemoryGuardian.openSavedReport`; status-bar click | `src/reportView.ts` `GuardianReport.refresh`; `src/reportModel.ts` `overview`; `src/reportWebview.ts` `reportHtml`, `memoryChart`, `overview` | Run metrics, RSS/traced-memory timeline, top sampled-line bars and verified source navigation | ProfileIndex, `timeline`, `rss_kind`, per-line measurements, freshness validation | `test-fixtures/test_report.js`, `test-fixtures/profiler_test.py` |
+| Interactive diagnosis, stack report and source navigation | `pythonMemoryGuardian.showReport`; status-bar click; auto-open after task profile loads | `src/reportView.ts` `GuardianReport.show`, `refresh`, `fresh`; `src/reportModel.ts` `diagnose`, `callTree`; `src/reportWebview.ts` `reportHtml` | Memory diagnosis cards and time-weighted Stack Explorer with metric/thread filters | ProfileIndex, stack samples, freshness validation, webview messages | `test-fixtures/test_report.js` |
 | Container execution and path translation | Nonempty `pythonMemoryGuardian.container.execPrefix` | `src/extension.ts` `containerConfig`, `stageHelper`, `probeInterpreter`; `src/profileView.ts` `runProfiler`, `load`; `src/containerPaths.ts` `resolveMappings`, `toContainer`, `toLocal`, `containerCommand`, `remapProfileKeys` | Probe/profile run in container; host-side editor mappings or error | Bind mount, configured prefix/interpreter/path mappings, staged helpers | `test-fixtures/test_container.js` |
 
 ## Planned, incomplete or unused capabilities
@@ -446,7 +458,6 @@ Paths are relative to the repository root. Tests listed are relevant checks, not
 | Automatic environment/interpreter discovery | `src/extension.ts` `interpreter` uses the explicit setting or `python3`/`python` fallback. It does not query the VS Code Python extension or scan virtual environments. `server/probe.py` measures whichever executable was selected. |
 | Allocation-stack graph and native stack/heap attribution | `server/pmg_profile.py` records line-level traced memory and Python call-stack **time** samples; `src/reportModel.ts` `callTree` weights time metrics only. The [planned completion criteria](#planned-completion-criteria) list memory-weighted allocation stacks and native visibility as planned. |
 | Cross-run comparison and agent telemetry contract | A single loaded `ProfileIndex` and one `.pmg/profile.json` path are used by `ProfileView`; no comparison view or telemetry export command exists. These are roadmap items. |
-| Process RSS timeline visualization | `Profiler.report` writes `timeline` to JSON; `GuardianReport.refresh` does not send it to the webview. Per-line retention sparklines are implemented. |
 | General task provider | `package.json` declares the `pmg-profile` task type and `runProfiler` creates a task, but no `registerTaskProvider` implementation exists. |
 
 ### Planned completion criteria

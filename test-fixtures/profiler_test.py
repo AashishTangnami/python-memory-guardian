@@ -39,6 +39,9 @@ check("L28 temporary(): ~160 MB observed, then freed",
       max(f["28"]["alloc_mb"], f["28"]["transient_peak_mb"], f["28"]["peak_mb"]) > 150
       and f["28"]["end_mb"] < 1)
 check("snapshot budget respected (<= 12% of wall)", p["snapshot_cost_s"] <= 0.12 * p["wall_s"])
+check("timeline includes exit sample after temporary memory is released",
+      abs(p["timeline"][-1][0] - p["wall_s"]) < 0.01
+      and p["timeline"][-1][1] < p["peak_traced_mb"] - 100)
 
 p, f = run("leak_workload.py", "precise")
 check("leak_workload L4 (+2 MB/call, kept) -> leak", "leak_runs" in f["4"])

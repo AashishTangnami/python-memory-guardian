@@ -576,8 +576,14 @@ class Profiler:
         self.cpu = time.process_time() - self.cpu0
         self.holders: dict = {}
         self.rss1 = self.rss() if self.rss_kind else None    # before our own snapshot work
+        traced_now = 0
         if self.memory == "precise":
-            self.peak_traced = max(self.peak_traced, tracemalloc.get_traced_memory()[1])
+            traced_now, traced_peak = tracemalloc.get_traced_memory()
+            self.peak_traced = max(self.peak_traced, traced_peak)
+        # Capture the process after user code exits; a short-lived allocation can
+        # otherwise be the timeline's last point even though the exit snapshot frees it.
+        self.timeline.append((self.wall, traced_now / 1e6, (self.rss1 or 0) / 1e6))
+        if self.memory == "precise":
             self._snapshot(self.wall)          # what is still held at exit
             leaks = self._leaks()
             if leaks:                          # needs tracemalloc still running
@@ -831,7 +837,10 @@ class Profiler:
                 fn["alloc_mb"] = round(fn["alloc_mb"] + e.get("alloc_mb", 0), 3)
                 fn["rss_growth_mb"] = round(fn["rss_growth_mb"] + e["rss_growth_mb"], 3)
         hashes = {path: digest for path, digest in hashes.items() if path in files}
-        step = max(1, len(self.timeline) // 300)
+        step = max(1, (len(self.timeline) + 298) // 299)
+        timeline = self.timeline[::step]
+        if timeline and timeline[-1] != self.timeline[-1]:
+            timeline.append(self.timeline[-1])
         stack_frames, frame_ids, stack_samples = [], {}, []
         for (ident, name, stack), values in self.stack_totals.items():
             ids = []
@@ -880,7 +889,7 @@ class Profiler:
                                              - self.peak_traced / 1e6
                                              - (self.rss0 or 0) / 1e6), 3)
                                    if self.memory == "precise" and self.rss_kind == "current" else None),
-            "timeline": [[round(a, 3), round(b, 3), round(c, 3)] for a, b, c in self.timeline[::step]],
+            "timeline": [[round(a, 3), round(b, 3), round(c, 3)] for a, b, c in timeline],
             "file_hashes": hashes, "files": files, "functions": funcs,
             'stacks': {'frames': stack_frames, 'samples': stack_samples,
                        'dropped_s': round(self.stack_dropped_s, 6),

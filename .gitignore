@@ -7,7 +7,6 @@
 /bin/
 /server/libs/
 /test-fixtures/profiler/out/
-.agents/
 .mypy_cache
 .pmg
 __pycache__/

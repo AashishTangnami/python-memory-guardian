@@ -70,18 +70,20 @@ Nothing else needs installing: the extension bundles its own copy of `pygls` (pi
    |---|---|---|
    | **fast** (default) | time split, caller stacks, and RSS growth | Sampling plus startup inventory/calibration; measure on your workload |
    | **precise** | adds retained-memory trends, suspected leaks, and holder evidence | Allocation tracing and snapshots can substantially slow allocation-heavy code |
-   | **time only** | time split and caller stacks | Sampling plus startup inventory/calibration |
+   | **time only** | time split and caller stacks; no per-line memory display | Sampling plus startup inventory/calibration |
 
 4. Your program runs in a terminal panel. To stop it early, press **Ctrl+C**; a partial profile is still saved.
-5. When it finishes, the native **Memory Guardian Report** opens with memory diagnosis first. Inline results also appear; data is stored in `.pmg/profile.json`.
+5. When it finishes, the native **Memory Guardian Report** opens on the Overview tab. Inline results also appear; data is stored in `.pmg/profile.json`.
 
-In precise mode, the report separates **suspected growing retention**, **retained at end**, and **released during the run**. Each finding shows recorded memory trends, any named holders, and recommendations tailored to lists, dictionaries/caches, or global ownership. These are observations and investigation steps; growing memory alone does not prove an unintended leak.
+The **Overview** tab shows run duration, CPU and sample counts, the top sampled source lines, and a process-memory timeline in fast and precise modes. Precise mode also plots currently traced Python allocations. Click a top line to open verified source. RSS can remain high after an allocation is released; use the exit-snapshot evidence in Memory diagnosis to assess retention.
+
+In precise mode, the **Memory diagnosis** tab separates **suspected growing retention**, **retained at end**, and **released during the run**. Each finding shows recorded memory trends, any named holders, and recommendations tailored to lists, dictionaries/caches, or global ownership. These are observations and investigation steps; growing memory alone does not prove an unintended leak.
 
 The **Stack Explorer** tab shows aggregated Python call stacks, including library frames, as a top-down call tree. Click a frame to zoom; filter by thread or Python/native/waiting/unclassified time, search for a function, and open verified application source. Native timing remains an estimate at the Python call site: C/C++ frames are not captured. Across threads, sampled elapsed time can exceed wall-clock run duration.
 
 On Python 3.12+, set `pythonMemoryGuardian.profile.monitoring` to `lines` to also record which user-code lines generated execution events. This is optional and can add overhead. It prevents an executed line missed by the interval sampler from being marked cold; it does not replace sampled timing or trace native allocations. If Python lacks `sys.monitoring` or another tool owns its profiler ID, Guardian falls back to sampling and marks line-event coverage unavailable in the report.
 
-Use **Python Memory Guardian: Open Profile Report** or click the status bar to reopen the report. Existing schema-2 reports still load; re-run profiling to obtain caller stacks and memory trends. Everything uses Guardian's own profiler and standard-library Python helpers, with no py-spy or Memray dependency.
+Use **Python Memory Guardian: Open Profile Report** or click the status bar to reopen the loaded report. Use **Python Memory Guardian: Open Saved Profile Report** to select any schema-2 or schema-3 profile JSON, including output from the standalone CLI. Older schema-2 reports still load; re-run profiling to obtain caller stacks and memory trends. Everything uses Guardian's own profiler and standard-library Python helpers, with no py-spy or Memray dependency.
 
 > **Tip:** add `.pmg/` to your `.gitignore`.
 

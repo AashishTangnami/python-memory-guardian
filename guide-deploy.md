@@ -52,7 +52,7 @@ These tools are needed to **build** a `.vsix` from the source repository. If you
 
 | Tool | Check | Notes |
 |---|---|---|
-| Node.js 20+ | `node --version` | |
+| Node.js 22+ | `node --version` | required by the pinned `@vscode/vsce@4.0.0` packager |
 | Python 3.9+ | `python3 --version` | used to run the backend checks |
 | uv | `uv --version` | packages and bundles the pinned `pygls` dependencies |
 | Internet access | | packaging downloads the packages pinned in `requirements.txt` from PyPI |

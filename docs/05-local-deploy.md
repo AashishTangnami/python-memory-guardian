@@ -4,7 +4,7 @@ Use this guide to install or share a build without publishing to the Marketplace
 
 ## Build a universal package
 
-You need Node.js 20+, npm, and `uv` on the build machine. From the repository root:
+You need Node.js 22+, npm, and `uv` on the build machine. From the repository root:
 
 ```bash
 npm ci

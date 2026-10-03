@@ -44,6 +44,10 @@
         "icon": "$(graph)"
       },
       {
+        "command": "pythonMemoryGuardian.openSavedReport",
+        "title": "Python Memory Guardian: Open Saved Profile Report"
+      },
+      {
         "command": "pythonMemoryGuardian.toggleProfileOverlay",
         "title": "Python Memory Guardian: Toggle Profile Overlay"
       },
@@ -192,10 +196,10 @@
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "@types/vscode": "^1.82.0",
-    "@vscode/vsce": "^3.2.0",
-    "typescript": "^5.4.0",
-    "esbuild": "^0.25.0"
+    "@types/vscode": "1.82.0",
+    "@vscode/vsce": "4.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.4.0"
   },
   "extensionKind": [
     "workspace"

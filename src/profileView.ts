@@ -57,6 +57,7 @@ export class ProfileView implements vscode.Disposable {
         }
       }),
       vscode.commands.registerCommand("pythonMemoryGuardian.showReport", () => this.report.show()),
+      vscode.commands.registerCommand("pythonMemoryGuardian.openSavedReport", () => this.openSavedReport()),
       vscode.commands.registerCommand("pythonMemoryGuardian.profileFile", () => this.runProfiler()),
       vscode.commands.registerCommand("pythonMemoryGuardian.toggleProfileOverlay", () => {
         this.overlay = !this.overlay;
@@ -128,24 +129,31 @@ export class ProfileView implements vscode.Disposable {
   }
 
   // ---------------------------------------------------------------- load / clear
-  private load(uri: vscode.Uri): void {
+  private async openSavedReport(): Promise<void> {
+    const selected = await vscode.window.showOpenDialog({ canSelectMany: false,
+      filters: { "Memory Guardian profile": ["json"] }, openLabel: "Open Profile Report" });
+    if (selected?.[0]) this.load(selected[0], true);
+  }
+
+  private load(uri: vscode.Uri, reveal = false): void {
     let text: string;
     try {
       text = fs.readFileSync(uri.fsPath, "utf8");
     } catch {
+      if (reveal) vscode.window.showWarningMessage("Python Memory Guardian: could not read the selected profile JSON.");
       return;
     }
     let p = parseProfile(text);
     const cc = this.container();
     if (p && cc) p = remapProfileKeys(p, (k) => toLocal(k, cc.mappings));   // /app/x.py -> host path
     if (!p) {
-      vscode.window.showWarningMessage("Python Memory Guardian: unreadable profile (re-run the profiler).");
+      vscode.window.showWarningMessage("Python Memory Guardian: unreadable profile JSON (schema 2 or 3 required).");
       return;
     }
     this.index = new ProfileIndex(p);
     this.runtime.clear();
     this.report.update(this.index);
-    if (this.showNextReport) { this.showNextReport = false; this.report.show(); }
+    if (this.showNextReport || reveal) { this.showNextReport = false; this.report.show(); }
     this.refreshDiagnostics();
     this.render();
   }

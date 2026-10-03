@@ -24,6 +24,8 @@ The published extension ID is `<publisher>.python-memory-guardian`. This checkou
 
    Rust is needed to verify both static-analysis backends. If you only distribute the Python backend, the Rust build is optional, but `npm run test:parity` will otherwise skip the Rust comparison.
 
+   Review both `npm audit` and `npm audit --omit=dev`. The full audit includes the development-only VSIX packaging tool; the production-only audit checks the Node dependency tree shipped with the extension. Do not treat a production-only clean result as a fix for a vulnerable build tool.
+
 3. Build the universal VSIX:
 
    ```bash
@@ -41,10 +43,13 @@ Build platform-specific VSIXs separately if you are distributing the Rust backen
 | Version and notes | `package.json` and `package-lock.json` are both 1.4.0; `CHANGELOG.md` has a 1.4.0 section. Confirm that 1.4.0 is newer than the live Marketplace version before upload. |
 | Publisher and legal identity | Repository URLs match the configured Git remote. The publisher ID in `package.json` and the copyright holder in `LICENSE` are still placeholders; confirm their exact values with the owner. |
 | Source and runtime tests | `npm test` passes on Python 3.13.0. Python/Rust parity and runtime tests pass on Python 3.9.6; two Python 3.12+ monitoring cases are skipped there. |
-| Universal package | A pre-version-bump VSIX passed the packaged Python-server smoke test on Python 3.9.6 and 3.13.0. Build and inspect a final 1.4.0 VSIX after the publisher value is set. |
+| Universal package | A 1.4.0 VSIX built with the pinned packager and passed the packaged Python-server smoke test on Python 3.13.0. A pre-version-bump VSIX also passed on Python 3.9.6. The manifest still has a placeholder publisher; rebuild and test the final VSIX after setting the real publisher. |
 | Rust package | A fresh macOS ARM release binary builds and passes parity. A matching platform VSIX has not been produced or smoke-tested for 1.4.0. Other target platforms require their own builds. |
-| Clean VS Code install | Pending a final 1.4.0 VSIX; verify static diagnostics and profiling in a clean VS Code profile before upload. |
-| Source control | `AGENTS.md`, `MEMORY.md`, the documentation skill, and this guide are new files in the working tree. Include them with the 1.4.0 changes in the release commit. |
+| Clean VS Code install | Pending the final publisher-specific 1.4.0 VSIX; verify static diagnostics and profiling in a clean VS Code profile before upload. |
+| VS Code API compatibility | `engines.vscode` remains `^1.82.0`, and `@types/vscode` is pinned to `1.82.0`. The previous `^1.140.0` types declaration failed `vsce package`'s compatibility check. Compilation and `npx vsce package` pass after aligning them. |
+| npm dependency audit | On October 3, `npm ci` and `npm audit` report zero findings with `@vscode/vsce@4.0.0`; the packaged-server smoke test passes on Python 3.13.0. The earlier `3.9.2` packager pulled in `secretlint → globby → fast-glob → micromatch → braces@3.0.3`, producing six high-severity entries for one [unpatched `braces` advisory](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm). Re-audit and package-test after any lockfile update. |
+| Install deprecations | The current clean install emits no deprecation warnings. Earlier packager versions warned about `whatwg-encoding`, `prebuild-install`, and `glob`. |
+| Source control | `AGENTS.md`, `MEMORY.md`, and this guide are committed. The `AGENTS.md` reference to `.agents/skills/maintain-feature-docs/SKILL.md` must be included in the next commit; `.gitignore` now allows the skill to be tracked. |
 
 ## Upload manually
 

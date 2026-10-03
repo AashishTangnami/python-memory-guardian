@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import { ProfileIndex } from './profileModel';
-import { diagnose, callTree, CallMetric } from './reportModel';
+import { diagnose, callTree, overview, CallMetric } from './reportModel';
 import { reportHtml } from './reportWebview';
 
 export class GuardianReport implements vscode.Disposable {
@@ -75,7 +75,8 @@ export class GuardianReport implements vscode.Disposable {
     const diagnoses = diagnose(p);
     const threads = [...new Map((p.stacks?.samples ?? []).map(s => [s.thread, s.thread_name])).entries()];
     void this.panel.webview.postMessage({ type: 'report', script: p.script, wall: p.wall_s,
-      mode: p.memory_mode, diagnoses: diagnoses.slice(0, 200), diagnosisCount: diagnoses.length,
+      mode: p.memory_mode, overview: overview(p), diagnoses: diagnoses.slice(0, 200),
+      diagnosisCount: diagnoses.length, growingCount: diagnoses.filter(d => d.status === 'growing').length,
       freshness, tree: callTree(p, this.metric, this.thread), metric: this.metric, thread: this.thread,
       threads, stacksAvailable: !!p.stacks, dropped: p.stacks?.dropped_s ?? 0,
       depthLimited: p.stacks?.depth_limited ?? false, monitoring: p.monitoring });
