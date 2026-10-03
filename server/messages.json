@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared by the Python and Rust servers. {placeholders} come from probe.py facts or the finding itself. The 'sized' variant is used only when every placeholder in it is known; otherwise 'neutral' is used. Sources: docs.python.org (whatsnew 3.12, c-api/memory, stdtypes, faq/programming, library/threading, library/asyncio-dev, howto/free-threading-python), peps.python.org (PEP 393, 623, 703, 779), CPython Misc/NEWS 2.5a1.",
+  "_comment": "Shared by the Python and Rust servers. {placeholders} come from probe.py facts or the finding itself. The 'sized' variant is used only when every placeholder in it is known; otherwise 'neutral' is used. Sources: docs.python.org (whatsnew 3.12, c-api/memory, stdtypes, faq/programming, library/threading, library/asyncio-dev, library/asyncio-task, library/functools, library/copy, library/re, library/gc, howto/free-threading-python), peps.python.org (PEP 393, 623, 703, 779), CPython Misc/NEWS 2.5a1.",
 
   "heap-inflation": {
     "sized": "⚠️ Heap Inflation (CPython {py_version}): fetchall() and row-at-a-time cursor loops box every cell as its own PyObject — measured on your interpreter: {int_size} B per int, {str_empty} B for an empty str (+1 B per ASCII char), plus {ptr_size} B per tuple slot — and keep the whole result set alive at once. Stream columnar Arrow batches instead (ADBC/DuckDB fetch_record_batch(), turbodbc fetcharrowbatches()) or load with Polars pl.read_database / ConnectorX.",
@@ -40,6 +40,27 @@
   },
   "memory-swell.unbounded-cache": {
     "neutral": "ℹ️ Memory Swell: @cache / lru_cache(maxsize=None) never evicts; every distinct argument tuple and its result live for the rest of the process. Fine for a small, fixed input domain; if the inputs come from data, set maxsize."
+  },
+  "memory-swell.deepcopy-loop": {
+    "neutral": "⚠️ Memory Swell: copy.deepcopy() recursively copies compound objects on every loop iteration. If the copy is large, this can cause substantial allocation and CPU cost. Copy only the fields that need isolation, or move an invariant copy outside the loop."
+  },
+  "memory-swell.recompile-loop": {
+    "neutral": "ℹ️ Memory Swell: re.compile() receives a literal pattern inside a loop. Compile it once outside the loop and reuse the pattern object. Python caches recent patterns, so the main avoidable work here is repeated lookup and object handling."
+  },
+  "memory-swell.setdefault-loop": {
+    "neutral": "ℹ️ Memory Swell: this bare setdefault(key, []) call creates a new empty list on every loop iteration, including when the key already exists. If you are initializing keys from many rows, consider defaultdict(list) or create the default only when the key is missing."
+  },
+  "memory-swell.list-extend-loop": {
+    "neutral": "ℹ️ Memory Swell: extend() builds a complete list comprehension on every outer-loop iteration before adding its items. Pass a generator expression or an existing iterable when the temporary list is not needed."
+  },
+  "gc-cycle-risk": {
+    "neutral": "ℹ️ GC Cycle Risk: this class has a back reference and a __del__ finalizer. Modern Python can collect most such cycles, but finalization may be delayed until cyclic GC runs. Use explicit close() or a context manager for resources that need prompt cleanup."
+  },
+  "task-retention.asyncio-task": {
+    "neutral": "⚠️ Asyncio Task: the result of asyncio.create_task() is discarded. Keep a reference until the task finishes, await it, or use asyncio.TaskGroup. For background tasks kept in a collection, remove completed tasks so the collection cannot retain them indefinitely."
+  },
+  "resource-leak.file-handle": {
+    "neutral": "⚠️ File Handle: this open() call has no visible context manager or close() in its scope. Use with open(...) as f, or close the handle in a finally block, to release it promptly even when an error occurs."
   },
 
   "single-thread-stall.async-blocking": {

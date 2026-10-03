@@ -374,6 +374,7 @@ The diagnostic code is the key in `server/messages.json`.
 | `heap-inflation` | Warning | `fetchall()`, `fetchone()` in loops, `for row in cur.execute(...)` |
 | `pointer-chasing` | Warning | pandas imports and row-oriented loaders, however aliased |
 | `cyclic-reference` | Info | back-pointer classes instantiated in loops |
+| `gc-cycle-risk` | Info | class with a back reference and `__del__` |
 | `ram-fragmentation.append` | Warning | `rows.append({...})` / tuple / list per iteration |
 | `ram-fragmentation.no-slots` | Info | class without `__slots__` instantiated in a loop. Exceptions, Enums, NamedTuples and `dataclass(slots=True)` are exempt |
 | `text-inflation.concat` | Warning | `s += "..."` on a str inside a loop (bytes excluded) |
@@ -382,9 +383,17 @@ The diagnostic code is the key in `server/messages.json`.
 | `memory-swell.list-copy` | Warning | `for x in list(...)`, or over a list comprehension |
 | `memory-swell.method-cache` | Warning | `@cache` / `lru_cache(maxsize=None)` on a method |
 | `memory-swell.unbounded-cache` | Info | the same on a plain function. A bounded `lru_cache` is fine |
+| `memory-swell.deepcopy-loop` | Warning | `copy.deepcopy(...)` inside a loop |
+| `memory-swell.recompile-loop` | Info | `re.compile("literal")` inside a loop |
+| `memory-swell.setdefault-loop` | Info | bare `d.setdefault(key, [])` inside a loop; creates a default list each time |
+| `memory-swell.list-extend-loop` | Info | `items.extend([x for ...])` inside an outer loop |
+| `task-retention.asyncio-task` | Warning | bare `asyncio.create_task(...)` whose result is discarded |
+| `resource-leak.file-handle` | Warning | `open(...)`, `io.open(...)`, or `Path(...).open()` without a visible `with`, `close()`, or returned ownership |
 | `single-thread-stall.async-blocking` | Warning | `time.sleep`, `requests.*`, `subprocess.*`, `urlopen` inside `async def` |
 | `single-thread-stall.list-membership` | Warning | `x in some_list` inside a loop |
 | `single-thread-stall.cpu-thread` | Info | CPU-bound function handed to a thread (below) |
+
+These rules follow the [functools](https://docs.python.org/3/library/functools.html), [copy](https://docs.python.org/3/library/copy.html), [re](https://docs.python.org/3/library/re.html), [asyncio task](https://docs.python.org/3/library/asyncio-task.html), and [gc](https://docs.python.org/3/library/gc.html) documentation. The regex rule is limited to literal `re.compile` calls: Python already caches recent patterns passed to `re.match` and related functions. Ordinary `setdefault` grouping, `list.append`/`extend`, and a `__del__` method alone are not treated as leaks; the added rules require a specific extra allocation or back reference. Modern Python generally collects cycles with finalizers, so `gc-cycle-risk` describes delayed cleanup rather than an inevitable leak.
 
 **When the thread rule fires, and when threads are fine.** The rule looks at what the target function does with the data it's given:
 - It **fires** when the function (defined in the same file) runs a Python-level loop over its own inputs, makes no I/O or GIL-releasing native calls, and the interpreter has the GIL.

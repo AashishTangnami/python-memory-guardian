@@ -9,9 +9,12 @@ Rule families (diagnostic `code` = messages.json key):
   heap-inflation          fetchall(), fetchone() in loops, `for row in cursor`
   pointer-chasing         pandas imports / row-oriented loaders
   cyclic-reference        back-pointer classes instantiated in loops
+  gc-cycle-risk           back-pointer classes with finalizers
   ram-fragmentation.*     per-row dict/tuple/list appends; no-__slots__ classes in loops
   text-inflation.*        str += in loops; read().split*() / readlines()
-  memory-swell.*          sum/any/all/min/max([...]); for x in list(...); unbounded caches
+  memory-swell.*          list materialization, unbounded caches, deepcopy/re.compile in loops
+  resource-leak.*         file opens without visible cleanup
+  task-retention.*        discarded asyncio tasks
   single-thread-stall.*   blocking calls in async def; `x in list` in loops;
                           CPU-bound pure-Python functions handed to threads
 """
@@ -336,9 +339,20 @@ def dotted(n: ast.AST) -> str | None:
     return None
 
 
+def _file_open(node: ast.Call, q: str, idx: FileIndex) -> bool:
+    if q in {"open", "builtins.open", "io.open"}:
+        return True
+    f = node.func
+    return (isinstance(f, ast.Attribute) and f.attr == "open"
+            and isinstance(f.value, ast.Call)
+            and qualname(f.value.func, idx.imports) == "pathlib.Path")
+
+
 class Visitor(ast.NodeVisitor):
-    def __init__(self, idx: FileIndex, facts: dict):
+    def __init__(self, idx: FileIndex, facts: dict, tree: ast.Module):
         self.idx, self.facts = idx, facts
+        self.parents = {child: parent for parent in ast.walk(tree)
+                        for child in ast.iter_child_nodes(parent)}
         self.out: list[Finding] = []
         self.loop_depth = 0
         self.async_stack: list[bool] = [False]
@@ -353,6 +367,37 @@ class Visitor(ast.NodeVisitor):
 
     def q(self, node):
         return qualname(node, self.idx.imports)
+
+    def _unmanaged_open(self, node: ast.Call) -> bool:
+        cur = node
+        while cur in self.parents:
+            parent = self.parents[cur]
+            if isinstance(parent, ast.withitem):
+                return False
+            if isinstance(parent, ast.Call) and (cur in parent.args or
+                    any(k.value is cur for k in parent.keywords)):
+                return False  # the callee may take ownership
+            if isinstance(parent, (ast.Return, ast.Yield, ast.YieldFrom)):
+                return False  # ownership may be passed to the caller
+            if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is cur:
+                targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                if names:
+                    scope = parent
+                    while scope in self.parents and not isinstance(scope, (ast.Module, ast.FunctionDef,
+                                                                           ast.AsyncFunctionDef, ast.Lambda)):
+                        scope = self.parents[scope]
+                    for n in scope_nodes(scope):
+                        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                                and n.func.attr == "close" and isinstance(n.func.value, ast.Name)
+                                and n.func.value.id in names):
+                            return False
+                break
+            if isinstance(parent, (ast.Expr, ast.Call, ast.Attribute, ast.Await, ast.Subscript)):
+                cur = parent
+                continue
+            break
+        return True
 
     # ---- scopes
     def _state(self):
@@ -400,6 +445,10 @@ class Visitor(ast.NodeVisitor):
         self._restore(saved)
 
     def visit_ClassDef(self, node):
+        if (_cycle_edge(node) is not None and any(
+                isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "__del__"
+                for stmt in node.body)):
+            self.add(node, "gc-cycle-risk", I, subject=node.name)
         for expr in node.decorator_list + node.bases + [k.value for k in node.keywords]:
             self.visit(expr)
         saved = self._state()
@@ -522,8 +571,26 @@ class Visitor(ast.NodeVisitor):
     def visit_Call(self, node):
         f = node.func
         q = self.q(f) or ""
+        if self.loop_depth and q == "copy.deepcopy":
+            self.add(node, "memory-swell.deepcopy-loop", W)
+        if (self.loop_depth and q == "re.compile" and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, (str, bytes))):
+            self.add(node, "memory-swell.recompile-loop", I)
+        if q == "asyncio.create_task" and isinstance(self.parents.get(node), ast.Expr):
+            self.add(node, "task-retention.asyncio-task", W)
+        if _file_open(node, q, self.idx) and self._unmanaged_open(node):
+            self.add(node, "resource-leak.file-handle", W)
         if isinstance(f, ast.Attribute):
             span = (f.end_lineno, f.end_col_offset - len(f.attr), f.end_col_offset)
+            if (f.attr == "setdefault" and self.loop_depth and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.List) and not node.args[1].elts
+                    and isinstance(self.parents.get(node), ast.Expr)):
+                self.add(node, "memory-swell.setdefault-loop", I, subject=dotted(f.value))
+            if (f.attr == "extend" and self.loop_depth and node.args
+                    and isinstance(node.args[0], ast.ListComp)):
+                self.add(node.args[0], "memory-swell.list-extend-loop", I,
+                         subject=dotted(f.value))
             # heap inflation
             if f.attr == "fetchall" or (f.attr == "fetchone" and self.loop_depth):
                 self.add(node, "heap-inflation", W, span=span, subject=dotted(f.value))
@@ -644,7 +711,7 @@ def analyze(source: str, uri: str = "file:///untitled.py",
         return None
     facts = facts or {}
     lines = source.splitlines() or [""]
-    v = Visitor(index_file(tree), facts)
+    v = Visitor(index_file(tree), facts, tree)
     v.visit(tree)
     scopes = _scopes(tree)
 

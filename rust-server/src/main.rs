@@ -297,6 +297,52 @@ fn dotted(n: Node, src: &[u8]) -> Option<String> {
     }
 }
 
+fn file_open(n: Node, f: Node, q: &str, src: &[u8], imports: &HashMap<String, String>) -> bool {
+    if ["open", "builtins.open", "io.open"].contains(&q) { return true; }
+    if attr_name(f, src) != "open" { return false; }
+    field(f, "object").map(unwrap).map_or(false, |o| {
+        o.kind() == "call" && field(o, "function")
+            .and_then(|of| qualname(of, src, imports)).as_deref() == Some("pathlib.Path")
+    }) && n.kind() == "call"
+}
+
+fn unmanaged_open(n: Node, src: &[u8]) -> bool {
+    let mut cur = n;
+    while let Some(parent) = cur.parent() {
+        match parent.kind() {
+            "with_item" => return false,
+            "argument_list" | "keyword_argument" => return false, // callee may take ownership
+            "return_statement" | "yield" => return false,
+            "assignment" if field(parent, "right").map(|r| r.id()) == Some(cur.id()) => {
+                let names: Vec<String> = field(parent, "left").into_iter()
+                    .filter(|l| l.kind() == "identifier")
+                    .map(|l| txt(l, src).to_string()).collect();
+                if !names.is_empty() {
+                    let mut scope = parent;
+                    while let Some(p) = scope.parent() {
+                        scope = p;
+                        if matches!(scope.kind(), "module" | "function_definition" | "lambda") { break; }
+                    }
+                    if scope_nodes(scope).into_iter().any(|x| {
+                        x.kind() == "call" && field(x, "function").map_or(false, |f| {
+                            attr_name(f, src) == "close" && field(f, "object").map_or(false, |o| {
+                                o.kind() == "identifier" && names.iter().any(|name| name == txt(o, src))
+                            })
+                        })
+                    }) { return false; }
+                }
+                return true;
+            }
+            "expression_statement" | "call" | "attribute" | "await" | "subscript"
+                | "parenthesized_expression" | "as_pattern" => {
+                cur = parent;
+            }
+            _ => return true,
+        }
+    }
+    true
+}
+
 /// Qualified enclosing scope, e.g. "Repo.lookup()" or "Repo" (= rules.scope_label).
 fn scope_label(n: Node, src: &[u8]) -> Option<String> {
     let mut names = Vec::new();
@@ -714,6 +760,23 @@ impl<'t, 's> Visitor<'t, 's> {
                 self.restore(saved);
             }
             "class_definition" => {
+                let finalizer = field(n, "body").map_or(false, |body| named_children(body).into_iter().any(|stmt| {
+                    let def = if stmt.kind() == "decorated_definition" {
+                        named_children(stmt).into_iter().find(|c| c.kind() == "function_definition")
+                    } else { Some(stmt) };
+                    def.map_or(false, |d| d.kind() == "function_definition"
+                        && field(d, "name").map_or(false, |name| txt(name, src) == "__del__"))
+                }));
+                if finalizer && cycle_edge(n, src).is_some() {
+                    let name = field(n, "name").map(|x| txt(x, src).to_string());
+                    self.add_s(n, "gc-cycle-risk", I, vec![], name);
+                    if let (Some(name), Some(last)) = (field(n, "name"), self.out.last_mut()) {
+                        let name = txt(name, src);
+                        last.scope = Some(last.scope.as_ref()
+                            .map(|parent| format!("{parent}.{name}"))
+                            .unwrap_or_else(|| name.to_string()));
+                    }
+                }
                 if let Some(bases) = field(n, "superclasses") { self.visit(bases); }
                 let saved = self.state();
                 self.enter_scope(n, saved.clone());
@@ -891,8 +954,35 @@ impl<'t, 's> Visitor<'t, 's> {
         let Some(f) = field(n, "function") else { return };
         let q = self.q(f);
         let (args, kws) = call_args(n);
+        if self.loop_depth > 0 && q == "copy.deepcopy" {
+            self.add(n, "memory-swell.deepcopy-loop", W, vec![]);
+        }
+        if self.loop_depth > 0 && q == "re.compile"
+            && args.first().map_or(false, |a| matches!(unwrap(*a).kind(), "string" | "concatenated_string"))
+        {
+            self.add(n, "memory-swell.recompile-loop", I, vec![]);
+        }
+        if q == "asyncio.create_task" && n.parent().map_or(false, |p| p.kind() == "expression_statement") {
+            self.add(n, "task-retention.asyncio-task", W, vec![]);
+        }
+        if file_open(n, f, &q, src, &self.idx.imports) && unmanaged_open(n, src) {
+            self.add(n, "resource-leak.file-handle", W, vec![]);
+        }
         if f.kind() == "attribute" {
             let a = attr_name(f, src);
+            if a == "setdefault" && self.loop_depth > 0 && args.len() >= 2
+                && args[1].kind() == "list" && named_children(args[1]).is_empty()
+                && n.parent().map_or(false, |p| p.kind() == "expression_statement")
+            {
+                let subj = field(f, "object").and_then(|o| dotted(o, src));
+                self.add_s(n, "memory-swell.setdefault-loop", I, vec![], subj);
+            }
+            if a == "extend" && self.loop_depth > 0
+                && args.first().map_or(false, |arg| arg.kind() == "list_comprehension")
+            {
+                let subj = field(f, "object").and_then(|o| dotted(o, src));
+                self.add_s(args[0], "memory-swell.list-extend-loop", I, vec![], subj);
+            }
             if let Some(an) = field(f, "attribute") {
                 let recv = field(f, "object").and_then(|o| dotted(o, src));
                 if a == "fetchall" || (a == "fetchone" && self.loop_depth > 0) {
