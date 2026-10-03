@@ -7,7 +7,7 @@ A VS Code extension for Python that does two things:
 
 It works on Linux, macOS and Windows, and inside containers (Dev Containers, Codespaces, plain Docker/Compose, WSL, Remote-SSH).
 
-**Product goal:** Make Guardian the fastest path from a Python memory symptom to an evidence-backed diagnosis and a verified fix, inside VS Code. For supported workloads, a developer should be able to profile, identify growing or retained allocations, inspect the responsible stacks and owners, compare runs, and share structured findings with an agent without switching to an external profiler CLI. Memory-leak diagnosis and recommendations lead this workflow; interactive graphs, native C-extension visibility, cross-run comparison, and agent-ready telemetry deepen the evidence. See the [planned target state](feature-map-end-to-end.md#13-target-state-planned) for the work that remains.
+**Product goal:** Make Guardian the fastest path from a Python memory symptom to an evidence-backed diagnosis and a verified fix, inside VS Code. For supported workloads, a developer should be able to profile, identify growing or retained allocations, inspect the responsible stacks and owners, compare runs, and share structured findings with an agent without switching to an external profiler CLI. Memory-leak diagnosis and recommendations lead this workflow; interactive graphs, native C-extension visibility, cross-run comparison, and agent-ready telemetry deepen the evidence. See the [feature map and planned completion criteria](docs/feature-map.md#planned-completion-criteria) for implemented behavior and the work that remains.
 
 ---
 

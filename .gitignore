@@ -8,4 +8,6 @@
 /server/libs/
 /test-fixtures/profiler/out/
 /docs/06-marketplace-publish.md
+.mypy_cache
+.pmg
 __pycache__/
