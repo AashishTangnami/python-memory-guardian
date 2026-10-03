@@ -2,7 +2,7 @@
 Python Memory Guardian - runtime profiler (standard library only).
 
     python server/pmg_profile.py [--out .pmg/profile.json] [--root DIR] [--interval 0.01]
-                          [--memory fast|precise|off] script.py [args...]
+                          [--memory fast|precise|off] [--monitoring off|lines] script.py [args...]
 
 Per line of *your* code (files under --root) it reports:
 
@@ -29,6 +29,9 @@ MEMORY
            Costs ~2-5x runtime (measured: 2.9x at the default 2-frame depth), because
            tracemalloc hooks every allocation. Snapshot cost is predicted from
            tracemalloc's bookkeeping size and capped at 10% of elapsed time.
+
+Optional Python 3.12+ LINE events record execution coverage. They do not replace
+the interval sampler or measure elapsed time, native stacks, or allocations.
 """
 from __future__ import annotations
 
@@ -175,7 +178,8 @@ class LineStats:
 
 
 class Profiler:
-    def __init__(self, root: str, interval: float, memory: str, frames: int = 2):
+    def __init__(self, root: str, interval: float, memory: str, frames: int = 2,
+                 monitoring: str = 'off'):
         self.root = os.path.normcase(os.path.abspath(root)).rstrip(os.sep) + os.sep
         self.interval = interval
         self.memory = memory
@@ -203,6 +207,60 @@ class Profiler:
         self.stack_totals: dict = {}
         self.stack_dropped_s = 0.0
         self.stack_depth_limited = False
+        self.monitoring_requested = monitoring
+        self.monitoring_reason = None
+        self._monitoring_tool = None
+        self.monitoring_enabled = False
+        self.line_events: dict[tuple[str, int], int] = {}
+        self.monitoring_dropped = 0
+
+    def _enable_monitoring(self):
+        """Optional execution evidence; sampled timing still uses _current_frames()."""
+        if self.monitoring_requested != 'lines':
+            return
+        mon = getattr(sys, 'monitoring', None)
+        if mon is None:
+            self.monitoring_reason = 'requires Python 3.12+'
+            return
+        tool = mon.PROFILER_ID
+        if mon.get_tool(tool) is not None:
+            self.monitoring_reason = 'profiler monitoring tool ID is already in use'
+            return
+        try:
+            mon.use_tool_id(tool, 'python-memory-guardian')
+            self._monitoring_tool = tool
+            mon.register_callback(tool, mon.events.LINE, self._on_line_event)
+            mon.set_events(tool, mon.events.LINE)
+            self.monitoring_enabled = True
+        except Exception:
+            self.monitoring_reason = 'could not enable execution-event monitoring'
+            self._disable_monitoring()
+
+    def _on_line_event(self, code, line):
+        filename = code.co_filename
+        if not self._is_user(filename):
+            return
+        loc = (os.path.abspath(filename), line)
+        if loc in self.line_events:
+            self.line_events[loc] += 1
+        elif len(self.line_events) < 50_000:
+            self.line_events[loc] = 1
+        else:
+            self.monitoring_dropped += 1
+
+    def _disable_monitoring(self):
+        tool = self._monitoring_tool
+        if tool is None:
+            return
+        self._monitoring_tool = None
+        mon = sys.monitoring
+        try:
+            mon.set_events(tool, 0)
+        finally:
+            try:
+                mon.register_callback(tool, mon.events.LINE, None)
+            finally:
+                mon.free_tool_id(tool)
 
     @staticmethod
     def _source_version(path: str) -> tuple:
@@ -508,10 +566,12 @@ class Profiler:
         self.t0 = time.perf_counter()
         self.cpu0 = time.process_time()
         self._thread.start()
+        self._enable_monitoring()
 
     def stop(self, main_globals: dict | None = None):
         self._stop.set()
         self._thread.join()
+        self._disable_monitoring()
         self.wall = time.perf_counter() - self.t0
         self.cpu = time.process_time() - self.cpu0
         self.holders: dict = {}
@@ -693,7 +753,7 @@ class Profiler:
         hashes = {}
         retained_locations = {loc for _, held, _ in self.snapshots for loc, size in held.items()
                               if size >= 1 << 20}
-        for loc in set(self.lines) | set(peak) | set(end) | retained_locations:
+        for loc in set(self.lines) | set(peak) | set(end) | retained_locations | set(self.line_events):
             st = self.lines.get(loc) or LineStats()
             t = st.python_s + st.native_s + st.system_s + st.cpu_s
             e = {"time_s": round(t, 4), "share": round(t / total, 4),
@@ -701,6 +761,8 @@ class Profiler:
                  "system_s": round(st.system_s, 4), "cpu_unsplit_s": round(st.cpu_s, 4),
                  "samples": st.samples,
                  "rss_growth_mb": round(st.rss_up / 1e6, 3), "rss_release_mb": round(st.rss_down / 1e6, 3)}
+            if loc in self.line_events:
+                e['line_events'] = self.line_events[loc]
             if st.func is not None:
                 e["func_line"] = st.func[1]
             if loc[0] not in symbols:
@@ -741,6 +803,7 @@ class Profiler:
                         'points': [[round(trend[i][0], 4), round(trend[i][1] / 1e6, 3)] for i in indices],
                     }
             if (st.samples == 0 and loc not in leaks and loc not in self.holders
+                    and loc not in self.line_events
                     and max(e.get("peak_mb", 0), e.get("end_mb", 0), e.get("alloc_mb", 0),
                             e["rss_growth_mb"], e.get('retention', {}).get('peak_mb', 0)) < 0.01):
                 continue          # nothing measured on this line: don't pad the report
@@ -794,6 +857,10 @@ class Profiler:
             "python": "%d.%d.%d" % sys.version_info[:3], "gil_split": self.split,
             "wall_s": round(self.wall, 4), "cpu_s": round(self.cpu, 4),
             "interval_s": self.interval, "samples": self.samples, "memory_mode": self.memory,
+            "monitoring": {"requested": self.monitoring_requested,
+                           "active": self.monitoring_enabled,
+                           "reason": self.monitoring_reason,
+                           "dropped_line_events": self.monitoring_dropped},
             "sleep_overhead_s": round(self.sleep_overhead, 6),
             "rss_kind": self.rss_kind,
             "per_thread_cpu": any(c is not None for c in self._clocks.values()),
@@ -828,6 +895,8 @@ def main(argv=None) -> int:
     ap.add_argument("--interval", type=float, default=0.01)
     ap.add_argument("--memory", choices=("fast", "precise", "off"), default="fast")
     ap.add_argument("--frames", type=int, default=2, help="precise mode traceback depth (cost grows with depth)")
+    ap.add_argument("--monitoring", choices=("off", "lines"), default="off",
+                    help="optional Python 3.12+ line-event coverage; timing still uses sampling")
     # One REMAINDER positional preserves a target's own '--' separator.
     ap.add_argument("script_args", nargs=argparse.REMAINDER, metavar="script [args...]")
     ns = ap.parse_args(argv)
@@ -841,7 +910,8 @@ def main(argv=None) -> int:
 
     script = os.path.abspath(script_args[0])
     out = os.path.abspath(ns.out)  # Target code may change the working directory.
-    prof = Profiler(ns.root or os.path.dirname(script), ns.interval, ns.memory, ns.frames)
+    prof = Profiler(ns.root or os.path.dirname(script), ns.interval, ns.memory, ns.frames,
+                    ns.monitoring)
     sys.argv = [script] + script_args[1:]
     sys.path.insert(0, os.path.dirname(script))
     code = 0

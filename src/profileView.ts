@@ -94,6 +94,7 @@ export class ProfileView implements vscode.Disposable {
     const root = folder?.uri.fsPath ?? path.dirname(file);
     const out = path.join(root, ".pmg", "profile.json");
     const frames = Math.max(1, Math.min(64, cfg.get<number>("frames", 2)));
+    const monitoring = cfg.get<string>("monitoring", "off") === "lines" ? "lines" : "off";
     let exec: vscode.ProcessExecution;
     const cc = this.container();
     if (cc) {
@@ -105,7 +106,8 @@ export class ProfileView implements vscode.Disposable {
         fs.copyFileSync(this.ctx.asAbsolutePath(path.join("server", "pmg_profile.py")), staged);
         const c = (p: string) => toContainer(p, cc.mappings);
         const cmd = containerCommand(cc, c(staged),
-          ["--memory", picked.mode, "--frames", String(frames), "--root", c(root), "--out", c(out), c(file)]);
+          ["--memory", picked.mode, "--frames", String(frames), "--monitoring", monitoring,
+            "--root", c(root), "--out", c(out), c(file)]);
         exec = new vscode.ProcessExecution(cmd.command, cmd.args, { cwd: root });
       } catch (e) {
         vscode.window.showErrorMessage(`Python Memory Guardian (container mode): ${e}`);
@@ -113,7 +115,8 @@ export class ProfileView implements vscode.Disposable {
       }
     } else {
       const args = [this.ctx.asAbsolutePath(path.join("server", "pmg_profile.py")),
-        "--memory", picked.mode, "--frames", String(frames), "--root", root, "--out", out, file];
+        "--memory", picked.mode, "--frames", String(frames), "--monitoring", monitoring,
+        "--root", root, "--out", out, file];
       // ProcessExecution: no shell, so paths with spaces need no quoting on any OS.
       exec = new vscode.ProcessExecution(this.interpreter(), args, { cwd: path.dirname(file) });
     }

@@ -18,16 +18,67 @@ spec.loader.exec_module(profiler)
 
 
 class ProfileRegressions(unittest.TestCase):
-    def run_script(self, directory, source, memory='off', interval='0.01'):
+    def run_script(self, directory, source, memory='off', interval='0.01', monitoring='off'):
         script = directory / 'main.py'
         script.write_text(source)
         report = directory / 'profile.json'
         result = subprocess.run(
             [sys.executable, str(PROFILER), '--memory', memory, '--interval', interval,
+             '--monitoring', monitoring,
              '--root', str(directory), '--out', str(report), str(script)],
             capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         return script, json.loads(report.read_text())
+
+    def test_optional_monitoring_reports_executed_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script, report = self.run_script(Path(tmp),
+                'total = 0\nfor i in range(200):\n    total += i\n', monitoring='lines')
+            status = report['monitoring']
+            self.assertEqual(status['requested'], 'lines')
+            if hasattr(sys, 'monitoring'):
+                self.assertTrue(status['active'], status)
+                self.assertGreater(report['files'][str(script)]['3']['line_events'], 1)
+            else:
+                self.assertFalse(status['active'])
+                self.assertEqual(status['reason'], 'requires Python 3.12+')
+
+    def test_monitoring_busy_tool_falls_back_without_claiming_coverage(self):
+        mon = getattr(sys, 'monitoring', None)
+        if mon is None:
+            self.skipTest('sys.monitoring requires Python 3.12+')
+        with tempfile.TemporaryDirectory() as tmp, patch.object(mon, 'get_tool', return_value='another profiler'):
+            p = profiler.Profiler(tmp, .01, 'off', monitoring='lines')
+            p._enable_monitoring()
+            self.assertFalse(p.monitoring_enabled)
+            self.assertIn('already in use', p.monitoring_reason)
+            self.assertIsNone(p._monitoring_tool)
+
+    def test_monitoring_unavailable_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(profiler.sys, 'monitoring', None,
+                                                               create=True):
+            p = profiler.Profiler(tmp, .01, 'off', monitoring='lines')
+            p._enable_monitoring()
+            self.assertFalse(p.monitoring_enabled)
+            self.assertEqual(p.monitoring_reason, 'requires Python 3.12+')
+
+    def test_monitoring_releases_tool_and_callback(self):
+        mon = getattr(sys, 'monitoring', None)
+        if mon is None:
+            self.skipTest('sys.monitoring requires Python 3.12+')
+        tool = mon.PROFILER_ID
+        if mon.get_tool(tool) is not None:
+            self.skipTest('profiler tool ID already in use')
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'off', monitoring='lines')
+            p._enable_monitoring()
+            try:
+                self.assertTrue(p.monitoring_enabled)
+                self.assertNotEqual(mon.get_events(tool), 0)
+            finally:
+                p._disable_monitoring()
+            self.assertIsNone(mon.get_tool(tool))
+            self.assertEqual(mon.get_events(tool), 0)
 
     def test_changed_source_is_not_certified_fresh(self):
         for restore in (False, True):

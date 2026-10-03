@@ -77,6 +77,8 @@ In precise mode, the report separates **suspected growing retention**, **retaine
 
 The **Stack Explorer** tab shows aggregated Python call stacks, including library frames, as a top-down call tree. Click a frame to zoom; filter by thread or Python/native/waiting/unclassified time, search for a function, and open verified application source. Native timing remains an estimate at the Python call site: C/C++ frames are not captured. Across threads, sampled elapsed time can exceed wall-clock run duration.
 
+On Python 3.12+, set `pythonMemoryGuardian.profile.monitoring` to `lines` to also record which user-code lines generated execution events. This is optional and can add overhead. It prevents an executed line missed by the interval sampler from being marked cold; it does not replace sampled timing or trace native allocations. If Python lacks `sys.monitoring` or another tool owns its profiler ID, Guardian falls back to sampling and marks line-event coverage unavailable in the report.
+
 Use **Python Memory Guardian: Open Profile Report** or click the status bar to reopen the report. Existing schema-2 reports still load; re-run profiling to obtain caller stacks and memory trends. Everything uses Guardian's own profiler and standard-library Python helpers, with no py-spy or Memray dependency.
 
 > **Tip:** add `.pmg/` to your `.gitignore`.
@@ -134,6 +136,7 @@ rows = cur.fetchall()  # memory-guardian: ignore
 | `pythonMemoryGuardian.profile.hotShare` | `0.05` | Runtime share that makes a line hot |
 | `pythonMemoryGuardian.profile.hotMB` | `50` | Memory (MB) that makes a line hot |
 | `pythonMemoryGuardian.profile.frames` | `2` | Precise mode: traceback depth. Higher ties more library-internal memory back to your lines, but is slower (on `import pandas`: 2 frames 1.3 s, 8 frames 2.9 s, 32 frames 7.5 s) |
+| `pythonMemoryGuardian.profile.monitoring` | `off` | Optional Python 3.12+ line-event coverage (`lines`); may add overhead, with sampling retained for timing |
 | `pythonMemoryGuardian.container.execPrefix` | `[]` | Container mode only, see [2.2](#22-plain-docker--compose-editor-on-the-host) |
 | `pythonMemoryGuardian.container.interpreter` | `python3` | Container mode only: Python inside the container |
 | `pythonMemoryGuardian.container.pathMappings` | `[]` | Container mode only: host ↔ container folders |

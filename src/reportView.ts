@@ -78,7 +78,7 @@ export class GuardianReport implements vscode.Disposable {
       mode: p.memory_mode, diagnoses: diagnoses.slice(0, 200), diagnosisCount: diagnoses.length,
       freshness, tree: callTree(p, this.metric, this.thread), metric: this.metric, thread: this.thread,
       threads, stacksAvailable: !!p.stacks, dropped: p.stacks?.dropped_s ?? 0,
-      depthLimited: p.stacks?.depth_limited ?? false });
+      depthLimited: p.stacks?.depth_limited ?? false, monitoring: p.monitoring });
   }
 
   dispose(): void { this.panel?.dispose(); }

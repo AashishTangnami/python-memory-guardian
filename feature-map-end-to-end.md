@@ -199,6 +199,7 @@ python3 server/pmg_profile.py --memory precise --frames 2 --interval 0.01 --root
 | `--interval` | `0.01` seconds | Sampling interval. |
 | `--memory` | `fast` | Select `fast`, `precise`, or `off`. |
 | `--frames` | `2` | Tracemalloc traceback depth in precise mode. The editor clamps this to 1–64. |
+| `--monitoring` | `off` | Optional `lines` mode records Python 3.12+ user-line events; sampled timing remains active. |
 
 Normal completion returns 0; integer `SystemExit` codes are preserved, Ctrl+C returns 130, and uncaught exceptions print a traceback and return 1. The finalization path attempts to save a report in all these cases. If non-daemon workers remain, normal Python thread/executor shutdown completes before finalization; Ctrl+C attempts an immediate partial report. Abrupt process termination cannot guarantee a report.
 
@@ -402,6 +403,7 @@ All setting names below have the `pythonMemoryGuardian.` prefix. See [package.js
 | `profile.hotShare` | `0.05` | Hot attributed-time share threshold, from 0 to 1. |
 | `profile.hotMB` | `50` | Hot memory threshold in MB, minimum 0. |
 | `profile.frames` | `2` | Precise traceback depth, 1–64; deeper traces can improve attribution and increase overhead. |
+| `profile.monitoring` | `off` | Optional `lines` event coverage on Python 3.12+; gracefully falls back when unavailable. |
 | `container.execPrefix` | `[]` | Enable host/container mode and supply the command prefix. |
 | `container.interpreter` | `python3` | Interpreter inside the container. |
 | `container.pathMappings` | `[]` | Host/container path pairs covering the bind-mounted project. |
@@ -473,6 +475,8 @@ flowchart TD
 ```
 
 The collector keeps Python frames from the outermost application frame through active library frames. No frame objects are retained. Immutable frame IDs and weighted stacks preserve caller relationships, including recursion. Time weights are accumulated from observed intervals instead of assuming a fixed sampling frequency. Multiple threads may accumulate more elapsed time than the wall-clock duration. Collection caps (128-frame depth, 50,000 stacks) and the 25,000-node display cap are reported as limitations when reached.
+
+Python 3.12+ offers `sys.monitoring` for execution-event callbacks. Guardian can optionally count `LINE` events from user code, keeping only file/line/count values and capping distinct lines at 50,000. An event-observed line missed by interval sampling is treated as unknown rather than cold when adjusting static severity. The profiler uses the monitoring profiler tool ID only when free, unregisters callbacks and releases the ID on completion, and records whether coverage was active or unavailable. `sys.monitoring` does not provide a snapshot of every thread, and a thread blocked inside a long native call may produce no Python event until the call returns. Guardian therefore retains `sys._current_frames()` for sampled stacks and timing across all supported Python versions. Event counts are not durations, native frames, or allocation records; the mode is off by default because its workload-dependent cost has not yet been benchmarked.
 
 The report uses a CSP-restricted webview, plain-text rendering of source metadata, and validates source-navigation messages against the loaded report. It includes a per-line retention sparkline; the process RSS timeline remains available in JSON only. New diagnostics call growth a suspected leak because a growing cache or a deliberately retained dataset can have the same trend.
 

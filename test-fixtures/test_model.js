@@ -29,6 +29,13 @@ assert.strictEqual(m.adjustSeverity(m.Sev.Information, "hot"), m.Sev.Warning);
 assert.strictEqual(m.adjustSeverity(m.Sev.Warning, "cold"), m.Sev.Hint);
 assert.strictEqual(m.adjustSeverity(m.Sev.Error, "cold"), m.Sev.Error);
 assert.strictEqual(m.adjustSeverity(m.Sev.Warning, "unknown"), m.Sev.Warning);
+assert.strictEqual(m.heat({ samples: 0, line_events: 4, rss_growth_mb: 0 }, "off", th), "unknown",
+  "an executed but unsampled line must not be demoted");
+assert.strictEqual(m.heat({ samples: 0, line_events: 0, rss_growth_mb: 0 }, "off", th), "cold");
+{ const p = m.parseProfile(fs.readFileSync(require("path").join(__dirname, "profiler/out/workload_fast.json"), "utf8"));
+  const file = Object.keys(p.files)[0];
+  p.files[file][Object.keys(p.files[file])[0]].line_events = -1;
+  assert.strictEqual(m.parseProfile(JSON.stringify(p)), undefined, "negative line-event count is rejected"); }
 assert.strictEqual(m.normPath("C:\\Proj\\a.py", "win32"), m.normPath("c:/proj/A.py", "win32"));
 const pp = m.parseProfile(fs.readFileSync(require("path").join(__dirname, "profiler/out/workload_precise.json"), "utf8"));
 console.log("leak msg:", m.leakMessage(new m.ProfileIndex(pp).line(WL, 24)).slice(0, 120) + "…");

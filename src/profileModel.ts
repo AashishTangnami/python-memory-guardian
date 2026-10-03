@@ -8,6 +8,7 @@ export interface LineEntry {
   time_s: number; share: number;
   python_s: number; native_s: number; system_s: number; cpu_unsplit_s: number;
   samples: number; rss_growth_mb: number; rss_release_mb: number;
+  line_events?: number;
   alloc_mb?: number; transient_peak_mb?: number; peak_mb?: number; end_mb?: number;
   leak_runs?: number; func_line?: number;
   /** Names from the source line (via ast): enclosing scope, assigned variables, called functions. */
@@ -38,6 +39,8 @@ export interface Profile {
   files: Record<string, Record<string, LineEntry>>;
   functions: Record<string, Record<string, FuncEntry>>;
   stacks?: { frames: StackFrame[]; samples: StackSample[]; dropped_s: number; depth_limited: boolean };
+  monitoring?: { requested: 'off' | 'lines'; active: boolean; reason: string | null;
+    dropped_line_events: number };
 }
 
 export interface Thresholds { hotShare: number; hotMb: number; }
@@ -77,6 +80,7 @@ export function parseProfile(json: string): Profile | undefined {
         for (const k of ['alloc_mb', 'transient_peak_mb', 'peak_mb', 'end_mb', 'leak_runs', 'func_line']) {
           if (e[k] != null && !number(e[k])) return undefined;
         }
+        if (e.line_events != null && (!Number.isSafeInteger(e.line_events) || e.line_events < 0)) return undefined;
         if (e.scope != null && typeof e.scope !== 'string') return undefined;
         for (const k of ['assigns', 'calls']) {
           if (e[k] != null && (!Array.isArray(e[k]) || !e[k].every((v: unknown) => typeof v === 'string'))) return undefined;
@@ -110,6 +114,12 @@ export function parseProfile(json: string): Profile | undefined {
           && Array.isArray(v.frames) && v.frames.length <= 128
           && v.frames.every((id: unknown) => Number.isInteger(id) && Number(id) >= 0 && Number(id) < s.frames.length))) return undefined;
     }
+    if (p.monitoring != null && (!record(p.monitoring)
+      || !['off', 'lines'].includes(p.monitoring.requested)
+      || typeof p.monitoring.active !== 'boolean'
+      || (p.monitoring.reason != null && typeof p.monitoring.reason !== 'string')
+      || !Number.isSafeInteger(p.monitoring.dropped_line_events)
+      || p.monitoring.dropped_line_events < 0)) return undefined;
     return p as unknown as Profile;
   } catch {
     return undefined;
@@ -172,7 +182,8 @@ export function memoryMb(e: LineEntry | undefined, mode: Profile["memory_mode"])
 
 export function heat(e: LineEntry | undefined, mode: Profile["memory_mode"], th: Thresholds,
                      insideSampledFn = false): Heat {
-  if (!e || (e.samples === 0 && memoryMb(e, mode) === 0)) return insideSampledFn ? "unknown" : "cold";
+  if (!e || (e.samples === 0 && memoryMb(e, mode) === 0))
+    return insideSampledFn || !!e?.line_events ? "unknown" : "cold";
   if (e.share >= th.hotShare || memoryMb(e, mode) >= th.hotMb || e.leak_runs) return "hot";
   return "unknown";
 }

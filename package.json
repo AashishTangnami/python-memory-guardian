@@ -146,6 +146,12 @@
           "minimum": 1,
           "maximum": 64,
           "markdownDescription": "Precise mode: traceback depth `tracemalloc` records per allocation. Higher values tie more memory allocated inside libraries back to your lines, but slow profiling (measured on `import pandas`: 2 frames 1.3 s, 8 frames 2.9 s, 32 frames 7.5 s)."
+        },
+        "pythonMemoryGuardian.profile.monitoring": {
+          "type": "string",
+          "enum": ["off", "lines"],
+          "default": "off",
+          "description": "Optional Python 3.12+ execution-event coverage. Counts user-line events; sampled timing and memory measurements are unchanged. Can increase overhead."
         }
       }
     },
