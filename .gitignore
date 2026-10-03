@@ -7,4 +7,5 @@
 /bin/
 /server/libs/
 /test-fixtures/profiler/out/
+/docs/06-marketplace-publish.md
 __pycache__/

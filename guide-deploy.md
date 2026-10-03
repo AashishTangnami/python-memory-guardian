@@ -301,14 +301,15 @@ npx vsce package --target linux-x64
 npx vsce package --target alpine-x64      # same static binary, second package
 ```
 
-Building all nine targets by hand is tedious. The CI workflow in 3.6 does it on GitHub's Linux, macOS and Windows runners.
+Building all nine targets by hand is tedious. Section 3.6 outlines an automated approach, but this checkout does not include that workflow.
 
 ### 3.6 Method C: automated releases with GitHub Actions and Entra ID
 
-The repository includes `.github/workflows/release.yml`. On a pushed tag such as `v1.3.0`, it:
-1. runs the full test suite;
-2. builds the universal package plus 8 platform packages (static musl for Linux, both macOS architectures, Windows x64/arm64 with `crt-static`);
-3. publishes them all with `vsce publish --azure-credential`, with no stored secret.
+This checkout does **not** include `.github/workflows/release.yml`. The workflow described below is a proposed setup; create and test it before using tag-triggered releases. A completed workflow should:
+
+1. run the full test suite;
+2. build the universal package and the platform packages you choose to support;
+3. publish them with an authentication method supported by the Marketplace.
 
 Microsoft's official instructions for identity-based publishing are written for **Azure Pipelines**. The GitHub Actions variant below follows the same model and is used by public projects (for example `github/vscode-codeql`), but it **has not been run as part of writing this guide**. Test it with a pre-release first (see 4.2).
 
@@ -341,7 +342,7 @@ git tag v1.3.1
 git push origin main v1.3.1
 ```
 
-Then watch **Actions → Release**. If you configured reviewers, approve the `publish` job when it asks.
+Only after creating the workflow and testing it, watch its Actions run for the tag. If you configured reviewers, approve the publish job when it asks.
 
 ### 3.7 Method D: Trusted Publishing (not available yet)
 
@@ -421,13 +422,13 @@ Prefer *unpublish* unless you're certain.
 - `npx vsce package`: universal package built with no warnings (160 files, 494.79 KB).
 - `npx vsce package --target linux-x64`: built, with the Rust binary present and executable (`-rwxr-xr-x`) and `TargetPlatform="linux-x64"` in the manifest.
 - The bundled `dist/extension.js` loads and exports `activate`.
-- The release workflow is valid YAML.
+- No release workflow is included in this checkout; the CI steps above are a design to implement and verify.
 - The glibc requirement of a glibc-built binary was measured (2.34).
 
 **Not run:**
 - an actual Marketplace upload or publish (it needs a real publisher account);
 - installing a VSIX into VS Code;
-- the GitHub Actions workflow, including the musl, macOS and Windows builds;
+- a GitHub Actions release workflow, including the musl, macOS and Windows builds;
 - the Entra ID setup.
 
 **Sources:**

@@ -13,6 +13,8 @@ It works on Linux, macOS and Windows, and inside containers (Dev Containers, Cod
 
 ## Contents
 
+**Short guides:** [Start here](docs/00-guides.md) · [Quick start](docs/01-quickstart.md) · [Using the extension](docs/02-using-the-extension.md) · [Container and remote setup](docs/03-container-setup.md) · [Developer setup](docs/04-developer-setup.md) · [Local deployment](docs/05-local-deploy.md).
+
 1. [Using the extension](#1-using-the-extension)
 2. [Containerized projects](#2-containerized-projects)
 3. [Developing the extension](#3-developing-the-extension)
@@ -37,7 +39,7 @@ Nothing else needs installing: the extension bundles its own copy of `pygls` (pi
 
 ### 1.2 Install
 
-1. Get the `` file: install from the Marketplace if it's published there, or build one with [guide-deploy.md](guide-deploy.md) (Part 1).
+1. Get the `.vsix` file: install from the Marketplace if it's published there, or build one with [guide-deploy.md](guide-deploy.md) (Part 1).
 2. In VS Code, open the Command Palette (**Ctrl+Shift+P**, or **Cmd+Shift+P** on macOS).
 3. Run **Extensions: Install from VSIX…** and pick the file.
 4. Reload the window when prompted.
@@ -256,7 +258,7 @@ Open the folder through **WSL: Connect to WSL** or **Remote-SSH: Connect to Host
 | VS Code | 1.82+ | run and debug the extension |
 | VS Code extensions | Python + Python Debugger (`ms-python.debugpy`); rust-analyzer (optional) | debugging |
 
-**Or skip all of this:** open the repo in VS Code and run **Dev Containers: Reopen in Container**. The included `.devcontainer/devcontainer.json` installs Node 20, Python 3.12, Rust and debugpy, then builds everything.
+The example under `examples/containerized-app/` has a Dev Container configuration. This checkout does not include a root `.devcontainer/devcontainer.json`; set up the development tools above for work on the extension itself.
 
 ### 3.2 Set up
 
@@ -283,22 +285,20 @@ The npm scripts find Python through `scripts/py.js`, which tries `python3`, then
 
 ### 3.3 Run it
 
-1. Open the repo folder in VS Code.
-2. Press **F5** (or pick **Run Extension** in the Run and Debug view).
-3. A second VS Code window opens: the *Extension Development Host*, with `test-fixtures/` loaded.
-4. Open `test-fixtures/native_patterns.py` and you'll see the diagnostics.
-5. Open `test-fixtures/profiler/holders_workload.py` and run **Profile Current File** (choose *precise*) to see leak holders.
+1. Build with `npm run vendor:python && npm run compile`, then launch `code --extensionDevelopmentPath=. test-fixtures` from the repo root. This checkout has no root F5 launch configuration.
+2. In the Extension Development Host, open `native_patterns.py` to see diagnostics.
+3. Open `profiler/holders_workload.py` and run **Profile Current File** (choose *precise*) to see leak holders.
 
-After editing TypeScript, run **Developer: Reload Window** in the development window. Run the **npm: watch** task for automatic recompiling.
+After editing TypeScript, run **Developer: Reload Window** in the development window. Run `npm run watch` in a shell for automatic TypeScript recompilation, then run `npm run bundle` to refresh the extension bundle.
 
 ### 3.4 Debug each part
 
 | Part | How |
 |---|---|
-| **TypeScript client** (`src/*.ts`) | set breakpoints, press **F5** (*Run Extension*) |
-| **Python language server** (`server/guardian_server.py`, `rules.py`) | pick **Extension + Python server (both debuggers)** and press F5. The server starts with `PMG_DEBUGPY=5678`, waits, and the debugger attaches. Breakpoints in `rules.py` hit when you open or edit a Python file in the development window |
+| **TypeScript client** (`src/*.ts`) | add a local extension-host launch configuration to use breakpoints; none is included in this checkout |
+| **Python language server** (`server/guardian_server.py`, `rules.py`) | add a local attach configuration if needed; no combined Python-server launch configuration is included |
 | **Rules without VS Code** | `python3 -c "import sys; sys.path.insert(0,'server'); import rules; [print(d.range.start.line+1, d.message[:80]) for d in rules.analyze(open('test-fixtures/native_patterns.py').read())]"` |
-| **Profiler** (`server/pmg_profile.py`) | **Debug profiler on a workload** launch config, or run it directly: `python3 server/pmg_profile.py --memory precise --out .pmg/profile.json test-fixtures/profiler/workload.py` |
+| **Profiler** (`server/pmg_profile.py`) | run it directly: `python3 server/pmg_profile.py --memory precise --out .pmg/profile.json test-fixtures/profiler/workload.py` |
 | **Rust server** | set `"pythonMemoryGuardian.backend": "rust"` in the development window. To step through it, attach a native debugger (CodeLLDB or gdb) to the running `guardian-server` process |
 | **LSP messages** | set `"pythonMemoryGuardian.trace.server": "verbose"` and read the *Python Memory Guardian* output channel |
 
@@ -310,7 +310,7 @@ npm test            # everything below, in order
 
 | Command | What it checks |
 |---|---|
-| `npm run test:parity` | the Python and Rust servers produce **identical** diagnostics over real LSP (4 fixtures × 3 interpreter profiles, with explicit scope regression expectations). If the Rust binary isn't built, it prints `SKIP` and checks the Python server on its own (set `PMG_REQUIRE_RUST=1` to make that a failure, as CI does) |
+| `npm run test:parity` | the Python and Rust servers produce **identical** diagnostics over real LSP (5 fixtures × 4 interpreter profiles, with explicit scope regression expectations). If the Rust binary isn't built, it prints `SKIP` and checks the Python server on its own (set `PMG_REQUIRE_RUST=1` to make that a failure) |
 | `node scripts/py.js test-fixtures/profiler_test.py` | profiler accuracy on workloads with known answers: time classification, leak detection, holder naming, snapshot budget (21 checks) |
 | `node test-fixtures/test_model.js` | editor-side logic: staleness, hot/cold rules, labels, messages. Uses the profiles written by the previous test, so run it after |
 | `node test-fixtures/test_container.js` | container path mapping, plus a simulated container run through an exec prefix |
@@ -445,13 +445,7 @@ These results come from one machine and a few workloads, not a general benchmark
 
 ```
 .
-├── .devcontainer/
-│   └── devcontainer.json          Extension development container
-├── .github/workflows/
-│   └── release.yml                CI, packaging, and publishing
-├── .vscode/
-│   ├── launch.json                Extension and profiler launch configs
-│   └── tasks.json                 Build tasks
+├── docs/                           Quick start, usage, setup, and publishing guides
 ├── examples/containerized-app/
 │   ├── .devcontainer/devcontainer.json
 │   ├── .vscode/settings.example.json
