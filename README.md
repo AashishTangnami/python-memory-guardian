@@ -14,6 +14,7 @@ It works on Linux, macOS and Windows, and inside containers (Dev Containers, Cod
 1. [Using the extension](#1-using-the-extension)
 2. [Containerized projects](#2-containerized-projects)
 3. [Developing the extension](#3-developing-the-extension)
+   - [Build, packaging, and verification](#37-build-packaging-and-verification-features)
 4. [Reference](#4-reference)
 5. [Troubleshooting](#5-troubleshooting)
 
@@ -298,7 +299,7 @@ npm test            # everything below, in order
 
 | Command | What it checks |
 |---|---|
-| `npm run test:parity` | the Python and Rust servers produce **identical** diagnostics over real LSP (3 fixtures × 3 interpreter profiles). If the Rust binary isn't built, it prints `SKIP` and checks the Python server on its own (set `PMG_REQUIRE_RUST=1` to make that a failure, as CI does) |
+| `npm run test:parity` | the Python and Rust servers produce **identical** diagnostics over real LSP (4 fixtures × 3 interpreter profiles, with explicit scope regression expectations). If the Rust binary isn't built, it prints `SKIP` and checks the Python server on its own (set `PMG_REQUIRE_RUST=1` to make that a failure, as CI does) |
 | `node scripts/py.js test-fixtures/profiler_test.py` | profiler accuracy on workloads with known answers: time classification, leak detection, holder naming, snapshot budget (21 checks) |
 | `node test-fixtures/test_model.js` | editor-side logic: staleness, hot/cold rules, labels, messages. Uses the profiles written by the previous test, so run it after |
 | `node test-fixtures/test_container.js` | container path mapping, plus a simulated container run through an exec prefix |
@@ -312,6 +313,42 @@ Both backends must stay identical, and the parity test enforces it.
 3. Implement the same detection in `rust-server/src/main.rs` (tree-sitter). To check node shapes, install the pinned development tools with `uv pip install --system -r requirements-dev.txt` and print the parse tree; don't guess them.
 4. Add positive **and** negative cases to a fixture in `test-fixtures/`.
 5. Run `npm run build:rust && npm run test:parity`. Both servers must produce the same output.
+
+### 3.7 Build, packaging, and verification features
+
+```mermaid
+flowchart LR
+    TS["TypeScript source"] --> Compile["npm run compile"]
+    Compile --> Out["out: compiled modules for tests"]
+    Compile --> Bundle["dist/extension.js: esbuild bundle"]
+    Requirements["Pinned Python requirements"] --> Vendor["npm run vendor:python"]
+    Vendor --> Libs["server/libs"]
+    RS["Rust source and shared messages"] --> Build["npm run build:rust"]
+    Build --> Copy["Copy release binary into bin"]
+    Bundle --> Package["VSIX packaging"]
+    Libs --> Package
+    Copy --> Package
+    Compile --> Tests["Parity, profiler, model, and container tests"]
+```
+
+| Capability | Repository support |
+|---|---|
+| Client compile/bundle | `npm run compile` runs TypeScript compilation and esbuild. `npm run bundle` bundles the extension separately; `npm run watch` watches TypeScript compilation but does not continuously rebuild the bundle. |
+| Python dependency vendoring | `npm run vendor:python` installs explicitly version-pinned runtime requirements into `server/libs`, using Python 3.9 as the resolver target. End-user environments do not need these packages installed separately. The requirements are version-pinned, not hash-pinned. |
+| Rust build | `npm run build:rust` creates a release build. Copy its executable to `bin` for the extension to find it. |
+| Packaging | `npm run package` runs `vsce package`; `vscode:prepublish` vendors Python dependencies and compiles/bundles the client. It does not build Rust automatically. |
+| Cross-platform test launcher | [scripts/py.js](scripts/py.js) tries Python 3.9+ through `python3`, `python`, then `py -3`; `PMG_PYTHON` overrides this selection. |
+| Full test entry point | `npm test` compiles, runs parity tests, then runtime tests. |
+| Backend parity | [test-fixtures/parity_test.py](test-fixtures/parity_test.py) exercises real stdio LSP with static fixtures and multiple interpreter profiles. Rust comparison is skipped if its binary is unavailable unless `PMG_REQUIRE_RUST=1` requires it. |
+| Source and peak regressions | [test-fixtures/profiler_regression_test.py](test-fixtures/profiler_regression_test.py) checks edits during execution, imported/new/deleted sources, normalized hashes, transient peaks, and consistency of the standalone profiler copy. |
+| Profiler verification | [test-fixtures/profiler_test.py](test-fixtures/profiler_test.py) checks known Python/native/waiting workloads, RSS growth, leak trends, holder names, source symbols, and snapshot budget. |
+| Editor model verification | [test-fixtures/test_model.js](test-fixtures/test_model.js) checks hashes, staleness, heat/severity, labels, holders, and unattributed-memory notes using generated reports. Run after profiler tests. |
+| Container verification | [test-fixtures/test_container.js](test-fixtures/test_container.js) checks mappings and a simulated exec-prefix probe/profile round trip. |
+| Examples and fixtures | Static positive/negative patterns plus dedicated timing, leak, and holder workloads under [test-fixtures](test-fixtures). |
+| Packaged runtime verification | `python test-fixtures/package_test.py path/to/extension.vsix` checks runtime files, development-file exclusions, and real LSP diagnostics from the extracted server. Run on the oldest and newest supported Python. |
+| Deployment documentation | [guide-deploy.md](guide-deploy.md) describes local VSIX installation and publishing workflows. These instructions are separate from runtime features. |
+
+This checkout does **not** contain the root `.devcontainer`, root `.vscode` launch/tasks files, or `.github/workflows/release.yml` referred to by existing documentation. Only the example application's Dev Container/settings files are present. Automated release CI and the referenced root debug configurations therefore are not included features of this tree. Publisher/repository URLs in the manifest also remain placeholders.
 
 ---
 
@@ -355,8 +392,8 @@ At startup the extension runs `server/probe.py` on your interpreter (inside the 
 
 **Time.** The profiler samples every 10 ms from a background thread. For each sample:
 - *system* time is wall time the thread spent off the CPU, read from the thread's own CPU clock;
-- the rest is split between *python* and *native* by how long the sampler waited for the GIL. Measured on CPython 3.12: about 5 ms (the switch interval) while bytecode runs, about 0.1 ms when C code released the GIL, and hundreds of ms when C code held it;
-- free-threaded builds have no GIL signal, so CPU time is reported unsplit.
+- the rest is split between *python* and *native* by estimated GIL waiting time, after subtracting a calibrated idle timer delay and excluding the sampler's own work. Measured on CPython 3.12: about 5 ms (the switch interval) while bytecode runs, about 0.1 ms when C code released the GIL, and hundreds of ms when C code held it;
+- calibration uses nine short sleeps before timing/tracing starts (roughly 0.1 s at the default interval). Scheduler noise can still affect this estimate; free-threaded builds have no GIL signal, so CPU time is reported unsplit.
 
 **Memory.**
 - *fast* mode attributes RSS growth to the running line.

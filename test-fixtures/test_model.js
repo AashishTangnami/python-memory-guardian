@@ -12,6 +12,9 @@ for (const mode of ["fast", "precise"]) {
   assert.strictEqual(idx.state(file, src.replace(/\n/g, "\r\n")), "fresh", "CRLF-insensitive");
   assert.strictEqual(idx.state(file, src + "\n# edit"), "stale", "edits invalidate");
   assert.strictEqual(idx.state("/elsewhere.py", src), "absent");
+  const invalidated = new m.ProfileIndex({ ...p, file_hashes: {} });
+  assert.strictEqual(invalidated.state(file, src), "stale",
+    "source changed during profiling: omitted hash must never count as fresh");
   console.log(`--- ${mode} mode`);
   for (const ln of [7, 12, 16, 19, 24, 29, 34]) {
     const e = idx.line(file, ln), h = m.heat(e, p.memory_mode, th, idx.insideSampledFunction(file, ln));

@@ -1,0 +1,25 @@
+# The client and its npm runtime dependencies are bundled in dist/extension.js.
+node_modules/**
+out/**
+src/**
+rust-server/**
+scripts/**
+test-fixtures/**
+examples/**
+requirements-dev.txt
+tsconfig.json
+package-lock.json
+pmg_profile.py
+
+# Keep server/libs (including licenses) and an optional bin/guardian-server.
+# Exclude development caches, interpreter-specific bytecode, and build artifacts.
+.*
+.*/**
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+**/*.map
+**/.DS_Store
+**/.pmg/**
+*.vsix
+*.zip

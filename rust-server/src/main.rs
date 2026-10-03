@@ -332,6 +332,7 @@ struct ClassInfo<'t> {
     cycle_edge: Option<Node<'t>>,
 }
 
+#[derive(Clone)]
 struct Index<'t> {
     imports: HashMap<String, String>,
     functions: HashMap<String, Node<'t>>,
@@ -412,9 +413,68 @@ fn needs_slots(cls: Node, src: &[u8], imports: &HashMap<String, String>) -> bool
     true
 }
 
+fn scope_nodes(root: Node) -> Vec<Node> {
+    fn walk<'t>(n: Node<'t>, out: &mut Vec<Node<'t>>) {
+        out.push(n);
+        if !["function_definition", "class_definition", "lambda"].contains(&n.kind()) {
+            for c in named_children(n) { walk(c, out); }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(body) = field(root, "body") {
+        walk(body, &mut out);
+    } else {
+        for c in named_children(root) { walk(c, &mut out); }
+    }
+    out
+}
+
+fn target_names(n: Node, src: &[u8], names: &mut HashSet<String>) {
+    if n.kind() == "identifier" {
+        names.insert(txt(n, src).to_string());
+    } else if ["pattern_list", "tuple_pattern", "list_pattern", "list_splat_pattern",
+               "as_pattern_target", "tuple", "list"].contains(&n.kind()) {
+        for c in named_children(n) { target_names(c, src, names); }
+    }
+}
+
+fn bound_names(root: Node, src: &[u8]) -> HashSet<String> {
+    let mut names: HashSet<String> = param_names(root, src).into_iter().collect();
+    let mut external = HashSet::new();
+    for n in scope_nodes(root) {
+        match n.kind() {
+            "function_definition" | "class_definition" => {
+                if let Some(name) = field(n, "name") { names.insert(txt(name, src).to_string()); }
+            }
+            "assignment" | "augmented_assignment" | "for_statement" => {
+                if let Some(left) = field(n, "left") { target_names(left, src, &mut names); }
+            }
+            "named_expression" => {
+                if let Some(name) = field(n, "name") { target_names(name, src, &mut names); }
+            }
+            "as_pattern" => {
+                if let Some(alias) = field(n, "alias") { target_names(alias, src, &mut names); }
+            }
+            "delete_statement" => {
+                for c in named_children(n) { target_names(c, src, &mut names); }
+            }
+            "global_statement" | "nonlocal_statement" => {
+                for c in named_children(n) { target_names(c, src, &mut external); }
+            }
+            _ => {}
+        }
+    }
+    names.extend(index(root, src).imports.into_keys());
+    names.retain(|name| !external.contains(name));
+    names
+}
+
 fn index<'t>(root: Node<'t>, src: &[u8]) -> Index<'t> {
-    let mut imports = HashMap::new();
-    for_each_node(root, |n| match n.kind() {
+    index_with_imports(root, src, HashMap::new())
+}
+
+fn index_with_imports<'t>(root: Node<'t>, src: &[u8], mut imports: HashMap<String, String>) -> Index<'t> {
+    for n in scope_nodes(root) { match n.kind() {
         "import_statement" => {
             for c in named_children(n) {
                 match c.kind() {
@@ -432,7 +492,7 @@ fn index<'t>(root: Node<'t>, src: &[u8]) -> Index<'t> {
             }
         }
         "import_from_statement" => {
-            let Some(m) = field(n, "module_name").filter(|m| m.kind() == "dotted_name") else { return };
+            let Some(m) = field(n, "module_name").filter(|m| m.kind() == "dotted_name") else { continue };
             let module = txt(m, src);
             let mut c = n.walk();
             for name in n.children_by_field_name("name", &mut c) {
@@ -447,10 +507,10 @@ fn index<'t>(root: Node<'t>, src: &[u8]) -> Index<'t> {
             }
         }
         _ => {}
-    });
+    }}
     let mut functions = HashMap::new();
     let mut classes = HashMap::new();
-    for_each_node(root, |n| match n.kind() {
+    for n in scope_nodes(root) { match n.kind() {
         "function_definition" => {
             if let Some(name) = field(n, "name") {
                 functions.insert(txt(name, src).to_string(), n);
@@ -465,11 +525,25 @@ fn index<'t>(root: Node<'t>, src: &[u8]) -> Index<'t> {
             }
         }
         _ => {}
-    });
+    }}
     Index { imports, functions, classes }
 }
 
 // ---------------------------------------------------------------- thread target classification
+fn scoped_index<'t>(root: Node<'t>, src: &[u8], parent: &Index<'t>) -> Index<'t> {
+    let mut idx = parent.clone();
+    for name in bound_names(root, src) {
+        idx.imports.insert(name.clone(), "<local>".into());
+        idx.functions.remove(&name);
+        idx.classes.remove(&name);
+    }
+    let local = index_with_imports(root, src, idx.imports.clone());
+    idx.imports.extend(local.imports);
+    idx.functions.extend(local.functions);
+    idx.classes.extend(local.classes);
+    idx
+}
+
 #[derive(Default)]
 struct WorkProfile<'t> {
     io: bool,
@@ -478,6 +552,7 @@ struct WorkProfile<'t> {
 }
 
 fn classify<'t>(fn_node: Node<'t>, idx: &Index<'t>, src: &[u8], seen: &mut HashSet<String>) -> WorkProfile<'t> {
+    let idx = scoped_index(fn_node, src, idx);
     if let Some(n) = field(fn_node, "name") {
         seen.insert(txt(n, src).to_string());
     }
@@ -490,7 +565,7 @@ fn classify<'t>(fn_node: Node<'t>, idx: &Index<'t>, src: &[u8], seen: &mut HashS
     let mut prof = WorkProfile::default();
     let mut calls = Vec::new();
     // Pre-order DFS visits nodes in source order, so the first match is the earliest loop.
-    for_each_node(fn_node, |n| {
+    for n in scope_nodes(fn_node) {
         if prof.data_loop.is_none() {
             prof.data_loop = match n.kind() {
                 "for_statement" => field(n, "right").filter(|r| uses_param(*r)).map(|_| n),
@@ -502,7 +577,7 @@ fn classify<'t>(fn_node: Node<'t>, idx: &Index<'t>, src: &[u8], seen: &mut HashS
         if n.kind() == "call" {
             calls.push(n);
         }
-    });
+    }
     for call in calls {
         let Some(f) = field(call, "function") else { continue };
         let q = qualname(f, src, &idx.imports).unwrap_or_default();
@@ -518,7 +593,7 @@ fn classify<'t>(fn_node: Node<'t>, idx: &Index<'t>, src: &[u8], seen: &mut HashS
             let name = txt(f, src);
             if let Some(sub_fn) = idx.functions.get(name) {
                 if !seen.contains(name) {
-                    let sub = classify(*sub_fn, idx, src, seen);
+                    let sub = classify(*sub_fn, &idx, src, seen);
                     prof.io |= sub.io;
                     prof.native |= sub.native;
                 }
@@ -540,6 +615,16 @@ struct Finding {
     subject: Option<String>,
 }
 
+#[derive(Clone)]
+struct ScopeState<'t> {
+    idx: Index<'t>,
+    strings: HashSet<String>,
+    lists: HashSet<String>,
+    executors: HashSet<String>,
+    loop_depth: usize,
+    class_parent: Option<Box<ScopeState<'t>>>,
+}
+
 struct Visitor<'t, 's> {
     src: &'s [u8],
     idx: Index<'t>,
@@ -551,9 +636,38 @@ struct Visitor<'t, 's> {
     str_names: HashSet<String>,
     list_names: HashSet<String>,
     executors: HashSet<String>,
+    class_parent: Option<Box<ScopeState<'t>>>,
 }
 
 impl<'t, 's> Visitor<'t, 's> {
+    fn state(&self) -> ScopeState<'t> {
+        ScopeState { idx: self.idx.clone(), strings: self.str_names.clone(),
+            lists: self.list_names.clone(), executors: self.executors.clone(),
+            loop_depth: self.loop_depth, class_parent: self.class_parent.clone() }
+    }
+
+    fn restore(&mut self, s: ScopeState<'t>) {
+        self.idx = s.idx;
+        self.str_names = s.strings;
+        self.list_names = s.lists;
+        self.executors = s.executors;
+        self.loop_depth = s.loop_depth;
+        self.class_parent = s.class_parent;
+    }
+
+    fn enter_scope(&mut self, n: Node<'t>, base: ScopeState<'t>) {
+        self.restore(base);
+        let bound = bound_names(n, self.src);
+        self.idx = scoped_index(n, self.src, &self.idx);
+        for name in &bound {
+            self.str_names.remove(name);
+            self.list_names.remove(name);
+            self.executors.remove(name);
+        }
+        self.loop_depth = 0;
+        self.class_parent = None;
+    }
+
     fn add(&mut self, n: Node, key: &'static str, sev: DiagnosticSeverity, local: Vec<(&'static str, String)>) {
         self.add_s(n, key, sev, local, None);
     }
@@ -580,14 +694,33 @@ impl<'t, 's> Visitor<'t, 's> {
         match n.kind() {
             "function_definition" => {
                 self.check_cache_decorators(n);
+                if let Some(params) = field(n, "parameters") { self.visit(params); }
+                let saved = self.state();
+                let base = self.class_parent.as_deref().cloned().unwrap_or_else(|| saved.clone());
+                self.enter_scope(n, base);
                 self.async_stack.push(is_async(n));
-                self.children(n);
+                if let Some(body) = field(n, "body") { self.visit(body); }
                 self.async_stack.pop();
+                self.restore(saved);
             }
             "lambda" => {
+                if let Some(params) = field(n, "parameters") { self.visit(params); }
+                let saved = self.state();
+                let base = self.class_parent.as_deref().cloned().unwrap_or_else(|| saved.clone());
+                self.enter_scope(n, base);
                 self.async_stack.push(false);
-                self.children(n);
+                if let Some(body) = field(n, "body") { self.visit(body); }
                 self.async_stack.pop();
+                self.restore(saved);
+            }
+            "class_definition" => {
+                if let Some(bases) = field(n, "superclasses") { self.visit(bases); }
+                let saved = self.state();
+                self.enter_scope(n, saved.clone());
+                self.loop_depth = saved.loop_depth; // Class bodies execute immediately.
+                self.class_parent = Some(saved.class_parent.clone().unwrap_or_else(|| Box::new(saved.clone())));
+                if let Some(body) = field(n, "body") { self.visit(body); }
+                self.restore(saved);
             }
             "for_statement" => {
                 if let Some(it) = field(n, "right") {
@@ -633,6 +766,7 @@ impl<'t, 's> Visitor<'t, 's> {
                 self.loop_depth -= 1;
             }
             "assignment" => {
+                if let Some(r) = field(n, "right") { self.visit(r); }
                 if let (Some(l), Some(r), None) = (field(n, "left"), field(n, "right"), field(n, "type")) {
                     if l.kind() == "identifier" {
                         let name = txt(l, src).to_string();
@@ -642,11 +776,16 @@ impl<'t, 's> Visitor<'t, 's> {
                         if r.kind() == "call"
                             && field(r, "function").map_or(false, |f| EXECUTOR_CTORS.contains(&self.q(f).as_str()))
                         {
-                            self.executors.insert(name);
+                            self.executors.insert(name.clone());
+                        } else {
+                            self.executors.remove(&name);
                         }
+                        self.idx.imports.insert(name.clone(), "<local>".into());
+                        self.idx.functions.remove(&name);
+                        self.idx.classes.remove(&name);
                     }
                 }
-                self.children(n);
+                if let Some(l) = field(n, "left") { self.visit(l); }
             }
             "with_item" => {
                 if let Some(v) = field(n, "value").filter(|v| v.kind() == "as_pattern") {
@@ -892,7 +1031,7 @@ fn analyze(text: &str, uri: &Url, facts: &Facts) -> Option<Vec<Diagnostic>> {
     let mut v = Visitor {
         src, idx: index(root, src), facts, out: vec![], loop_depth: 0, async_stack: vec![false],
         reported_cycles: HashSet::new(), str_names: HashSet::new(), list_names: HashSet::new(),
-        executors: HashSet::new(),
+        executors: HashSet::new(), class_parent: None,
     };
     v.visit(root);
 

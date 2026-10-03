@@ -8,13 +8,15 @@
 # 1. Pinned for the OLDEST supported Python (3.9), because the bundle must work on
 #    every Python a user might run. uv resolves for the requested target version, so
 #    an unpinned build on 3.12 picks cattrs 26.x, which requires Python >= 3.10.
+#    cattrs 25.3.0 supports 3.9 through 3.14; keep this pin until the minimum
+#    supported Python changes (https://pypi.org/project/cattrs/25.3.0/).
 # 2. Complete and without environment markers. cattrs needs exceptiongroup only on
 #    Python < 3.11; a resolver evaluates that marker against its target interpreter, so
 #    a build on 3.11+ silently omitted it and the server failed on 3.9/3.10 with
 #    "No module named 'exceptiongroup'". It is listed unconditionally here; on 3.11+
 #    it simply defers to the built-in ExceptionGroup.
-# Verified with the server's LSP parity test on CPython 3.9.25, 3.10.20, 3.12.3,
-# 3.13.13 and 3.14.4.
+# Validate changes with real LSP parity tests on the oldest and newest supported
+# Python, plus test-fixtures/package_test.py against the built VSIX.
 #
 # To update: change a version, then run `npm run vendor:python && npm test` on the
 # oldest and newest supported Python.
@@ -22,6 +24,6 @@
 pygls==2.1.1
 lsprotocol==2025.0.0
 attrs==26.1.0
-cattrs==26.2.1
+cattrs==25.3.0
 typing-extensions==4.16.0
 exceptiongroup==1.3.1

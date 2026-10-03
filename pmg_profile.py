@@ -10,7 +10,8 @@ TIME (sampling, ~1% overhead), split three ways for each sample:
   system  wall time the thread was off-CPU (I/O, sleep, lock waits) - from the
           thread's own CPU clock vs wall clock.
   native  CPU time in C code. Signal: how long this sampler thread waited for the
-          GIL. Python bytecode yields the GIL at the switch interval
+          GIL, after subtracting a calibrated idle timer delay and excluding the
+          sampler's own work. Python bytecode yields the GIL at the switch interval
           (sys.getswitchinterval(), 5 ms default), so a wait of ~1 interval means
           bytecode was running; ~0 while the thread burned CPU means C code had
           released the GIL; >> 1 interval means C code held it ("the actual value
@@ -38,6 +39,7 @@ import hashlib
 import json
 import os
 import runpy
+import statistics
 import sys
 import sysconfig
 import threading
@@ -140,6 +142,22 @@ def _gil_enabled() -> bool:
     return True if f is None else bool(f())
 
 
+def _sleep_overhead(interval: float) -> float:
+    """Measure timer oversleep before user code starts, without GIL contention.
+
+    OS timer coalescing can add milliseconds to sleep even when Python is idle.
+    Use a median so an isolated scheduling pause does not skew the baseline.
+    Bound startup cost for unusually large requested sampling intervals.
+    """
+    delay = min(interval, 0.01)
+    overshoots = []
+    for _ in range(9):
+        before = time.perf_counter()
+        time.sleep(delay)
+        overshoots.append(max(0.0, time.perf_counter() - before - delay))
+    return statistics.median(overshoots)
+
+
 class LineStats:
     __slots__ = ("python_s", "native_s", "system_s", "cpu_s", "samples", "rss_up", "rss_down",
                  "transient", "traced_up", "func")
@@ -172,11 +190,54 @@ class Profiler:
         self.rss, self.rss_kind = _make_rss_reader()
         self.split = _gil_enabled()
         self.switch = sys.getswitchinterval()
+        self.sleep_overhead = 0.0
         self.snapshots: list[tuple[float, dict, dict]] = []  # (t, held{loc:bytes}, None)
         self.snap_cost = 0.0
         self.timeline: list[tuple[float, float, float]] = []
         self.peak_traced = 0
         self.samples = 0
+        self._source_versions: dict[str, tuple[tuple, str]] = {}
+
+    @staticmethod
+    def _source_version(path: str) -> tuple:
+        st = os.stat(path)
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+    def _remember_sources(self):
+        """Record identities before execution, including files imported later.
+
+        A file created or changed during the run must not be certified fresh from
+        its exit-time contents. Retain hashes rather than source buffers. This
+        inventory runs before timing/tracing starts; hashes also protect platforms
+        whose stat change-time field is actually a creation timestamp.
+        """
+        for directory, dirs, names in os.walk(self.root):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d != 'node_modules'
+                       and self._is_user(os.path.join(directory, d, '_source.py'))]
+            for name in names:
+                path = os.path.abspath(os.path.join(directory, name))
+                if name.endswith(('.py', '.pyw')) and self._is_user(path):
+                    try:
+                        version = self._source_version(path)
+                        with open(path, 'rb') as f:
+                            digest = hashlib.sha1(f.read().replace(b"\r\n", b"\n")).hexdigest()
+                        if self._source_version(path) == version:
+                            self._source_versions[os.path.normcase(path)] = (version, digest)
+                    except OSError:
+                        pass
+
+    def _unchanged_source(self, path: str) -> bytes | None:
+        """Return source only if its identity stayed stable throughout this run."""
+        expected = self._source_versions.get(os.path.normcase(path))
+        try:
+            if expected is None or self._source_version(path) != expected[0]:
+                return None
+            with open(path, 'rb') as f:
+                source = f.read()
+            digest = hashlib.sha1(source.replace(b"\r\n", b"\n")).hexdigest()
+            return source if self._source_version(path) == expected[0] and digest == expected[1] else None
+        except OSError:
+            return None
 
     def _is_user(self, filename: str) -> bool:
         hit = self._user_cache.get(filename)
@@ -219,12 +280,15 @@ class Profiler:
         t0 = last_wall
         last_snap_t, last_snap_traced, prev_traced = 0.0, 0, 0
         while not self._stop.is_set():
+            sleep_started = time.perf_counter()
             time.sleep(self.interval)
             now = time.perf_counter()          # first thing after re-acquiring the GIL
             proc = time.process_time()
             dw, dproc = now - last_wall, proc - last_proc
             last_wall, last_proc = now, proc
-            wait = max(0.0, dw - self.interval)
+            # Only sleep overshoot is a possible GIL signal. The preceding
+            # sample/snapshot work and the idle timer baseline are not GIL waits.
+            wait = max(0.0, now - sleep_started - self.interval - self.sleep_overhead)
             self.samples += 1
 
             per_thread = []
@@ -283,6 +347,7 @@ class Profiler:
             traced = 0
             if self.memory == "precise":
                 traced, interval_peak = tracemalloc.get_traced_memory()
+                self.peak_traced = max(self.peak_traced, interval_peak)
                 if hasattr(tracemalloc, "reset_peak"):          # 3.9+
                     tracemalloc.reset_peak()
                     # A peak that rose and fell between samples (e.g. inside a C call that
@@ -375,6 +440,8 @@ class Profiler:
         self.snapshots.append((t, held, unattributed))
 
     def start(self):
+        self._remember_sources()
+        self.sleep_overhead = _sleep_overhead(self.interval) if self.split else 0.0
         if self.memory == "precise":
             tracemalloc.start(self.frames)
         self.rss0 = self.rss() if self.rss_kind else None
@@ -390,8 +457,8 @@ class Profiler:
         self.holders: dict = {}
         self.rss1 = self.rss() if self.rss_kind else None    # before our own snapshot work
         if self.memory == "precise":
-            self._snapshot(self.wall)          # what is still held at exit
             self.peak_traced = max(self.peak_traced, tracemalloc.get_traced_memory()[1])
+            self._snapshot(self.wall)          # what is still held at exit
             leaks = self._leaks()
             if leaks:                          # needs tracemalloc still running
                 self.holders = self._find_holders(set(leaks), main_globals)
@@ -496,11 +563,10 @@ class Profiler:
         return out
 
     @staticmethod
-    def _symbols(path: str) -> dict:
+    def _symbols(source: bytes) -> dict:
         """line -> {"scope": "Service.handle()", "assigns": [...], "calls": [...]} via ast."""
         try:
-            with open(path, "rb") as f:
-                tree = ast.parse(f.read())
+            tree = ast.parse(source)
         except (OSError, SyntaxError, ValueError):
             return {}
         out: dict = {}
@@ -560,6 +626,7 @@ class Profiler:
         files: dict[str, dict] = {}
         funcs: dict[str, dict] = {}
         symbols: dict[str, dict] = {}
+        hashes = {}
         for loc in set(self.lines) | set(peak) | set(end):
             st = self.lines.get(loc) or LineStats()
             t = st.python_s + st.native_s + st.system_s + st.cpu_s
@@ -570,7 +637,12 @@ class Profiler:
                  "rss_growth_mb": round(st.rss_up / 1e6, 3), "rss_release_mb": round(st.rss_down / 1e6, 3)}
             if st.func is not None:
                 e["func_line"] = st.func[1]
-            sym = symbols.setdefault(loc[0], self._symbols(loc[0])).get(loc[1])
+            if loc[0] not in symbols:
+                source = self._unchanged_source(loc[0])
+                symbols[loc[0]] = self._symbols(source) if source is not None else {}
+                if source is not None:
+                    hashes[loc[0]] = hashlib.sha1(source.replace(b"\r\n", b"\n")).hexdigest()
+            sym = symbols[loc[0]].get(loc[1])
             if sym:
                 if sym["scope"]:
                     e["scope"] = sym["scope"]
@@ -597,7 +669,7 @@ class Profiler:
                 if "." not in fname:
                     # Python < 3.11 has no co_qualname: recover "Class.method" from the source.
                     # co_firstlineno points at the first decorator, so scan forward to the def.
-                    syms = symbols.setdefault(loc[0], self._symbols(loc[0]))
+                    syms = symbols[loc[0]]
                     for ln in range(st.func[1], st.func[1] + 20):
                         sc = (syms.get(ln) or {}).get("scope") or ""
                         if sc.endswith("()") and sc[:-2].split(".")[-1] == fname:
@@ -613,19 +685,14 @@ class Profiler:
                 fn["transient_peak_mb"] = max(fn["transient_peak_mb"], e.get("transient_peak_mb", 0))
                 fn["alloc_mb"] = round(fn["alloc_mb"] + e.get("alloc_mb", 0), 3)
                 fn["rss_growth_mb"] = round(fn["rss_growth_mb"] + e["rss_growth_mb"], 3)
-        hashes = {}
-        for path in files:
-            try:
-                with open(path, "rb") as f:
-                    hashes[path] = hashlib.sha1(f.read().replace(b"\r\n", b"\n")).hexdigest()
-            except OSError:
-                pass
+        hashes = {path: digest for path, digest in hashes.items() if path in files}
         step = max(1, len(self.timeline) // 300)
         return {
             "schema": SCHEMA, "script": os.path.abspath(script),
             "python": "%d.%d.%d" % sys.version_info[:3], "gil_split": self.split,
             "wall_s": round(self.wall, 4), "cpu_s": round(self.cpu, 4),
             "interval_s": self.interval, "samples": self.samples, "memory_mode": self.memory,
+            "sleep_overhead_s": round(self.sleep_overhead, 6),
             "rss_kind": self.rss_kind,
             "per_thread_cpu": any(c is not None for c in self._clocks.values()),
             "snapshot_cost_s": round(self.snap_cost, 3), "snapshots": len(self.snapshots),

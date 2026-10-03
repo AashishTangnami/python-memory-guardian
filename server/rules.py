@@ -196,9 +196,45 @@ def _needs_slots(cls: ast.ClassDef, imports: dict[str, str]) -> bool:
     return True
 
 
-def index_file(tree: ast.Module) -> FileIndex:
-    idx = FileIndex()
-    for node in ast.walk(tree):
+def scope_nodes(tree):
+    """Walk one lexical body, yielding nested definitions but not their bodies."""
+    pending = list(reversed(tree.body if isinstance(tree.body, list) else [tree.body]))
+    while pending:
+        node = pending.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            pending.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def bound_names(tree) -> set[str]:
+    names, external = set(), set()
+    nodes = list(scope_nodes(tree))
+    comprehension_targets = {id(n) for c in nodes if isinstance(c, ast.comprehension)
+                             for n in ast.walk(c.target)}
+    for node in nodes:
+        if (isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+                and id(node) not in comprehension_targets):
+            names.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Import):
+            names.update(a.asname or a.name.split('.')[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(a.asname or a.name for a in node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            external.update(node.names)
+    if hasattr(tree, 'args'):
+        a = tree.args
+        names.update(x.arg for x in a.posonlyargs + a.args + a.kwonlyargs)
+        names.update(x.arg for x in (a.vararg, a.kwarg) if x)
+    return names - external
+
+
+def index_file(tree, imports=None) -> FileIndex:
+    idx = FileIndex(imports=dict(imports or {}))
+    for node in scope_nodes(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
                 if a.asname:
@@ -209,11 +245,24 @@ def index_file(tree: ast.Module) -> FileIndex:
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             for a in node.names:
                 idx.imports[a.asname or a.name] = f"{node.module}.{a.name}"
-    for node in ast.walk(tree):
+    for node in scope_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             idx.functions[node.name] = node
         elif isinstance(node, ast.ClassDef):
             idx.classes[node.name] = ClassInfo(_needs_slots(node, idx.imports), _cycle_edge(node))
+    return idx
+
+
+def scoped_index(tree, parent: FileIndex) -> FileIndex:
+    idx = FileIndex(dict(parent.imports), dict(parent.functions), dict(parent.classes))
+    for name in bound_names(tree):
+        idx.imports[name] = '<local>'
+        idx.functions.pop(name, None)
+        idx.classes.pop(name, None)
+    local = index_file(tree, idx.imports)
+    idx.imports.update(local.imports)
+    idx.functions.update(local.functions)
+    idx.classes.update(local.classes)
     return idx
 
 
@@ -229,6 +278,7 @@ def classify(fn: ast.AST, idx: FileIndex, seen: set[str] | None = None) -> WorkP
     """What does this function do with the data it is handed?"""
     seen = seen or set()
     seen.add(fn.name)
+    idx = scoped_index(fn, idx)
     prof = WorkProfile()
     a = fn.args
     params = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}
@@ -239,7 +289,7 @@ def classify(fn: ast.AST, idx: FileIndex, seen: set[str] | None = None) -> WorkP
         return any(isinstance(n, ast.Name) and n.id in params for n in ast.walk(expr))
 
     loops = []
-    for node in ast.walk(fn):
+    for node in scope_nodes(fn):
         if isinstance(node, (ast.For, ast.AsyncFor)) and uses_param(node.iter):
             loops.append(node)
         elif isinstance(node, ast.While) and uses_param(node.test):
@@ -296,6 +346,7 @@ class Visitor(ast.NodeVisitor):
         self.str_names: set[str] = set()
         self.list_names: set[str] = set()
         self.executors: set[str] = set()
+        self.class_parent = None
 
     def add(self, *a, **k):
         self.out.append(Finding(*a, **k))
@@ -304,11 +355,33 @@ class Visitor(ast.NodeVisitor):
         return qualname(node, self.idx.imports)
 
     # ---- scopes
+    def _state(self):
+        return self.idx, self.str_names, self.list_names, self.executors, self.loop_depth, self.class_parent
+
+    def _restore(self, state):
+        self.idx, self.str_names, self.list_names, self.executors, self.loop_depth, self.class_parent = state
+
+    def _enter_scope(self, node, base):
+        idx, strings, lists, executors, _, _ = base
+        bound = bound_names(node)
+        self.idx = scoped_index(node, idx)
+        self.str_names, self.list_names = strings - bound, lists - bound
+        self.executors = executors - bound
+        self.loop_depth = 0
+        self.class_parent = None
+
     def _visit_func(self, node, is_async: bool):
         self._check_cache_decorators(node)
+        # Defaults and decorators execute in the enclosing scope.
+        for expr in node.decorator_list + node.args.defaults + [x for x in node.args.kw_defaults if x]:
+            self.visit(expr)
+        saved = self._state()
+        self._enter_scope(node, self.class_parent or saved)
         self.async_stack.append(is_async)
-        self.generic_visit(node)
+        for stmt in node.body:
+            self.visit(stmt)
         self.async_stack.pop()
+        self._restore(saved)
 
     def visit_FunctionDef(self, node):
         self._visit_func(node, False)
@@ -317,15 +390,27 @@ class Visitor(ast.NodeVisitor):
         self._visit_func(node, True)
 
     def visit_Lambda(self, node):
+        for expr in node.args.defaults + [x for x in node.args.kw_defaults if x]:
+            self.visit(expr)
+        saved = self._state()
+        self._enter_scope(node, self.class_parent or saved)
         self.async_stack.append(False)
-        self.generic_visit(node)
+        self.visit(node.body)
         self.async_stack.pop()
+        self._restore(saved)
 
     def visit_ClassDef(self, node):
+        for expr in node.decorator_list + node.bases + [k.value for k in node.keywords]:
+            self.visit(expr)
+        saved = self._state()
+        self._enter_scope(node, saved)
+        self.loop_depth = saved[4]  # Class bodies execute immediately in the surrounding loop.
+        self.class_parent = saved[-1] or saved
         for stmt in node.body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 stmt._pmg_method = True  # noqa: SLF001 - marker for cache rule
-        self.generic_visit(node)
+            self.visit(stmt)
+        self._restore(saved)
 
     # ---- loops
     def _visit_loop(self, node):
@@ -365,13 +450,19 @@ class Visitor(ast.NodeVisitor):
 
     # ---- name tracking (str / list variables, executors)
     def visit_Assign(self, node):
+        self.visit(node.value)
         for t in node.targets:
             if isinstance(t, ast.Name):
                 (self.str_names.add if _is_strish(node.value) else self.str_names.discard)(t.id)
                 (self.list_names.add if _is_listish(node.value) else self.list_names.discard)(t.id)
                 if isinstance(node.value, ast.Call) and self.q(node.value.func) in EXECUTOR_CTORS:
                     self.executors.add(t.id)
-        self.generic_visit(node)
+                else:
+                    self.executors.discard(t.id)
+                self.idx.imports[t.id] = '<local>'
+                self.idx.functions.pop(t.id, None)
+                self.idx.classes.pop(t.id, None)
+            self.visit(t)
 
     def visit_With(self, node):
         for item in node.items:

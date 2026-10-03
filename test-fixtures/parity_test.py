@@ -72,11 +72,22 @@ if __name__ == "__main__":
             sys.exit("FAIL " + msg)
         print("SKIP " + msg + "\n     Checking the Python server on its own instead.")
     failures = 0
-    for fixture in ("sample.py", "native_patterns.py", "edge_cases.py"):
+    for fixture in ("sample.py", "native_patterns.py", "edge_cases.py", "scope_cases.py"):
         text = open(os.path.join(HERE, fixture), encoding="utf-8").read()
         for pname, prof in profiles.items():
             try:
                 py = run(SERVERS["python"], prof, text)
+                if fixture == "scope_cases.py":
+                    expected = set()
+                    for line, source in enumerate(text.splitlines()):
+                        if '# expect:' in source:
+                            expected.add((line, source.split('# expect:')[1].strip()))
+                        if '# expect-gil:' in source and prof.get('gil_state') != 'disabled':
+                            expected.add((line, source.split('# expect-gil:')[1].strip()))
+                    actual = {(row[0], row[4]) for row in py}
+                    if actual != expected:
+                        failures += 1
+                        print(f"FAIL  scope expectations / {pname}: missing={expected - actual}, extra={actual - expected}")
                 if not have_rust:
                     ok = len(py) > 0
                     failures += not ok
