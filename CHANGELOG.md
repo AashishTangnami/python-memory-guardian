@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+
+## 1.4.0
 - Add opt-in Python 3.12+ `sys.monitoring` line-event coverage with unavailable-tool fallback; keep sampled timing and stacks unchanged, and avoid marking observed but unsampled lines cold.
 - Keep one profiler implementation at `server/pmg_profile.py`; remove the duplicate root script and its synchronization check.
 - Add a native Memory Guardian Report, with retained-memory trends, observed holders, and targeted investigation recommendations before the interactive Stack Explorer view.

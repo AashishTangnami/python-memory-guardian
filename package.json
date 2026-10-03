@@ -2,7 +2,7 @@
   "name": "python-memory-guardian",
   "displayName": "Python Memory Guardian",
   "description": "Static + runtime analysis for CPython: flags heap inflation, RAM fragmentation, text inflation, memory swell and single-threaded stalls as you type, and measures per-line time (Python / native / system) and memory with a built-in low-overhead profiler.",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "publisher": "your-publisher-id",
   "license": "MIT",
   "engines": {
@@ -128,7 +128,7 @@
               "container"
             ]
           },
-          "markdownDescription": "Host \u2194 container path pairs for container mode, e.g. `[{\"local\": \"${workspaceFolder}\", \"container\": \"/app\"}]` (the folder your compose file bind-mounts)."
+          "markdownDescription": "Host ↔ container path pairs for container mode, e.g. `[{\"local\": \"${workspaceFolder}\", \"container\": \"/app\"}]` (the folder your compose file bind-mounts)."
         },
         "pythonMemoryGuardian.trace.server": {
           "type": "string",
@@ -149,7 +149,10 @@
         },
         "pythonMemoryGuardian.profile.monitoring": {
           "type": "string",
-          "enum": ["off", "lines"],
+          "enum": [
+            "off",
+            "lines"
+          ],
           "default": "off",
           "description": "Optional Python 3.12+ execution-event coverage. Counts user-line events; sampled timing and memory measurements are unchanged. Can increase overhead."
         }
@@ -199,12 +202,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-org/python-memory-guardian.git"
+    "url": "https://github.com/AashishTangnami/python-memory-guardian.git"
   },
   "bugs": {
-    "url": "https://github.com/your-org/python-memory-guardian/issues"
+    "url": "https://github.com/AashishTangnami/python-memory-guardian/issues"
   },
-  "homepage": "https://github.com/your-org/python-memory-guardian#readme",
+  "homepage": "https://github.com/AashishTangnami/python-memory-guardian#readme",
   "icon": "images/icon.png",
   "galleryBanner": {
     "color": "#1b2b3a",

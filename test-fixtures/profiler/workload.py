@@ -25,7 +25,7 @@ def leaky():
         time.sleep(0.25)
 
 def temporary():
-    big = [0] * 20_000_000                  # L28: big but freed right after
+    big = [0] * 20_000_000; time.sleep(0.12)  # L28: hold RSS peak for several sampler ticks
     return len(big)
 
 if __name__ == "__main__":

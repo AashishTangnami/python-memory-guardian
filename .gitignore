@@ -1,5 +1,5 @@
-/python-memory-guardian-1.3.0-source.zip
-/python-memory-guardian-1.3.0.vsix
+/python-memory-guardian-*-source.zip
+/python-memory-guardian-*.vsix
 /rust-server/target/
 /node_modules/
 /out/
@@ -7,7 +7,7 @@
 /bin/
 /server/libs/
 /test-fixtures/profiler/out/
-/docs/06-marketplace-publish.md
+.agents/
 .mypy_cache
 .pmg
 __pycache__/

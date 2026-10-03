@@ -11,7 +11,9 @@ npm ci
 npx vsce package
 ```
 
-`vsce package` runs this project's `vscode:prepublish` script, which vendors the pinned Python server dependencies and builds the TypeScript bundle. It produces a file named like `python-memory-guardian-1.3.0.vsix` for the current manifest version. The universal package supports the default Python backend; users need Python 3.9+ on the machine where the extension runs.
+`vsce package` runs this project's `vscode:prepublish` script, which vendors the pinned Python server dependencies and builds the TypeScript bundle. It produces a file named like `python-memory-guardian-1.4.0.vsix` for the current manifest version. The universal package supports the default Python backend; users need Python 3.9+ on the machine where the extension runs.
+
+Generated root-level VSIX and source-archive filenames are ignored by Git for every version; the Marketplace publishing guide under `docs/` is a source document to keep with the release changes.
 
 To inspect the package contents before installing:
 
@@ -37,7 +39,7 @@ The example target is Linux x64; choose the correct `--target` for your machine.
 In VS Code, run **Extensions: Install from VSIX…**, select the package, and reload. Or use the CLI:
 
 ```bash
-code --install-extension python-memory-guardian-1.3.0.vsix
+code --install-extension python-memory-guardian-1.4.0.vsix
 ```
 
 Open a folder with Python files and check that warnings appear. Select a Python interpreter in settings, then profile a runnable script. If you built a platform-specific package, set `pythonMemoryGuardian.backend` to `rust` and check that diagnostics still appear.

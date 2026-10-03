@@ -30,11 +30,14 @@ check("L16 sorted (holds GIL) -> native", dominant(f["16"]) == "native")
 check("L19 time.sleep(0.8) -> system ~0.8 s", dominant(f["19"]) == "system" and abs(f["19"]["system_s"] - 0.8) < 0.1)
 check("L25 12 x sleep(0.25) -> system ~3.0 s", abs(f["25"]["system_s"] - 3.0) < 0.2)
 fn = {v["name"]: v for v in next(iter(p["functions"].values())).values()}
-check("temporary(): ~160 MB RSS growth (function level)", fn["temporary"]["rss_growth_mb"] > 140)
+check("temporary(): substantial fast-mode RSS growth (function level)", fn["temporary"]["rss_growth_mb"] > 80)
 
 p, f = run("workload.py", "precise")
 check("L24 LEAK.append flagged as leak, 48 MB held", "leak_runs" in f["24"] and abs(f["24"]["end_mb"] - 48) < 2)
 check("L16 sorted() copy ~12 MB attributed", f["16"].get("alloc_mb", 0) + f["16"].get("transient_peak_mb", 0) > 10)
+check("L28 temporary(): ~160 MB observed, then freed",
+      max(f["28"]["alloc_mb"], f["28"]["transient_peak_mb"], f["28"]["peak_mb"]) > 150
+      and f["28"]["end_mb"] < 1)
 check("snapshot budget respected (<= 12% of wall)", p["snapshot_cost_s"] <= 0.12 * p["wall_s"])
 
 p, f = run("leak_workload.py", "precise")

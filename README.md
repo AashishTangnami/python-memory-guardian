@@ -13,7 +13,7 @@ It works on Linux, macOS and Windows, and inside containers (Dev Containers, Cod
 
 ## Contents
 
-**Short guides:** [Start here](docs/00-guides.md) · [Quick start](docs/01-quickstart.md) · [Using the extension](docs/02-using-the-extension.md) · [Container and remote setup](docs/03-container-setup.md) · [Developer setup](docs/04-developer-setup.md) · [Local deployment](docs/05-local-deploy.md).
+**Short guides:** [Start here](docs/00-guides.md) · [Quick start](docs/01-quickstart.md) · [Using the extension](docs/02-using-the-extension.md) · [Container and remote setup](docs/03-container-setup.md) · [Developer setup](docs/04-developer-setup.md) · [Local deployment](docs/05-local-deploy.md) · [Project memory](MEMORY.md).
 
 1. [Using the extension](#1-using-the-extension)
 2. [Containerized projects](#2-containerized-projects)
@@ -352,7 +352,7 @@ flowchart LR
 | Full test entry point | `npm test` compiles, runs parity tests, then runtime tests. |
 | Backend parity | [test-fixtures/parity_test.py](test-fixtures/parity_test.py) exercises real stdio LSP with static fixtures and multiple interpreter profiles. Rust comparison is skipped if its binary is unavailable unless `PMG_REQUIRE_RUST=1` requires it. |
 | Source and peak regressions | [test-fixtures/profiler_regression_test.py](test-fixtures/profiler_regression_test.py) checks edits during execution, imported/new/deleted sources, normalized hashes, and transient peaks. |
-| Profiler verification | [test-fixtures/profiler_test.py](test-fixtures/profiler_test.py) checks known Python/native/waiting workloads, RSS growth, leak trends, holder names, source symbols, and snapshot budget. |
+| Profiler verification | [test-fixtures/profiler_test.py](test-fixtures/profiler_test.py) checks known Python/native/waiting workloads, RSS growth, leak trends, holder names, source symbols, and snapshot budget. The temporary-allocation fixture holds memory across several 10 ms sampler ticks; its fast-mode check allows for RSS reuse, while precise mode accepts sampled growth, a transient peak, or a held-at-peak snapshot as evidence of roughly 160 MB before verifying release at exit. |
 | Editor model verification | [test-fixtures/test_model.js](test-fixtures/test_model.js) checks hashes, staleness, heat/severity, labels, holders, and unattributed-memory notes using generated reports. Run after profiler tests. |
 | Container verification | [test-fixtures/test_container.js](test-fixtures/test_container.js) checks mappings and a simulated exec-prefix probe/profile round trip. |
 | Examples and fixtures | Static positive/negative patterns plus dedicated timing, leak, and holder workloads under [test-fixtures](test-fixtures). |
