@@ -45,33 +45,30 @@ The extension supports local execution, remote extension hosts, and a host edito
 | [server/pmg_profile.py](server/pmg_profile.py) | Script execution, sampling, memory analysis, report generation |
 | [src/profileModel.ts](src/profileModel.ts) | Profile parsing, freshness, heat, severity, label and message formatting |
 | [src/profileView.ts](src/profileView.ts) | Profile tasks, report watcher, editor decorations, runtime diagnostics |
+| [src/reportModel.ts](src/reportModel.ts), [src/reportView.ts](src/reportView.ts), [src/reportWebview.ts](src/reportWebview.ts) | Retention diagnosis, recommendations, and native interactive report |
 | [src/containerPaths.ts](src/containerPaths.ts) | Container command construction and bidirectional path mapping |
 
 ## 2. Activation, interpreter awareness, and server lifecycle
 
 ```mermaid
-sequenceDiagram
-    actor User
-    participant VS as VS Code
-    participant Client as Extension client
-    participant Probe as Target Python / probe.py
-    participant Server as Selected language server
-    User->>VS: Open a Python document
-    VS->>Client: Activate extension
-    Client->>Client: Register commands, profile watcher, and status bar
-    Client->>Probe: Run probe locally or through container prefix
-    alt Probe returns valid JSON
-        Probe-->>Client: Measured interpreter facts
-    else Timeout, process failure, or invalid output
-        Client->>Client: Log failure and use an empty facts object
-    end
-    Client->>Server: Start over stdio; initialize with profile facts
-    Server-->>VS: Publish static diagnostics
-    User->>VS: Change a PMG setting or run Restart Server
-    VS->>Client: Restart requested
-    Client->>Server: Stop existing server
-    Client->>Probe: Probe again
-    Client->>Server: Start selected backend again
+flowchart TD
+    Open["Open a Python document"] --> Activate["Activate the workspace extension"]
+    Activate --> Register["Register commands, report watcher, and status bar"]
+    Register --> Queue["Queue a server start or restart"]
+    Settings["Change settings or request restart"] --> Queue
+    Queue --> Stop["Stop the current language client"]
+    Stop --> Probe["Probe target Python locally or in the container"]
+    Probe --> Result{"Valid interpreter facts?"}
+    Result -->|Yes| Facts["Use measured sizes, GIL state, and allocator"]
+    Result -->|No| Neutral["Log failure and use neutral facts"]
+    Facts --> Select{"Selected backend"}
+    Neutral --> Select
+    Select -->|Python| Python["Start the Python server with vendored dependencies"]
+    Select -->|Rust| Rust["Start the packaged Rust server"]
+    Python --> LSP["Initialize over standard input and output"]
+    Rust --> LSP
+    LSP --> Diagnostics["Publish static diagnostics"]
+    Deactivate["Deactivate extension"] --> Drain["Finish pending lifecycle work and stop the client"]
 ```
 
 The client accepts both saved (`file`) and unsaved (`untitled`) Python documents for static analysis. The extension is declared as a workspace extension, so remote workspaces run it beside the remote source and interpreter.
@@ -81,10 +78,10 @@ The client accepts both saved (`file`) and unsaved (`untitled`) Python documents
 | Interpreter selection | Uses `pythonMemoryGuardian.interpreter`; an empty value selects `python3` on non-Windows hosts and `python` on Windows. |
 | Interpreter probe | Measures implementation/version, pointer and integer sizes, empty/ASCII/wide string sizes, three-field dictionaries/tuples/ordinary/slotted instances, runtime GIL state, and allocator facts where available. |
 | Version-aware diagnostics | A sized message is used only when all of its placeholders are available; otherwise the shared neutral variant is used. Non-CPython probes omit CPython-specific sizes and allocator facts. |
-| Probe failure | The client logs failures and uses empty facts after a 20-second timeout or other failure. The Python server attempts its own in-process probe if supplied facts are empty; Rust uses only supplied facts. In host/container mode, that Python fallback describes the host interpreter. |
+| Probe failure | The client logs failures and uses empty facts after a 20-second timeout or other failure. An explicitly empty facts object remains neutral in both servers. The Python server probes itself only when no profile object was supplied; failed container probes never substitute host measurements. |
 | Python backend | Starts `server/guardian_server.py` with bundled dependencies from `server/libs`. [server/_vendor.py](server/_vendor.py) also locates these dependencies when the server is launched directly. |
 | Rust backend | Starts `bin/guardian-server` or `bin/guardian-server.exe`; reports a startup error if missing. On non-Windows hosts it attempts to restore the executable bit if needed. |
-| Restart and shutdown | Any setting change under `pythonMemoryGuardian` restarts the server and probe. The restart command does the same; deactivation stops the LSP client. |
+| Restart and shutdown | Any setting change under `pythonMemoryGuardian` restarts the server and probe. The restart command does the same. Starts and restarts are serialized; deactivation waits for in-flight lifecycle work and stops the resulting client. |
 | Observability | The Python Memory Guardian output channel shows probe/startup information; `trace.server` controls LSP traffic logging. `PMG_DEBUGPY=<port>` lets the Python server wait for a localhost debugger when `debugpy` is installed. |
 
 ## 3. Static analysis: edit to diagnostic
@@ -162,34 +159,30 @@ flowchart LR
 
 ## 4. Runtime profiling: script to report
 
-The canonical extension helper is [server/pmg_profile.py](server/pmg_profile.py). The repository also contains a byte-identical standalone copy at [pmg_profile.py](pmg_profile.py). Both use the Python standard library.
+The extension and standalone CLI both use [server/pmg_profile.py](server/pmg_profile.py). It uses only the Python standard library.
 
 ```mermaid
-sequenceDiagram
-    actor User
-    participant UI as Profile command
-    participant Task as VS Code process task
-    participant Profiler as pmg_profile.py
-    participant Script as User script
-    participant Report as .pmg/profile.json
-    participant View as Profile watcher
-    User->>UI: Click pulse icon or Profile Current File
-    UI->>UI: Require saved Python file; save dirty document
-    UI->>User: Choose fast, precise, or time only
-    User->>UI: Select mode
-    UI->>Task: Start pmg-profile task in terminal
-    Task->>Profiler: Pass script, root, output, mode, and frame depth
-    Profiler->>Profiler: Start sampler and optional tracemalloc
-    Profiler->>Script: Execute as __main__
-    loop Until execution ends
-        Profiler->>Script: Sample thread frames, CPU clocks, and memory
-    end
-    Script-->>Profiler: Completion, SystemExit, interrupt, or exception
-    Profiler->>Profiler: Stop sampling; analyze memory and holders
-    Profiler->>Report: Write temporary JSON, then atomically replace report
-    Report-->>View: File created or changed
-    View->>View: Parse, remap paths, and check source hashes
-    View-->>User: Labels, totals, status, leak warnings, adjusted findings
+flowchart TD
+    Command["Profile Current File"] --> Save["Require a saved Python file and save edits"]
+    Save --> Mode["Choose fast, precise, or time only"]
+    Mode --> Task["Launch the profiler as a process task"]
+    CLI["Run the standalone profiler"] --> Prepare
+    Task --> Prepare["Record source identities and calibrate timing"]
+    Prepare --> Start["Start sampling and optional allocation tracing"]
+    Start --> Run["Execute the target script"]
+    Run --> Sample["Collect caller stacks, timing, and memory evidence"]
+    Sample --> Finish{"How did execution finish?"}
+    Finish -->|Normal exit| Workers["Allow normal thread and executor shutdown"]
+    Finish -->|Exception or exit code| Workers
+    Finish -->|Interrupt| Partial["Prepare a partial report"]
+    Workers --> Analyze["Stop sampling and inspect retention and holders"]
+    Partial --> Analyze
+    Analyze --> Write["Write temporary JSON and replace the report atomically"]
+    Write --> Watch["Report watcher loads and validates the data"]
+    Watch --> Fresh["Remap paths and verify source hashes"]
+    Fresh --> Diagnosis["Memory diagnosis, trends, and recommendations"]
+    Fresh --> Graph["Interactive Stack Explorer"]
+    Fresh --> Editor["Inline metrics and runtime-informed diagnostics"]
 ```
 
 The command runs a saved file as a script, not a selected function or notebook cell. Locally, its working directory is the script's directory; its analysis root is the containing workspace folder, or the script directory when no folder applies. The process task passes arguments without shell interpolation. The CLI also accepts script arguments:
@@ -207,7 +200,7 @@ python3 server/pmg_profile.py --memory precise --frames 2 --interval 0.01 --root
 | `--memory` | `fast` | Select `fast`, `precise`, or `off`. |
 | `--frames` | `2` | Tracemalloc traceback depth in precise mode. The editor clamps this to 1–64. |
 
-Normal completion returns 0; integer `SystemExit` codes are preserved, Ctrl+C returns 130, and uncaught exceptions print a traceback and return 1. The `finally` path attempts to save the partial profile in all these cases. Abrupt process termination cannot guarantee a report.
+Normal completion returns 0; integer `SystemExit` codes are preserved, Ctrl+C returns 130, and uncaught exceptions print a traceback and return 1. The finalization path attempts to save a report in all these cases. If non-daemon workers remain, normal Python thread/executor shutdown completes before finalization; Ctrl+C attempts an immediate partial report. Abrupt process termination cannot guarantee a report.
 
 ### 4.1 Time sampling
 
@@ -276,7 +269,7 @@ The search inspects at most 5,000 elements per container and uses a time-budget 
 
 ## 6. Profile data, persistence, and freshness
 
-The profiler writes schema **2** JSON. The client accepts JSON with `schema >= 2` and a `files` object; this is a minimal compatibility check rather than full schema validation.
+The profiler writes schema **3** JSON. The client validates schemas 2 and 3, including required timing fields, retention evidence, and stack references. Older reports remain readable without the new stack/trend views.
 
 ```mermaid
 flowchart LR
@@ -295,7 +288,7 @@ flowchart LR
 | Run metadata | Script path, Python version, wall/process CPU time, interval, sample count, memory mode, GIL split availability, per-thread clock availability, RSS reader type. |
 | `files` | Absolute file paths → one-based line-number strings → timing, RSS growth/release, precise memory fields, leak evidence, function-start association, scope, assigned names, called names, and holders. |
 | `functions` | File paths → first-line strings → qualified function names and aggregated metrics. Source AST information recovers qualified names on older Python versions. These are line aggregates, not a call graph. |
-| `file_hashes` | SHA-1 of unchanged source bytes after CRLF-to-LF normalization; compared with the current editor text. Files changed or created during the run receive no freshness hash. |
+| `file_hashes` | SHA-1 of unchanged source decoded using its Python encoding (BOM removed), encoded as UTF-8 after CRLF-to-LF normalization; compared with the current editor text. Files changed or created during the run receive no freshness hash. |
 | Memory totals | Traced peak, RSS start/end/peak, snapshot count/cost, frame depth, unattributed held memory, and a coarse process-level `native_untraced_mb` estimate when current RSS is available. |
 | `timeline` | Downsampled elapsed/traced/RSS samples for external inspection; the extension does not render a timeline chart. |
 
@@ -315,7 +308,7 @@ stateDiagram-v2
     Absent --> NoProfile: Clear profile or watched report deleted
 ```
 
-Freshness is checked per document. Stale/absent files get no runtime decorations or leak diagnostics, and freshly processed static diagnostics retain their base behavior. A text edit immediately rerenders the overlay; static severities are readjusted when LSP republishes or the profile is refreshed. Before execution, the profiler inventories eligible Python source-file hashes and filesystem identities (device, inode, size, modification time, and change/creation time). It checks those identities around source reading and compares the content hash at report time. This startup inventory runs before timing and tracing begin, retains hashes rather than source buffers, and adds startup work proportional to source size. Changed, replaced, deleted, newly created, or uninventoried files receive no hash or source-derived labels and are treated as stale. This conservatively invalidates even a file edited back to its original contents. Hidden subdirectories and `node_modules` are skipped during the inventory.
+Freshness is checked per document. Stale/absent files get no runtime decorations or leak diagnostics, and freshly processed static diagnostics retain their base behavior. A text edit immediately rerenders the overlay and restores static severities when the report becomes stale. The report marks historical measurements and disables unverified source navigation. Before execution, the profiler inventories eligible Python source-file hashes and filesystem identities (device, inode, size, modification time, and change/creation time). It checks those identities around source reading and compares the content hash at report time. This startup inventory runs before timing and tracing begin, retains hashes rather than source buffers, and adds startup work proportional to source size. Changed, replaced, deleted, newly created, or uninventoried files receive no hash or source-derived labels and are treated as stale. This conservatively invalidates even a file edited back to its original contents. Hidden subdirectories and `node_modules` are skipped during the inventory.
 
 ## 7. Editor feedback and profile-informed priorities
 
@@ -324,14 +317,15 @@ Freshness is checked per document. Stale/absent files get no runtime decorations
 | Command / surface | Feature |
 |---|---|
 | `pythonMemoryGuardian.restart` | **Restart Server** stops the backend, probes again, and restarts it. |
-| `pythonMemoryGuardian.profileFile` | **Profile Current File**, also exposed as the pulse icon on Python editor titles and by clicking the profile status bar. |
+| `pythonMemoryGuardian.profileFile` | **Profile Current File**, also exposed as the pulse icon on Python editor titles. A completed run opens the native report. |
+| `pythonMemoryGuardian.showReport` | **Open Profile Report**, also available through the status bar. Memory diagnosis is the initial view; Stack Explorer is a second tab. |
 | `pythonMemoryGuardian.toggleProfileOverlay` | **Toggle Profile Overlay** hides/shows inline labels; runtime leak diagnostics and static severity adjustment remain active. |
 | `pythonMemoryGuardian.clearProfile` | **Clear Profile** clears the active in-memory report, runtime warnings, and decorations, and restores raw static diagnostics. It does not delete the JSON file, which can load again later. |
 | Inline timing | Seconds, attributed-time share, and substantial Python/native/system components. Precise mode adds `~` to indicate timing distortion. |
 | Inline memory | Fast mode shows `RSS +`; precise mode distinguishes `alloc`, `held`, and `spike`. Assigned-variable names are included when available. |
 | Inline leaks | Retained memory and available holder names. |
 | Function labels | `Σ` totals at the recorded function-start line, including qualified names and time/memory summaries; module totals are not decorated. |
-| Problems panel | Static diagnostics plus a separate runtime collection using code `runtime-leak` and Warning severity. Runtime leak entries are populated for visible fresh Python editors. |
+| Problems panel | Static diagnostics plus a separate runtime collection using code `runtime-leak` and Warning severity. Runtime suspected-leak entries are populated for visible fresh Python editors and persist when switching tabs; stale edits remove them. |
 | Status bar | Run duration, mode, memory peak when available, or a stale-profile notice; tooltip includes script, Python version, and unattributed-memory explanation. |
 
 To reduce clutter, line labels generally require at least 1% of attributed time, a displayed memory amount, or a leak. Memory labels normally start at 1 MB. Hot labels use the editor warning color; ordinary labels use the CodeLens foreground color.
@@ -355,7 +349,7 @@ flowchart TD
 
 Defaults are `hotShare = 0.05` and `hotMB = 50`. Precise memory heat uses the maximum of allocated, transient, and held-at-peak memory; fast mode uses RSS growth; time-only mode uses no memory heat. Hot findings move Hint → Information → Warning → Error, with Error as the ceiling. Cold non-errors become Hint.
 
-A line missing from samples inside a sampled function's recorded span is treated as unknown rather than cold. The span extends from the recorded function start through its last sampled line, not necessarily to its syntactic end. A low-cost sampled line also remains unknown. Absence from samples is not proof that a line did not execute.
+A line missing from samples inside a sampled function's recorded span is treated as unknown rather than cold. New reports include the complete syntactic function range; older schema-2 reports fall back to the last sampled line. A low-cost sampled line also remains unknown. Absence from samples is not proof that a line did not execute.
 
 ## 8. Local, remote, and container execution
 
@@ -439,7 +433,7 @@ flowchart LR
 | Cross-platform test launcher | [scripts/py.js](scripts/py.js) tries Python 3.9+ through `python3`, `python`, then `py -3`; `PMG_PYTHON` overrides this selection. |
 | Full test entry point | `npm test` compiles, runs parity tests, then runtime tests. |
 | Backend parity | [test-fixtures/parity_test.py](test-fixtures/parity_test.py) exercises real stdio LSP with static fixtures and multiple interpreter profiles. Rust comparison is skipped if its binary is unavailable unless `PMG_REQUIRE_RUST=1` requires it. |
-| Source and peak regressions | [test-fixtures/profiler_regression_test.py](test-fixtures/profiler_regression_test.py) checks edits during execution, imported/new/deleted sources, normalized hashes, transient peaks, and consistency of the standalone profiler copy. |
+| Source and peak regressions | [test-fixtures/profiler_regression_test.py](test-fixtures/profiler_regression_test.py) checks edits during execution, imported/new/deleted sources, normalized hashes, and transient peaks. |
 | Profiler verification | [test-fixtures/profiler_test.py](test-fixtures/profiler_test.py) checks known Python/native/waiting workloads, RSS growth, leak trends, holder names, source symbols, and snapshot budget. |
 | Editor model verification | [test-fixtures/test_model.js](test-fixtures/test_model.js) checks hashes, staleness, heat/severity, labels, holders, and unattributed-memory notes using generated reports. Run after profiler tests. |
 | Container verification | [test-fixtures/test_container.js](test-fixtures/test_container.js) checks mappings and a simulated exec-prefix probe/profile round trip. |
@@ -455,4 +449,59 @@ The implementation is a static heuristic analyzer plus a sampling profiler. Stat
 
 Long native calls holding the GIL can delay the sampler and attribute a spike to the following line; function aggregates help when the shifted attribution stays within the same function. Deep library allocations can lack a user frame at the configured traceback depth. RSS changes include allocator behavior and are not equivalent to live Python object sizes. `native_untraced_mb` is a coarse process-level estimate, not a per-line native allocation measurement.
 
-There is no child-process/multiprocessing aggregation, GPU profiling, copy-volume measurement, historical profile comparison UI, call-graph view, or timeline chart. The editor manages one active report at a time. These boundaries explain how to read the diagrams and outputs without treating sampled evidence as exhaustive execution tracing.
+There is no child-process/multiprocessing aggregation, GPU profiling, copy-volume measurement, historical profile comparison UI, or a process-wide timeline chart. Native C/C++ stack unwinding is not supported; the call graph contains Python frames and estimated timing categories. The editor manages one active report at a time. These boundaries explain how to read the diagrams and outputs without treating sampled evidence as exhaustive execution tracing.
+
+
+## 12. Native diagnosis report and Stack Explorer
+
+[reportModel.ts](src/reportModel.ts) derives evidence and recommendations from retained allocations. Findings are ordered by suspected growth, then unconfirmed retention, then released allocations. Snapshot counts, increases/decreases, net growth, per-line observed peak, downsampled retention points, and up to three observed holders explain each finding. Recommendations depend on holder type and scope; they recommend bounded histories, cache eviction, or shorter ownership lifetimes when those match the intended workload. No automatic deletion or source modification is performed.
+
+```mermaid
+flowchart TD
+    Samples["Guardian sampler and tracemalloc snapshots"] --> Report["Schema 3 profile.json"]
+    Report --> Retention["Per-line retention trends and observed holders"]
+    Retention --> Diagnose["Growing / retained / released"]
+    Diagnose --> Advice["Evidence and targeted recommendations"]
+    Report --> Stacks["Weighted Python caller stacks"]
+    Stacks --> Tree["Call tree: inclusive and self time"]
+    Tree --> Graph["Zoom, search, thread and time filters"]
+    Advice --> Webview["Native report: memory diagnosis first"]
+    Graph --> Webview
+    Webview --> Fresh{"Source hash still matches?"}
+    Fresh -->|Yes| Source["Open allocation or frame source"]
+    Fresh -->|No| Historical["Mark historical; disable source navigation"]
+```
+
+The collector keeps Python frames from the outermost application frame through active library frames. No frame objects are retained. Immutable frame IDs and weighted stacks preserve caller relationships, including recursion. Time weights are accumulated from observed intervals instead of assuming a fixed sampling frequency. Multiple threads may accumulate more elapsed time than the wall-clock duration. Collection caps (128-frame depth, 50,000 stacks) and the 25,000-node display cap are reported as limitations when reached.
+
+The report uses a CSP-restricted webview, plain-text rendering of source metadata, and validates source-navigation messages against the loaded report. It includes a per-line retention sparkline; the process RSS timeline remains available in JSON only. New diagnostics call growth a suspected leak because a growing cache or a deliberately retained dataset can have the same trend.
+
+Normal Python thread/executor shutdown completes before reports for outstanding non-daemon workers are finalized. Interrupted runs attempt an immediate partial report. `npm run benchmark:native` checks growing and bounded histories and records measured cost by profiler mode. This benchmark does not establish superiority over py-spy or Memray.
+
+## 13. Target state (planned)
+
+**Goal:** Make Guardian the fastest path from a Python memory symptom to an evidence-backed diagnosis and a verified fix, entirely inside VS Code for supported workloads. A developer should not need a separate profiler CLI to find a growing allocation, understand its allocation stack and observed owner, compare the result with an earlier run, and give an agent structured evidence for a proposed change. Workflow velocity is the outcome; trustworthy memory-leak diagnosis and actionable recommendations come first.
+
+The diagram below is a roadmap, not a description of implemented features. Stack Explorer currently visualizes sampled **time** on Python call stacks; precise memory evidence is currently attributed to lines, not full allocation stacks. Native timing is an estimate at a Python call site, not C/C++ stack unwinding or native heap attribution. There is no cross-run comparison UI or stable agent telemetry contract yet.
+
+```mermaid
+flowchart LR
+    Run["Profile a representative workload"] --> Diagnose["Prioritize suspected leaks with evidence and recommendations"]
+    Diagnose --> MemoryStacks["Memory-weighted allocation stacks: held at peak and end"]
+    Run --> TimeStacks["Interactive time-weighted Python stacks"]
+    MemoryStacks --> Native["Native C-extension visibility where supported"]
+    TimeStacks --> Native
+    Native --> Compare["Compare runs against a saved baseline"]
+    Compare --> Telemetry["Export versioned, agent-ready evidence"]
+    Telemetry --> Verify["Re-run and verify the change"]
+```
+
+| Planned capability | Completion criterion |
+|---|---|
+| Memory-weighted stack graph | Precise-mode allocation tracebacks produce peak-held and end-held MB views. A diagnosis opens the relevant stack; displayed totals reconcile with captured snapshots, and missing/truncated attribution is visible. |
+| Native C-extension visibility | Show supported native call stacks and native allocation evidence with their platform and collection limits. Keep estimated Python-site timing distinct from measured native frames and memory. |
+| Cross-run diffing | Save/select a baseline, align source and stack identities, and show changes in held memory, growth, allocation sites, and time alongside workload and environment metadata. |
+| Agent-ready telemetry | Export a versioned, machine-readable report containing evidence, source identity, measurement method, confidence/limits, and suggested verification steps; agents can consume it without scraping webview text. |
+| End-to-end verification | A developer can move from a finding to a candidate fix and a repeat run in VS Code, with a comparison that shows whether retention improved under the same workload. |
+
+Priority order is memory-stack attribution and leak diagnosis, then reliable interactive exploration, then native visibility, cross-run diffing, and telemetry. Every new measurement needs an explicit source and limitation so the report never presents sampled or inferred data as proof of ownership or causality.

@@ -7,6 +7,8 @@ A VS Code extension for Python that does two things:
 
 It works on Linux, macOS and Windows, and inside containers (Dev Containers, Codespaces, plain Docker/Compose, WSL, Remote-SSH).
 
+**Product goal:** Make Guardian the fastest path from a Python memory symptom to an evidence-backed diagnosis and a verified fix, inside VS Code. For supported workloads, a developer should be able to profile, identify growing or retained allocations, inspect the responsible stacks and owners, compare runs, and share structured findings with an agent without switching to an external profiler CLI. Memory-leak diagnosis and recommendations lead this workflow; interactive graphs, native C-extension visibility, cross-run comparison, and agent-ready telemetry deepen the evidence. See the [planned target state](feature-map-end-to-end.md#13-target-state-planned) for the work that remains.
+
 ---
 
 ## Contents
@@ -62,14 +64,20 @@ Nothing else needs installing: the extension bundles its own copy of `pygls` (pi
 2. Click the **pulse icon** in the editor title bar, or run **Python Memory Guardian: Profile Current File** from the Command Palette.
 3. Choose a memory mode:
 
-   | Mode | Measures | Typical overhead |
+   | Mode | Measures | Cost |
    |---|---|---|
-   | **fast** (default) | time split + RSS memory growth per line and function | about 1–5% |
-   | **precise** | adds per-line allocated / held / spike memory, **leaks and the variable holding them** | 5% (I/O-heavy) to about 3x (allocation-heavy) |
-   | **time only** | time split only | about 1% |
+   | **fast** (default) | time split, caller stacks, and RSS growth | Sampling plus startup inventory/calibration; measure on your workload |
+   | **precise** | adds retained-memory trends, suspected leaks, and holder evidence | Allocation tracing and snapshots can substantially slow allocation-heavy code |
+   | **time only** | time split and caller stacks | Sampling plus startup inventory/calibration |
 
 4. Your program runs in a terminal panel. To stop it early, press **Ctrl+C**; a partial profile is still saved.
-5. When it finishes, the results appear automatically (stored in `.pmg/profile.json` in your project).
+5. When it finishes, the native **Memory Guardian Report** opens with memory diagnosis first. Inline results also appear; data is stored in `.pmg/profile.json`.
+
+In precise mode, the report separates **suspected growing retention**, **retained at end**, and **released during the run**. Each finding shows recorded memory trends, any named holders, and recommendations tailored to lists, dictionaries/caches, or global ownership. These are observations and investigation steps; growing memory alone does not prove an unintended leak.
+
+The **Stack Explorer** tab shows aggregated Python call stacks, including library frames, as a top-down call tree. Click a frame to zoom; filter by thread or Python/native/waiting/unclassified time, search for a function, and open verified application source. Native timing remains an estimate at the Python call site: C/C++ frames are not captured. Across threads, sampled elapsed time can exceed wall-clock run duration.
+
+Use **Python Memory Guardian: Open Profile Report** or click the status bar to reopen the report. Existing schema-2 reports still load; re-run profiling to obtain caller stacks and memory trends. Everything uses Guardian's own profiler and standard-library Python helpers, with no py-spy or Memray dependency.
 
 > **Tip:** add `.pmg/` to your `.gitignore`.
 
@@ -93,14 +101,14 @@ handler() — ⚠️ Single-Threaded Stall: time.sleep() blocks inside `async de
 | `▲ held 45 MB` | memory from this line still alive at the peak |
 | `▲ spike 160 MB` | a short-lived peak that came and went between two samples |
 | `▲ RSS +22 MB` | fast mode: process memory growth while this line ran |
-| `⚠ leak: 45 MB held by Service.history` | measured leak, and the variable that still holds it |
+| `⚠ leak: 45 MB held by Service.history` | suspected growing retention and an observed holder |
 | `Σ Service.handle(): 3.7 s …` | totals for the whole function, shown on its `def` line |
 
-**Measured leaks** also appear in the Problems panel as warnings:
+**Suspected leaks** also appear in the Problems panel as warnings:
 
 ```
-Service.handle() › `self.history.append` — ⚠️ Runtime leak (measured): … 45.0 MB is still
-referenced by `Service.history` (list, 30 items) when the program exited.
+Service.handle() › `self.history.append` — ⚠️ Suspected memory leak: … 45.0 MB is still
+referenced by `Service.history` (list, 30 items) when profiling ended.
 ```
 
 **The profile changes static warning severity:**
@@ -108,7 +116,7 @@ referenced by `Service.history` (list, 30 items) when the program exited.
 - A **cold** line is lowered to a hint, but only if it sits outside every function that was sampled. A line can run between samples, so "no samples" alone is never treated as cheap.
 - If you **edit a file** after profiling it, its profile is ignored (the status bar shows *PMG profile stale — re-run*). Line numbers would be wrong otherwise.
 
-The status bar item (`PMG 7.01 s · RSS peak 400 MB (fast)`) re-runs the profiler when clicked. Run **Toggle Profile Overlay** to hide or show the labels, and **Clear Profile** to remove them.
+The status bar item (`PMG 7.01 s · RSS peak 400 MB (fast)`) opens the report when clicked. Run **Toggle Profile Overlay** to hide or show labels, and **Clear Profile** to clear the active report and overlays.
 
 ### 1.6 Silence a warning on one line
 
@@ -340,7 +348,7 @@ flowchart LR
 | Cross-platform test launcher | [scripts/py.js](scripts/py.js) tries Python 3.9+ through `python3`, `python`, then `py -3`; `PMG_PYTHON` overrides this selection. |
 | Full test entry point | `npm test` compiles, runs parity tests, then runtime tests. |
 | Backend parity | [test-fixtures/parity_test.py](test-fixtures/parity_test.py) exercises real stdio LSP with static fixtures and multiple interpreter profiles. Rust comparison is skipped if its binary is unavailable unless `PMG_REQUIRE_RUST=1` requires it. |
-| Source and peak regressions | [test-fixtures/profiler_regression_test.py](test-fixtures/profiler_regression_test.py) checks edits during execution, imported/new/deleted sources, normalized hashes, transient peaks, and consistency of the standalone profiler copy. |
+| Source and peak regressions | [test-fixtures/profiler_regression_test.py](test-fixtures/profiler_regression_test.py) checks edits during execution, imported/new/deleted sources, normalized hashes, and transient peaks. |
 | Profiler verification | [test-fixtures/profiler_test.py](test-fixtures/profiler_test.py) checks known Python/native/waiting workloads, RSS growth, leak trends, holder names, source symbols, and snapshot budget. |
 | Editor model verification | [test-fixtures/test_model.js](test-fixtures/test_model.js) checks hashes, staleness, heat/severity, labels, holders, and unattributed-memory notes using generated reports. Run after profiler tests. |
 | Container verification | [test-fixtures/test_container.js](test-fixtures/test_container.js) checks mappings and a simulated exec-prefix probe/profile round trip. |
@@ -399,7 +407,7 @@ At startup the extension runs `server/probe.py` on your interpreter (inside the 
 - *fast* mode attributes RSS growth to the running line.
 - *precise* mode uses `tracemalloc` for allocations per line, the memory still alive at the peak, short-lived spikes (captured with `tracemalloc.reset_peak()`), leaks, and their holders. Snapshot cost is predicted from `tracemalloc`'s own bookkeeping size and capped at 10% of runtime.
 
-**Leaks.** A line is reported as leaking when the memory it allocated never went down over the trailing snapshots, rose in at least 3 of them, and at least 1 MB was still alive at exit. The holder is then found by searching garbage-collector-tracked objects, module globals, and attributes of your own classes' objects. The last two matter because CPython can stop tracking dicts that hold only plain values (verified: a dict of `bytearray`s isn't tracked).
+**Suspected leaks.** A line is flagged for investigation when the memory it allocated never went down over the trailing snapshots, rose in at least 3 of them, and at least 1 MB was still alive at exit. The holder is then found by searching garbage-collector-tracked objects, module globals, and attributes of your own classes' objects. The last two matter because CPython can stop tracking dicts that hold only plain values (verified: a dict of `bytearray`s isn't tracked).
 
 **Known limits.**
 - A single C call that holds the GIL (such as `[0] * 20_000_000`) can be credited to the *next* line, because the sampler can only run once the call returns. Function totals are unaffected.
@@ -473,11 +481,18 @@ Generated build output (`out/`, `dist/`, `bin/`, and `rust-server/target/`) and 
 
 ### 4.6 Verification status
 
-Everything in this README was run while building it, except the following. **Real Docker, Dev Containers and Codespaces were not available in the build environment.**
+Automated checks cover profiling, report data, language-server parity, and lifecycle behavior. Interactive VS Code behavior still requires a manual editor smoke test. **Real Docker, Dev Containers and Codespaces were not available in the build environment.**
 - Container mode was verified with a simulated container: commands went through an exec prefix, and the project was reached through a different path.
 - The `devcontainer.json`, `compose.yaml` and settings files were validated for syntax, not launched.
 
 Report anything that differs from these instructions.
+
+### Native retention benchmark
+
+
+Run `npm run benchmark:native` to compare baseline execution with Guardian's time-only, fast, and precise modes. The default is three runs per case; `.pmg/benchmark.json` records median process elapsed time (including startup), relative cost, and diagnosis checks. The growing-history case must identify retention and a holder; the bounded-history case must not produce a suspected-leak flag.
+
+This is a small reproducible workload, not a performance claim against another profiler. CPU-heavy allocation workloads, deep stacks, and large repositories need separate measurements. Stack collection is limited to 128 frames and 50,000 distinct thread/stack combinations; the report indicates omissions. Stack Explorer displays at most 25,000 tree nodes, and the diagnosis panel shows the first 200 findings.
 
 ### 4.7 Sources
 

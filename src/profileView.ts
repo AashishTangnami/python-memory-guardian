@@ -14,6 +14,7 @@ import {
   ProfileIndex, Thresholds, unattributedNote,
 } from "./profileModel";
 import { ContainerConfig, containerCommand, remapProfileKeys, toContainer, toLocal } from "./containerPaths";
+import { GuardianReport } from "./reportView";
 
 const PROFILE_GLOB = "**/.pmg/profile.json";
 
@@ -30,6 +31,8 @@ export class ProfileView implements vscode.Disposable {
     after: { margin: "0 0 0 2em", color: new vscode.ThemeColor("editorWarning.foreground") },
   });
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly report: GuardianReport;
+  private showNextReport = false;
 
   constructor(
     private readonly ctx: vscode.ExtensionContext,
@@ -37,16 +40,23 @@ export class ProfileView implements vscode.Disposable {
     private readonly interpreter: () => string,
     private readonly container: () => ContainerConfig | undefined = () => undefined,
   ) {
+    this.report = new GuardianReport();
     const watcher = vscode.workspace.createFileSystemWatcher(PROFILE_GLOB);
     this.disposables.push(
-      watcher, this.runtime, this.status, this.lineDeco, this.hotDeco,
+      watcher, this.runtime, this.status, this.lineDeco, this.hotDeco, this.report,
       watcher.onDidCreate((u) => this.load(u)),
       watcher.onDidChange((u) => this.load(u)),
       watcher.onDidDelete(() => this.clear()),
       vscode.window.onDidChangeVisibleTextEditors(() => this.render()),
       vscode.workspace.onDidChangeTextDocument((e) => {
-        if (e.document.languageId === "python") this.render();
+        if (e.document.languageId === "python") {
+          this.refreshDiagnostics();
+          if (this.index?.state(e.document.uri.fsPath, e.document.getText()) !== 'fresh') this.runtime.delete(e.document.uri);
+          this.report.refresh();
+          this.render();
+        }
       }),
+      vscode.commands.registerCommand("pythonMemoryGuardian.showReport", () => this.report.show()),
       vscode.commands.registerCommand("pythonMemoryGuardian.profileFile", () => this.runProfiler()),
       vscode.commands.registerCommand("pythonMemoryGuardian.toggleProfileOverlay", () => {
         this.overlay = !this.overlay;
@@ -54,7 +64,7 @@ export class ProfileView implements vscode.Disposable {
       }),
       vscode.commands.registerCommand("pythonMemoryGuardian.clearProfile", () => this.clear()),
     );
-    this.status.command = "pythonMemoryGuardian.profileFile";
+    this.status.command = "pythonMemoryGuardian.showReport";
     void vscode.workspace.findFiles(PROFILE_GLOB, undefined, 1).then((u) => u[0] && this.load(u[0]));
   }
 
@@ -70,7 +80,7 @@ export class ProfileView implements vscode.Disposable {
       vscode.window.showWarningMessage("Open a saved Python file to profile it.");
       return;
     }
-    if (editor.document.isDirty) await editor.document.save();
+    if (editor.document.isDirty && !await editor.document.save()) return;
     const cfg = vscode.workspace.getConfiguration("pythonMemoryGuardian.profile");
     const picked = await vscode.window.showQuickPick([
       { label: "fast", description: "time split + RSS memory, ~5% overhead", mode: "fast" },
@@ -110,6 +120,7 @@ export class ProfileView implements vscode.Disposable {
     const task = new vscode.Task({ type: "pmg-profile" }, folder ?? vscode.TaskScope.Workspace,
       `Profile ${path.basename(file)}`, "Python Memory Guardian", exec);
     task.presentationOptions = { reveal: vscode.TaskRevealKind.Always, clear: true };
+    this.showNextReport = true;
     await vscode.tasks.executeTask(task);
   }
 
@@ -129,12 +140,16 @@ export class ProfileView implements vscode.Disposable {
       return;
     }
     this.index = new ProfileIndex(p);
+    this.runtime.clear();
+    this.report.update(this.index);
+    if (this.showNextReport) { this.showNextReport = false; this.report.show(); }
     this.refreshDiagnostics();
     this.render();
   }
 
   private clear(): void {
     this.index = undefined;
+    this.report.update(undefined);
     this.runtime.clear();
     this.refreshDiagnostics();
     this.render();
@@ -184,7 +199,6 @@ export class ProfileView implements vscode.Disposable {
     const p = idx.profile;
     const th = this.thresholds();
     let stale = false;
-    this.runtime.clear();
     for (const ed of vscode.window.visibleTextEditors) {
       const doc = ed.document;
       if (doc.languageId !== "python") continue;
@@ -221,7 +235,7 @@ export class ProfileView implements vscode.Disposable {
       }
       ed.setDecorations(this.lineDeco, normal);
       ed.setDecorations(this.hotDeco, hot);
-      if (leaks.length) this.runtime.set(doc.uri, leaks);
+      this.runtime.set(doc.uri, leaks);
     }
     const mem = p.memory_mode === "precise" && p.peak_traced_mb != null
       ? ` · peak ${p.peak_traced_mb.toFixed(0)} MB traced` : p.rss_peak_mb ? ` · RSS peak ${p.rss_peak_mb.toFixed(0)} MB` : "";
@@ -229,7 +243,7 @@ export class ProfileView implements vscode.Disposable {
       ? "$(warning) PMG profile stale — re-run"
       : `$(pulse) PMG ${p.wall_s.toFixed(2)} s${mem} (${p.memory_mode})`;
     const note = unattributedNote(p);
-    this.status.tooltip = `Profiled ${path.basename(p.script)} on Python ${p.python}. Click to profile again.` +
+    this.status.tooltip = `Profiled ${path.basename(p.script)} on Python ${p.python}. Click to open the report.` +
       (note ? `\n\n${note}` : "");
     this.status.show();
   }

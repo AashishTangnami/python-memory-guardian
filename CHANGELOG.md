@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- Keep one profiler implementation at `server/pmg_profile.py`; remove the duplicate root script and its synchronization check.
+- Add a native Memory Guardian Report, with retained-memory trends, observed holders, and targeted investigation recommendations before the interactive Stack Explorer view.
+- Preserve caller stacks in schema-3 reports; add thread/time-category filters, zoom, search, and verified source navigation. Continue reading schema-2 profiles.
+- Distinguish suspected growing retention from intentional/unconfirmed retention and released allocations; retain evidence from intermediate snapshots.
+- Preserve target arguments and relative output destinations, normalize encoded source text for freshness, and finalize threaded runs after normal Python thread/executor shutdown.
+- Use complete source function ranges for unsampled-line heat, restore diagnostic severities immediately on edits, serialize language-client restarts, cancel closed-document analysis, and keep failed container probes neutral.
+- Add native retention benchmarks and regression checks for diagnosis, bounded caches, stack accounting, source ranges, CLI behavior, and editor/server lifecycle.
 - Calibrate idle timer oversleep before profiling and exclude sampler work from the GIL-delay estimate, fixing native hashing misclassified as Python on macOS.
 - Pin cattrs to 25.3.0 so the vendored runtime resolves for Python 3.9, and add a VSIX content/server smoke test.
 - Add the missing `.vscodeignore` to exclude development dependencies, caches, bytecode, and build/test artifacts from packaged extensions.

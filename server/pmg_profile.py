@@ -1,7 +1,7 @@
 """
 Python Memory Guardian - runtime profiler (standard library only).
 
-    python pmg_profile.py [--out .pmg/profile.json] [--root DIR] [--interval 0.01]
+    python server/pmg_profile.py [--out .pmg/profile.json] [--root DIR] [--interval 0.01]
                           [--memory fast|precise|off] script.py [args...]
 
 Per line of *your* code (files under --root) it reports:
@@ -34,8 +34,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import atexit
 import gc
 import hashlib
+import io
 import json
 import os
 import runpy
@@ -44,9 +46,10 @@ import sys
 import sysconfig
 import threading
 import time
+import tokenize
 import tracemalloc
 
-SCHEMA = 2
+SCHEMA = 3
 THIS_FILE = os.path.normcase(os.path.abspath(__file__))
 
 
@@ -197,6 +200,9 @@ class Profiler:
         self.peak_traced = 0
         self.samples = 0
         self._source_versions: dict[str, tuple[tuple, str]] = {}
+        self.stack_totals: dict = {}
+        self.stack_dropped_s = 0.0
+        self.stack_depth_limited = False
 
     @staticmethod
     def _source_version(path: str) -> tuple:
@@ -239,6 +245,12 @@ class Profiler:
         except OSError:
             return None
 
+    @staticmethod
+    def _text_hash(source: bytes) -> str:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
+        text = source.decode(encoding).replace("\r\n", "\n")
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
     def _is_user(self, filename: str) -> bool:
         hit = self._user_cache.get(filename)
         if hit is None:
@@ -262,6 +274,40 @@ class Profiler:
                 return (os.path.abspath(co.co_filename), f.f_lineno), (qn, co.co_firstlineno)
             f = f.f_back
         return None, None
+
+    def _stack(self, frame):
+        """Python frames from the outermost user call through the active frame.
+
+        Store immutable values only, never frame references that retain locals.
+        Native C frames are not visible through sys._current_frames().
+        """
+        frames = []
+        while frame is not None and len(frames) < 128:
+            co = frame.f_code
+            filename = co.co_filename
+            user = self._is_user(filename)
+            frames.append((os.path.abspath(filename) if not filename.startswith('<') else filename,
+                           frame.f_lineno, getattr(co, 'co_qualname', co.co_name).replace('.<locals>', ''),
+                           co.co_firstlineno, user))
+            frame = frame.f_back
+        self.stack_depth_limited |= frame is not None
+        frames.reverse()
+        first = next((i for i, fr in enumerate(frames) if fr[4]), None)
+        return tuple(frames[first:]) if first is not None else ()
+
+    def _record_stack(self, ident, name, stack, values):
+        if not stack:
+            return
+        key = (str(ident), name, stack)
+        totals = self.stack_totals.get(key)
+        if totals is None:
+            if len(self.stack_totals) >= 50_000:
+                self.stack_dropped_s += sum(values)
+                return
+            totals = self.stack_totals[key] = [0.0, 0.0, 0.0, 0.0, 0]
+        for i, value in enumerate(values):
+            totals[i] += value
+        totals[4] += 1
 
     def _stats(self, loc):
         st = self.lines.get(loc)
@@ -292,6 +338,8 @@ class Profiler:
             self.samples += 1
 
             per_thread = []
+            stacks = {}
+            names = {t.ident: t.name for t in threading.enumerate()}
             for ident, frame in sys._current_frames().items():
                 if ident == me:
                     continue
@@ -299,14 +347,21 @@ class Profiler:
                 if clock == 0:
                     clock = self._clocks[ident] = _thread_cpu_clock(ident)
                 if clock is not None:
-                    c = clock()
-                    dcpu = c - last_cpu.get(ident, c)
-                    last_cpu[ident] = c
+                    try:
+                        c = clock()
+                        dcpu = c - last_cpu.get(ident, c)
+                        last_cpu[ident] = c
+                    except (OSError, ValueError):
+                        # A short-lived worker may exit between frame/clock reads.
+                        self._clocks.pop(ident, None)
+                        last_cpu.pop(ident, None)
+                        dcpu = None
                 else:
                     dcpu = dproc if ident == main else None
                 loc, func = self._user_line(frame)
                 if loc is not None:
                     self._stats(loc).func = func
+                    stacks[ident] = self._stack(frame)
                 per_thread.append((ident, loc, dcpu))
 
             running = [t for t in per_thread if t[2] is not None and t[2] > 0.2 * dw]
@@ -314,9 +369,11 @@ class Profiler:
                 if loc is None:
                     continue
                 st = self._stats(loc)
+                before = (st.python_s, st.native_s, st.system_s, st.cpu_s)
                 st.samples += 1
                 if dcpu is None:                     # no CPU clock for this thread
                     st.cpu_s += dw
+                    self._record_stack(ident, names.get(ident, 'Thread'), stacks.get(ident), (0, 0, 0, dw))
                     continue
                 cpu = min(max(dcpu, 0.0), dw)
                 st.system_s += dw - cpu
@@ -330,6 +387,9 @@ class Profiler:
                     st.native_s += cpu
                 else:                                # yielded at the switch interval
                     st.python_s += cpu
+                after = (st.python_s, st.native_s, st.system_s, st.cpu_s)
+                self._record_stack(ident, names.get(ident, 'Thread'), stacks.get(ident),
+                                   tuple(b - a for a, b in zip(before, after)))
 
             # fast memory: attribute RSS change to the busiest thread's line
             if self.rss_kind:
@@ -614,6 +674,10 @@ class Profiler:
                             e["calls"].append(d)
                 walk(child, sc)
         walk(tree, [])
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                out.setdefault(first, {"scope": None, "assigns": [], "calls": []})['end_line'] = node.end_lineno
         return out
 
     def report(self, script: str) -> dict:
@@ -627,7 +691,9 @@ class Profiler:
         funcs: dict[str, dict] = {}
         symbols: dict[str, dict] = {}
         hashes = {}
-        for loc in set(self.lines) | set(peak) | set(end):
+        retained_locations = {loc for _, held, _ in self.snapshots for loc, size in held.items()
+                              if size >= 1 << 20}
+        for loc in set(self.lines) | set(peak) | set(end) | retained_locations:
             st = self.lines.get(loc) or LineStats()
             t = st.python_s + st.native_s + st.system_s + st.cpu_s
             e = {"time_s": round(t, 4), "share": round(t / total, 4),
@@ -641,7 +707,8 @@ class Profiler:
                 source = self._unchanged_source(loc[0])
                 symbols[loc[0]] = self._symbols(source) if source is not None else {}
                 if source is not None:
-                    hashes[loc[0]] = hashlib.sha1(source.replace(b"\r\n", b"\n")).hexdigest()
+                    # VS Code hashes decoded document text, without a UTF-8 BOM.
+                    hashes[loc[0]] = self._text_hash(source)
             sym = symbols[loc[0]].get(loc[1])
             if sym:
                 if sym["scope"]:
@@ -659,9 +726,23 @@ class Profiler:
                 e["end_mb"] = round(end.get(loc, 0) / 1e6, 3)
                 if loc in leaks:
                     e["leak_runs"] = leaks[loc]
+                if max((held.get(loc, 0) for _, held, _ in self.snapshots), default=0) >= 1 << 20:
+                    trend = [(t, held.get(loc, 0)) for t, held, _ in self.snapshots]
+                    # Keep both ends and representative intermediate points.
+                    indices = sorted({round(i * (len(trend) - 1) / min(59, len(trend) - 1))
+                                      for i in range(min(60, len(trend)))}) if len(trend) > 1 else [0]
+                    e['retention'] = {
+                        'peak_mb': round(max(size for _, size in trend) / 1e6, 3),
+                        'snapshots': len(trend),
+                        'rises': sum(b[1] > a[1] for a, b in zip(trend, trend[1:])),
+                        'releases': sum(b[1] < a[1] for a, b in zip(trend, trend[1:])),
+                        'growth_mb': round((trend[-1][1] - trend[0][1]) / 1e6, 3),
+                        'observed_s': round(trend[-1][0] - trend[0][0], 4),
+                        'points': [[round(trend[i][0], 4), round(trend[i][1] / 1e6, 3)] for i in indices],
+                    }
             if (st.samples == 0 and loc not in leaks and loc not in self.holders
                     and max(e.get("peak_mb", 0), e.get("end_mb", 0), e.get("alloc_mb", 0),
-                            e["rss_growth_mb"]) < 0.01):
+                            e["rss_growth_mb"], e.get('retention', {}).get('peak_mb', 0)) < 0.01):
                 continue          # nothing measured on this line: don't pad the report
             files.setdefault(loc[0], {})[str(loc[1])] = e
             if st.func is not None:   # per-function totals: robust to line-level skew
@@ -679,6 +760,7 @@ class Profiler:
                     "name": fname, "time_s": 0.0, "python_s": 0.0, "native_s": 0.0,
                     "system_s": 0.0, "peak_mb": 0.0, "transient_peak_mb": 0.0, "alloc_mb": 0.0,
                     "rss_growth_mb": 0.0})
+                fn['end_line'] = symbols[loc[0]].get(st.func[1], {}).get('end_line')
                 for k in ("time_s", "python_s", "native_s", "system_s"):
                     fn[k] = round(fn[k] + e[k], 4)
                 fn["peak_mb"] = round(fn["peak_mb"] + e.get("peak_mb", 0), 3)
@@ -687,6 +769,26 @@ class Profiler:
                 fn["rss_growth_mb"] = round(fn["rss_growth_mb"] + e["rss_growth_mb"], 3)
         hashes = {path: digest for path, digest in hashes.items() if path in files}
         step = max(1, len(self.timeline) // 300)
+        stack_frames, frame_ids, stack_samples = [], {}, []
+        for (ident, name, stack), values in self.stack_totals.items():
+            ids = []
+            for fr in stack:
+                if fr not in frame_ids:
+                    frame_ids[fr] = len(stack_frames)
+                    stack_frames.append(dict(zip(('file', 'line', 'name', 'first_line', 'user'), fr)))
+                ids.append(frame_ids[fr])
+            stack_samples.append({'thread': ident, 'thread_name': name, 'frames': ids,
+                                  'python_s': round(values[0], 6), 'native_s': round(values[1], 6),
+                                  'system_s': round(values[2], 6), 'unsplit_s': round(values[3], 6),
+                                  'samples': values[4]})
+        # Caller-only files still need a verified hash for source navigation.
+        for fr in stack_frames:
+            path = fr['file']
+            if fr['user'] and path not in files:
+                files[path] = {}
+                source = self._unchanged_source(path)
+                if source is not None:
+                    hashes[path] = self._text_hash(source)
         return {
             "schema": SCHEMA, "script": os.path.abspath(script),
             "python": "%d.%d.%d" % sys.version_info[:3], "gil_split": self.split,
@@ -713,6 +815,9 @@ class Profiler:
                                    if self.memory == "precise" and self.rss_kind == "current" else None),
             "timeline": [[round(a, 3), round(b, 3), round(c, 3)] for a, b, c in self.timeline[::step]],
             "file_hashes": hashes, "files": files, "functions": funcs,
+            'stacks': {'frames': stack_frames, 'samples': stack_samples,
+                       'dropped_s': round(self.stack_dropped_s, 6),
+                       'depth_limited': self.stack_depth_limited},
         }
 
 
@@ -723,22 +828,41 @@ def main(argv=None) -> int:
     ap.add_argument("--interval", type=float, default=0.01)
     ap.add_argument("--memory", choices=("fast", "precise", "off"), default="fast")
     ap.add_argument("--frames", type=int, default=2, help="precise mode traceback depth (cost grows with depth)")
-    ap.add_argument("script")
-    ap.add_argument("args", nargs=argparse.REMAINDER)
+    # One REMAINDER positional preserves a target's own '--' separator.
+    ap.add_argument("script_args", nargs=argparse.REMAINDER, metavar="script [args...]")
     ns = ap.parse_args(argv)
+    script_args = ns.script_args[1:] if ns.script_args[:1] == ['--'] else ns.script_args
+    if not script_args:
+        ap.error('a script is required')
+    if not 0 < ns.interval < float('inf'):
+        ap.error('--interval must be finite and positive')
+    if not 1 <= ns.frames <= 64:
+        ap.error('--frames must be between 1 and 64')
 
-    script = os.path.abspath(ns.script)
+    script = os.path.abspath(script_args[0])
+    out = os.path.abspath(ns.out)  # Target code may change the working directory.
     prof = Profiler(ns.root or os.path.dirname(script), ns.interval, ns.memory, ns.frames)
-    sys.argv = [script] + [a for a in ns.args if a != "--"]
+    sys.argv = [script] + script_args[1:]
     sys.path.insert(0, os.path.dirname(script))
     code = 0
     prof.start()
     main_globals = None
+
+    def finish():
+        prof.stop(main_globals)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(prof.report(script), f)
+        os.replace(out + ".tmp", out)
+        sys.stderr.write(f"[pmg] profile written to {out}\n")
+
     try:
         # run_path returns the module's globals: used to name leak holders at exit.
         main_globals = runpy.run_path(script, run_name="__main__")
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        if e.code is not None and not isinstance(e.code, int):
+            print(e.code, file=sys.stderr)
     except KeyboardInterrupt:
         code = 130                                    # Ctrl+C: still write what we have
     except BaseException:
@@ -746,13 +870,14 @@ def main(argv=None) -> int:
         traceback.print_exc()
         code = 1
     finally:
-        prof.stop(main_globals)
-        out = os.path.abspath(ns.out)
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        with open(out + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(prof.report(script), f)
-        os.replace(out + ".tmp", out)                # atomic for the VS Code file watcher
-        sys.stderr.write(f"[pmg] profile written to {out}\n")
+        if code != 130 and any(t is not threading.current_thread() and not t.daemon
+                               for t in threading.enumerate()):
+            # Let Python perform its normal executor/thread shutdown before the
+            # final snapshot. Joining here would deadlock idle executor workers,
+            # whose shutdown hooks have not run yet. Keep sampling meanwhile.
+            atexit.register(finish)
+        else:
+            finish()
     return code
 
 

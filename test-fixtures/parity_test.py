@@ -61,6 +61,7 @@ if __name__ == "__main__":
         "measured": measured,
         "free-threaded": dict(measured, gil_state="disabled", allocator="mimalloc heaps (free-threaded build)"),
         "unknown-sizes": {"implementation": "CPython", "py_version": measured["py_version"]},
+        "probe-failed": {},
     }
     if not os.path.isdir(os.path.join(ROOT, "server", "libs")):
         sys.exit("server/libs/ is missing: run `npm run vendor:python` first.")

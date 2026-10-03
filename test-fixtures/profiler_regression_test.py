@@ -132,8 +132,66 @@ class ProfileRegressions(unittest.TestCase):
                 p.report(str(script))
                 self.assertEqual(symbols.call_count, 1)
 
-    def test_standalone_copy_matches(self):
-        self.assertEqual(PROFILER.read_bytes(), (ROOT / 'pmg_profile.py').read_bytes())
+    def test_worker_shutdown_is_included_without_joining_idle_executors(self):
+        for start in ('threading.Thread(target=work).start()',
+                      'pool = ThreadPoolExecutor()\npool.submit(work)'):
+            with self.subTest(start=start), tempfile.TemporaryDirectory() as tmp:
+                _, report = self.run_script(Path(tmp),
+                    'import threading, time\nfrom concurrent.futures import ThreadPoolExecutor\n'
+                    'def work():\n    time.sleep(.25)\n' + start + '\n')
+                self.assertGreaterEqual(report['wall_s'], .24)
+                self.assertTrue(any(f['name'] == 'work' for f in report['stacks']['frames']))
+
+    def test_cli_preserves_arguments_and_output_after_chdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'nested').mkdir()
+            script = root / 'args.py'
+            script.write_text('import sys, os\nassert sys.argv[1:] == ["--", "-input.txt"]\nos.chdir("nested")\n')
+            r = subprocess.run([sys.executable, str(PROFILER), '--out', 'result.json',
+                                str(script), '--', '-input.txt'], cwd=tmp, capture_output=True, text=True, timeout=15)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue((root / 'result.json').exists())
+            self.assertFalse((root / 'nested' / 'result.json').exists())
+
+    def test_source_hash_uses_decoded_text(self):
+        for encoding in ('utf-8-sig', 'latin-1'):
+            text = '# coding: ' + encoding + '\nname = "café"\n'
+            self.assertEqual(profiler.Profiler._text_hash(text.encode(encoding)),
+                             hashlib.sha1(text.encode('utf-8')).hexdigest())
+
+    def test_stacks_preserve_call_paths_and_full_function_extent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script, report = self.run_script(Path(tmp),
+                'import time\ndef leaf():\n    time.sleep(.08)\n    return 42\n'
+                'def left():\n    leaf()\ndef right():\n    leaf()\nleft()\nright()\n')
+            frames = report['stacks']['frames']
+            paths = [[frames[i]['name'] for i in row['frames']] for row in report['stacks']['samples']]
+            self.assertTrue(any('left' in p and 'leaf' in p for p in paths), paths)
+            self.assertTrue(any('right' in p and 'leaf' in p for p in paths), paths)
+            self.assertEqual(report['functions'][str(script)]['2']['end_line'], 4)
+            weights = sum(sum(s[k] for k in ('python_s', 'native_s', 'system_s', 'unsplit_s'))
+                          for s in report['stacks']['samples'])
+            lines = sum(e['time_s'] for values in report['files'].values() for e in values.values())
+            self.assertAlmostEqual(weights, lines, delta=.002)
+
+    def test_retention_evidence_distinguishes_growth_from_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / 'case.py'
+            script.write_text('growth = []\nscratch = []\n')
+            p = profiler.Profiler(tmp, .01, 'precise')
+            p.start()
+            p.stop()
+            growth, scratch = (str(script), 1), (str(script), 2)
+            p.snapshots = [(i * .5, {growth: (i + 1) * 2_000_000,
+                                    scratch: 10_000_000 if i < 2 else 0}, 0) for i in range(4)]
+            for loc in (growth, scratch):
+                p._stats(loc).samples = 1
+            rows = p.report(str(script))['files'][str(script)]
+            self.assertEqual(rows['1']['leak_runs'], 3)
+            self.assertEqual(rows['1']['retention']['growth_mb'], 6)
+            self.assertEqual(rows['2']['retention']['releases'], 1)
+            self.assertNotIn('leak_runs', rows['2'])
 
     def test_idle_timer_calibration_ignores_one_scheduling_pause(self):
         elapsed = [.0025] * 8 + [.1]

@@ -14,12 +14,19 @@ export interface LineEntry {
   scope?: string; assigns?: string[]; calls?: string[];
   /** For leaks: the variables still referencing the leaked objects at exit. */
   held_by?: { holder: string; type: string; items: number; matching: number }[];
+  retention?: { snapshots: number; rises: number; releases: number; growth_mb: number;
+    observed_s: number; peak_mb?: number; points: [number, number][] };
 }
 
 export interface FuncEntry {
   name: string; time_s: number; python_s: number; native_s: number; system_s: number;
   peak_mb: number; transient_peak_mb: number; alloc_mb?: number; rss_growth_mb?: number;
+  end_line?: number | null;
 }
+
+export interface StackFrame { file: string; line: number; name: string; first_line: number; user: boolean; }
+export interface StackSample { thread: string; thread_name: string; frames: number[];
+  python_s: number; native_s: number; system_s: number; unsplit_s: number; samples: number; }
 
 export interface Profile {
   schema: number; script: string; python: string; gil_split: boolean;
@@ -30,6 +37,7 @@ export interface Profile {
   file_hashes: Record<string, string>;
   files: Record<string, Record<string, LineEntry>>;
   functions: Record<string, Record<string, FuncEntry>>;
+  stacks?: { frames: StackFrame[]; samples: StackSample[]; dropped_s: number; depth_limited: boolean };
 }
 
 export interface Thresholds { hotShare: number; hotMb: number; }
@@ -52,7 +60,57 @@ export function textHash(text: string): string {
 export function parseProfile(json: string): Profile | undefined {
   try {
     const p = JSON.parse(json);
-    return p && p.schema >= 2 && p.files ? (p as Profile) : undefined;
+    const record = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
+    const number = (v: unknown) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+    const numeric = (v: Record<string, any>, fields: string[]) => fields.every(k => number(v[k]));
+    if (!record(p) || ![2, 3].includes(p.schema) || typeof p.script !== 'string'
+      || typeof p.python !== 'string' || typeof p.gil_split !== 'boolean'
+      || !number(p.wall_s) || !['fast', 'precise', 'off'].includes(p.memory_mode)
+      || !record(p.files) || !record(p.functions ?? {}) || !record(p.file_hashes ?? {})) return undefined;
+    if (![p.peak_traced_mb, p.rss_peak_mb, p.unattributed_peak_mb].every(v => v == null || number(v))) return undefined;
+    if (!Object.values(p.file_hashes ?? {}).every(v => typeof v === 'string')) return undefined;
+    for (const entries of Object.values(p.files)) {
+      if (!record(entries)) return undefined;
+      for (const [line, e] of Object.entries(entries)) {
+        if (!/^[1-9]\d*$/.test(line) || !record(e) || !numeric(e,
+          ['time_s', 'share', 'python_s', 'native_s', 'system_s', 'samples', 'rss_growth_mb', 'rss_release_mb'])) return undefined;
+        for (const k of ['alloc_mb', 'transient_peak_mb', 'peak_mb', 'end_mb', 'leak_runs', 'func_line']) {
+          if (e[k] != null && !number(e[k])) return undefined;
+        }
+        if (e.scope != null && typeof e.scope !== 'string') return undefined;
+        for (const k of ['assigns', 'calls']) {
+          if (e[k] != null && (!Array.isArray(e[k]) || !e[k].every((v: unknown) => typeof v === 'string'))) return undefined;
+        }
+        if (e.held_by != null && (!Array.isArray(e.held_by) || !e.held_by.every((h: unknown) =>
+          record(h) && typeof h.holder === 'string' && typeof h.type === 'string' && numeric(h, ['items', 'matching'])))) return undefined;
+        if (e.retention != null) {
+          const r = e.retention;
+          if (!record(r) || !numeric(r, ['snapshots', 'rises', 'releases', 'observed_s'])
+            || (r.peak_mb != null && !number(r.peak_mb))
+            || typeof r.growth_mb !== 'number' || !Number.isFinite(r.growth_mb)
+            || !Array.isArray(r.points) || !r.points.every((v: unknown) =>
+              Array.isArray(v) && v.length === 2 && v.every(number))) return undefined;
+        }
+      }
+    }
+    for (const entries of Object.values(p.functions ?? {})) {
+      if (!record(entries) || !Object.values(entries).every(f => record(f) && typeof f.name === 'string'
+        && numeric(f, ['time_s', 'python_s', 'native_s', 'system_s', 'peak_mb', 'transient_peak_mb'])
+        && (f.end_line == null || number(f.end_line)))) return undefined;
+    }
+    if (p.stacks != null) {
+      const s = p.stacks;
+      if (!record(s) || !number(s.dropped_s) || typeof s.depth_limited !== 'boolean'
+        || !Array.isArray(s.frames) || !s.frames.every((f: unknown) => record(f)
+          && typeof f.file === 'string' && typeof f.name === 'string' && typeof f.user === 'boolean'
+          && Number.isInteger(f.line) && f.line >= 0 && Number.isInteger(f.first_line) && f.first_line >= 0)
+        || !Array.isArray(s.samples) || !s.samples.every((v: unknown) => record(v)
+          && typeof v.thread === 'string' && typeof v.thread_name === 'string'
+          && numeric(v, ['python_s', 'native_s', 'system_s', 'unsplit_s', 'samples'])
+          && Array.isArray(v.frames) && v.frames.length <= 128
+          && v.frames.every((id: unknown) => Number.isInteger(id) && Number(id) >= 0 && Number(id) < s.frames.length))) return undefined;
+    }
+    return p as unknown as Profile;
   } catch {
     return undefined;
   }
@@ -82,8 +140,7 @@ export class ProfileIndex {
   }
 
   /**
-   * True if line1 lies inside a function that was sampled (from its `def` line to its
-   * last sampled line). Such lines are never "cold": a line can run between samples
+   * True if line1 lies inside a function that was sampled. Such lines are never "cold": a line can run between samples
    * (or have its memory attributed to a neighbour) without appearing in the profile.
    */
   insideSampledFunction(path: string, line1: number, platform = process.platform): boolean {
@@ -96,7 +153,8 @@ export class ProfileIndex {
         last.set(e.func_line, Math.max(last.get(e.func_line) ?? e.func_line, Number(ln)));
       }
       const fn = this.functions.get(key) ?? {};
-      spans = [...last].filter(([first]) => fn[String(first)]?.name !== "<module>");
+      spans = [...last].filter(([first]) => fn[String(first)]?.name !== "<module>")
+        .map(([first, end]) => [first, fn[String(first)]?.end_line ?? end]);
       this.spans.set(key, spans);
     }
     return spans.some(([a, b]) => line1 >= a && line1 <= b);
@@ -186,7 +244,7 @@ export function evidence(e: LineEntry | undefined, h: Heat, p: Profile): string 
     if (e.leak_runs) bits.push("leaking");
     return `🔥 Measured in last profile: ${bits.join(", ")}. `;
   }
-  if (h === "cold") return "❄ Not reached in the last profile (its code never showed up in any sample). ";
+  if (h === "cold") return "❄ No runtime samples recorded here; execution is unconfirmed. ";
   return "";
 }
 
@@ -212,8 +270,8 @@ export function leakMessage(e: LineEntry): string {
   const held = holders.length
     ? `is still referenced by ${holders.join(" and ")}`
     : "was still held (holder not found)";
-  return `${runtimePrefix(e)}⚠️ Runtime leak (measured): memory allocated on this line never went down and ` +
-    `grew in ${e.leak_runs} snapshots, and ${mb(e.end_mb ?? 0)} ${held} when the program exited. ` +
+  return `${runtimePrefix(e)}⚠️ Suspected memory leak: retained allocations grew across ${e.leak_runs} ` +
+    `trailing snapshot increases, and ${mb(e.end_mb ?? 0)} ${held} when profiling ended. ` +
     (holders.length ? "Bound it, evict old entries, or stop storing per-call data there."
                     : "Check for containers that only grow (globals, caches without a bound).");
 }

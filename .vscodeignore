@@ -9,7 +9,6 @@ examples/**
 requirements-dev.txt
 tsconfig.json
 package-lock.json
-pmg_profile.py
 
 # Keep server/libs (including licenses) and an optional bin/guardian-server.
 # Exclude development caches, interpreter-specific bytecode, and build artifacts.

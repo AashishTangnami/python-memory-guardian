@@ -31,6 +31,8 @@ import { ContainerConfig, containerCommand, PathMapping, resolveMappings, toCont
 let client: LanguageClient | undefined;
 let output: vscode.OutputChannel | undefined;
 let profileView: ProfileView | undefined;
+let lifecycle: Promise<void> = Promise.resolve();
+let shuttingDown = false;
 
 function interpreter(): string {
   const configured = vscode.workspace
@@ -89,7 +91,8 @@ function probeInterpreter(ctx: vscode.ExtensionContext): Promise<Record<string, 
     }
   }
   return new Promise((resolve) => {
-    execFile(command, args, { timeout: 20_000, windowsHide: true }, (err, stdout) => {
+    execFile(command, args, { timeout: 20_000, windowsHide: true,
+      cwd: cc ? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath : undefined }, (err, stdout) => {
       if (err) {
         output?.appendLine(`Interpreter probe failed (${err.message}); using version-neutral messages.`);
         return resolve({});
@@ -171,13 +174,18 @@ async function startClient(ctx: vscode.ExtensionContext): Promise<void> {
   }
 }
 
-async function restartClient(ctx: vscode.ExtensionContext): Promise<void> {
-  await client?.stop();
-  client = undefined;
-  await startClient(ctx);
+function restartClient(ctx: vscode.ExtensionContext): Promise<void> {
+  lifecycle = lifecycle.catch(err => output?.appendLine(`Server stop failed: ${err}`)).then(async () => {
+    if (shuttingDown) return;
+    await client?.stop();
+    client = undefined;
+    await startClient(ctx);
+  });
+  return lifecycle;
 }
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
+  shuttingDown = false;
   output = vscode.window.createOutputChannel("Python Memory Guardian");
   profileView = new ProfileView(ctx, () => client?.diagnostics, interpreter, containerConfig);
   ctx.subscriptions.push(
@@ -191,9 +199,13 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       }
     }),
   );
-  await startClient(ctx);
+  await restartClient(ctx);
 }
 
 export function deactivate(): Thenable<void> | undefined {
-  return client?.stop();
+  shuttingDown = true;
+  return lifecycle.catch(() => {}).then(async () => {
+    await client?.stop();
+    client = undefined;
+  });
 }

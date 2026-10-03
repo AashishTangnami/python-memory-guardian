@@ -32,12 +32,16 @@ def on_initialize(ls: LanguageServer, params: lsp.InitializeParams):
     profile = opts.get("profile") if isinstance(opts, dict) else None
     FACTS.clear()
     try:
-        FACTS.update(profile if isinstance(profile, dict) and profile else probe.probe())
+        # An explicit empty profile means the configured target probe failed.
+        # Do not replace container facts with measurements of the host runtime.
+        FACTS.update(profile if isinstance(profile, dict) else probe.probe())
     except Exception:  # never fail startup over the probe; messages go neutral
         pass
 
 
 def _publish(ls: LanguageServer, uri: str) -> None:
+    if (h := _pending.pop(uri, None)) is not None:
+        h.cancel()
     doc = ls.workspace.get_text_document(uri)
     diags = rules.analyze(doc.source, uri, FACTS)
     if diags is None:
@@ -69,6 +73,8 @@ def did_save(ls: LanguageServer, params: lsp.DidSaveTextDocumentParams):
 
 @server.feature(lsp.TEXT_DOCUMENT_DID_CLOSE)
 def did_close(ls: LanguageServer, params: lsp.DidCloseTextDocumentParams):
+    if (h := _pending.pop(params.text_document.uri, None)) is not None:
+        h.cancel()
     ls.text_document_publish_diagnostics(
         lsp.PublishDiagnosticsParams(uri=params.text_document.uri, diagnostics=[]))
 

@@ -70,10 +70,13 @@ export function containerCommand(cfg: ContainerConfig, scriptInContainer: string
 
 /** Rewrite every path key in a profile from container paths to host paths. */
 export function remapProfileKeys<T extends { script: string; files: Record<string, unknown>;
-  functions?: Record<string, unknown>; file_hashes?: Record<string, string> }>(
+  functions?: Record<string, unknown>; file_hashes?: Record<string, string>;
+  stacks?: { frames: { file: string }[] } }>(
   p: T, map: (containerPath: string) => string): T {
   const re = <V>(o: Record<string, V> | undefined) =>
     o && Object.fromEntries(Object.entries(o).map(([k, v]) => [map(k), v]));
   return { ...p, script: map(p.script), files: re(p.files)!, functions: re(p.functions),
-    file_hashes: re(p.file_hashes) };
+    file_hashes: re(p.file_hashes), stacks: p.stacks && {
+      ...p.stacks, frames: p.stacks.frames.map(f => ({ ...f, file: map(f.file) })),
+    } };
 }
