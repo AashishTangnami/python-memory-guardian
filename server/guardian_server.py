@@ -21,7 +21,7 @@ import rules
 
 DEBOUNCE_SECONDS = 0.35
 
-server = LanguageServer("python-memory-guardian", "1.4.0")  # keep in step with package.json
+server = LanguageServer("python-memory-guardian", "1.4.1")  # keep in step with package.json
 FACTS: dict = {}
 _pending: dict[str, asyncio.TimerHandle] = {}
 

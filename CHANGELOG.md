@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.4.1
 - Stack Explorer explains where each frame comes from: boxes are colored by origin (your code, one color per installed package, standard library, Python internals) with a legend, frames such as `<frozen importlib._bootstrap_external>` read as "Python import system", durations show in ms, and the details line gives each frame's share of the run and whether time was spent in it or in its callees.
 - Stack Explorer adds a **Frames** control: group consecutive library or Python-internal frames into one box (default), show all frames, or show only your code with library time counted in the calling function. Totals are identical in every view.
 - The sampler walks each thread's stack once per sample instead of twice and caches per-function facts, about 2.8× less sampler work per sample on deep multi-threaded stacks. Less time holding the GIL also means less distortion of the native/Python time split. Report output is unchanged.

@@ -13,7 +13,7 @@ The published extension ID is `<publisher>.python-memory-guardian`. This checkou
 
 ## Prepare a release
 
-1. Confirm the version in `package.json` and `package-lock.json` is higher than the published version, and finalize its `CHANGELOG.md` section. Set the same version in `rust-server/Cargo.toml` (the Rust server reports it at initialization) and in the `LanguageServer(...)` call in `server/guardian_server.py`. This checkout is prepared as 1.4.0; verify that number against the Marketplace listing before publishing.
+1. Confirm the version in `package.json` and `package-lock.json` is higher than the published version, and finalize its `CHANGELOG.md` section. Set the same version in `rust-server/Cargo.toml` (the Rust server reports it at initialization) and in the `LanguageServer(...)` call in `server/guardian_server.py`. This checkout is prepared as 1.4.1; verify that number against the Marketplace listing before publishing.
 2. Build and run the project tests:
 
    ```bash
@@ -35,6 +35,16 @@ The published extension ID is `<publisher>.python-memory-guardian`. This checkou
 4. Check the package contents with `npx vsce ls --tree`. Run `python test-fixtures/package_test.py path/to/package.vsix` with the oldest and current supported Python, then install the VSIX in a clean VS Code environment and test warnings and profiling. Use the [local deployment checklist](05-local-deploy.md#install-and-check-it).
 
 Build platform-specific VSIXs separately if you are distributing the Rust backend. Each package must contain a binary for its target OS and CPU. The [VS Code publishing guide](https://code.visualstudio.com/api/working-with-extensions/publishing-extension#platform-specific-extensions) explains `--target` packages and the universal fallback.
+
+## 1.4.1 preparation status (October 4, 2026)
+
+| Gate | Status in this checkout |
+|---|---|
+| Version and notes | `package.json`, `package-lock.json`, `rust-server/Cargo.toml` and `Cargo.lock`, and `server/guardian_server.py` are all 1.4.1; `CHANGELOG.md` has a 1.4.1 section. Both language servers report 1.4.1 in their `initialize` response. Confirm that 1.4.1 is newer than the live Marketplace version before upload. |
+| Source and runtime tests | `npm test` and the Rust-required parity check (`PMG_REQUIRE_RUST=1`) pass on Python 3.13.0 with a fresh macOS ARM release binary. Not yet rerun on Python 3.9. |
+| Packaging, clean install and audit | Not yet run for 1.4.1: build the VSIX, run the packaged Python-server smoke test, install it in a clean VS Code profile, and rerun `npm audit`. The publisher ID and `LICENSE` copyright holder are still placeholders, as in 1.4.0. |
+
+The 1.4.0 table below is kept as the record of that release's checks.
 
 ## 1.4.0 preparation status (October 3, 2026)
 

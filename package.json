@@ -2,7 +2,7 @@
   "name": "python-memory-guardian",
   "displayName": "Python Memory Guardian",
   "description": "Static + runtime analysis for CPython: flags heap inflation, RAM fragmentation, text inflation, memory swell and single-threaded stalls as you type, and measures per-line time (Python / native / system) and memory with a built-in low-overhead profiler.",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "publisher": "your-publisher-id",
   "license": "MIT",
   "engines": {
