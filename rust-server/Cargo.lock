@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-server"
-version = "1.1.0"
+version = "1.4.0"
 dependencies = [
  "serde_json",
  "tokio",

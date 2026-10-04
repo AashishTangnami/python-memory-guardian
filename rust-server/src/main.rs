@@ -1195,7 +1195,7 @@ impl LanguageServer for Backend {
                 })),
                 ..Default::default()
             },
-            server_info: Some(ServerInfo { name: "python-memory-guardian".into(), version: Some("1.1.0".into()) }),
+            server_info: Some(ServerInfo { name: "python-memory-guardian".into(), version: Some(env!("CARGO_PKG_VERSION").into()) }),
         })
     }
 

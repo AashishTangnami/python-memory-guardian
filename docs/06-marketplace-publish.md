@@ -13,7 +13,7 @@ The published extension ID is `<publisher>.python-memory-guardian`. This checkou
 
 ## Prepare a release
 
-1. Confirm the version in `package.json` and `package-lock.json` is higher than the published version, and finalize its `CHANGELOG.md` section. This checkout is prepared as 1.4.0; verify that number against the Marketplace listing before publishing.
+1. Confirm the version in `package.json` and `package-lock.json` is higher than the published version, and finalize its `CHANGELOG.md` section. Set the same version in `rust-server/Cargo.toml` (the Rust server reports it at initialization) and in the `LanguageServer(...)` call in `server/guardian_server.py`. This checkout is prepared as 1.4.0; verify that number against the Marketplace listing before publishing.
 2. Build and run the project tests:
 
    ```bash
