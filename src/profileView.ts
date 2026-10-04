@@ -58,6 +58,7 @@ export class ProfileView implements vscode.Disposable {
       }),
       vscode.commands.registerCommand("pythonMemoryGuardian.showReport", () => this.report.show()),
       vscode.commands.registerCommand("pythonMemoryGuardian.openSavedReport", () => this.openSavedReport()),
+      vscode.commands.registerCommand("pythonMemoryGuardian.visualizeReport", (uri?: vscode.Uri) => this.visualizeReport(uri)),
       vscode.commands.registerCommand("pythonMemoryGuardian.profileFile", () => this.runProfiler()),
       vscode.commands.registerCommand("pythonMemoryGuardian.toggleProfileOverlay", () => {
         this.overlay = !this.overlay;
@@ -135,10 +136,23 @@ export class ProfileView implements vscode.Disposable {
     if (selected?.[0]) this.load(selected[0], true);
   }
 
+  /** The JSON editor title passes its URI; the Command Palette uses the active editor. */
+  private visualizeReport(uri?: vscode.Uri): void {
+    const target = uri ?? vscode.window.activeTextEditor?.document.uri;
+    if (!target || target.scheme !== "file" || path.extname(target.fsPath).toLowerCase() !== ".json") {
+      void vscode.window.showWarningMessage("Open a saved Memory Guardian profile JSON to visualize it.");
+      return;
+    }
+    this.load(target, true);
+  }
+
   private load(uri: vscode.Uri, reveal = false): void {
     let text: string;
     try {
-      text = fs.readFileSync(uri.fsPath, "utf8");
+      // A user may click the action while editing the JSON. Render the text they
+      // can see, including unsaved changes; watcher loads still read the disk.
+      const open = reveal && vscode.workspace.textDocuments.find(d => d.uri.toString() === uri.toString());
+      text = open ? open.getText() : fs.readFileSync(uri.fsPath, "utf8");
     } catch {
       if (reveal) vscode.window.showWarningMessage("Python Memory Guardian: could not read the selected profile JSON.");
       return;

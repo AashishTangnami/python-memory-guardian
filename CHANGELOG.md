@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Add a macOS/Linux `scripts/install-local.js` helper to install locked npm packages, build the VSIX, and force-install it into local VS Code with one command.
+- Add a one-click graph action to JSON editor tabs for opening valid Memory Guardian profiles in the visual report.
 
 ## 1.4.0
 - Open generated or selected saved JSON profiles in an Overview with run metrics, an interactive process-memory timeline, and top sampled source lines. New timelines retain a post-script memory sample.

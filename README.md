@@ -83,7 +83,7 @@ The **Stack Explorer** tab shows aggregated Python call stacks, including librar
 
 On Python 3.12+, set `pythonMemoryGuardian.profile.monitoring` to `lines` to also record which user-code lines generated execution events. This is optional and can add overhead. It prevents an executed line missed by the interval sampler from being marked cold; it does not replace sampled timing or trace native allocations. If Python lacks `sys.monitoring` or another tool owns its profiler ID, Guardian falls back to sampling and marks line-event coverage unavailable in the report.
 
-Use **Python Memory Guardian: Open Profile Report** or click the status bar to reopen the loaded report. Use **Python Memory Guardian: Open Saved Profile Report** to select any schema-2 or schema-3 profile JSON, including output from the standalone CLI. Older schema-2 reports still load; re-run profiling to obtain caller stacks and memory trends. Everything uses Guardian's own profiler and standard-library Python helpers, with no py-spy or Memray dependency.
+Use **Python Memory Guardian: Open Profile Report** or click the status bar to reopen the loaded report. When a saved JSON report is open in the editor, click its **graph icon** in the editor title bar to visualize it in one step. The action validates the file before loading it; unrelated JSON remains in the editor. **Python Memory Guardian: Open Saved Profile Report** still lets you select any schema-2 or schema-3 profile JSON, including output from the standalone CLI. Older schema-2 reports still load; re-run profiling to obtain caller stacks and memory trends. Everything uses Guardian's own profiler and standard-library Python helpers, with no py-spy or Memray dependency.
 
 > **Tip:** add `.pmg/` to your `.gitignore`.
 
@@ -248,6 +248,8 @@ Open the folder through **WSL: Connect to WSL** or **Remote-SSH: Connect to Host
 ---
 
 ## 3. Developing the extension
+
+On macOS or Linux, install a fresh local build in VS Code with `node scripts/install-local.js` from the repository root, then reload the VS Code window. The script installs npm dependencies, builds the VSIX and installs it with `--force`; [local deployment](docs/05-local-deploy.md) covers requirements, Windows manual steps, and remote windows.
 
 ### 3.1 Prerequisites
 

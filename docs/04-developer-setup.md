@@ -23,6 +23,7 @@ npm run compile
 ```
 
 `vendor:python` installs the pinned runtime packages into `server/libs/`. `compile` type-checks the TypeScript and bundles `dist/extension.js`. The packaging command also invokes these steps through `vscode:prepublish`.
+On macOS or Linux, install a packaged development build into local VS Code in one step with `node scripts/install-local.js`; it includes `npm ci` and the prepublish build, then forces the VSIX install. See [local deployment](05-local-deploy.md) for Windows manual steps and the remote-host note.
 Keep `@types/vscode` pinned to the minimum supported `engines.vscode` minor version in `package.json`; `vsce package` validates this match. Upgrade the editor minimum only when the extension uses an API that requires it.
 
 To work on the Rust backend, build it separately:

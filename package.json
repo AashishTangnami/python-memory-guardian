@@ -48,6 +48,11 @@
         "title": "Python Memory Guardian: Open Saved Profile Report"
       },
       {
+        "command": "pythonMemoryGuardian.visualizeReport",
+        "title": "Python Memory Guardian: Visualize This Report",
+        "icon": "$(graph)"
+      },
+      {
         "command": "pythonMemoryGuardian.toggleProfileOverlay",
         "title": "Python Memory Guardian: Toggle Profile Overlay"
       },
@@ -168,6 +173,11 @@
           "command": "pythonMemoryGuardian.profileFile",
           "when": "resourceLangId == python",
           "group": "navigation"
+        },
+        {
+          "command": "pythonMemoryGuardian.visualizeReport",
+          "when": "resourceScheme == file && resourceExtname == .json",
+          "group": "navigation"
         }
       ]
     },
@@ -188,7 +198,7 @@
     "vscode:prepublish": "npm run vendor:python && npm run compile",
     "package": "vsce package",
     "test": "npm run compile && npm run test:parity && npm run test:runtime",
-    "test:runtime": "node scripts/py.js test-fixtures/profiler_regression_test.py && node scripts/py.js test-fixtures/server_lifecycle_test.py && node scripts/py.js test-fixtures/profiler_test.py && node test-fixtures/test_model.js && node test-fixtures/test_report.js && node test-fixtures/test_extension_lifecycle.js && node test-fixtures/test_container.js",
+    "test:runtime": "node scripts/py.js test-fixtures/profiler_regression_test.py && node scripts/py.js test-fixtures/server_lifecycle_test.py && node scripts/py.js test-fixtures/profiler_test.py && node test-fixtures/test_model.js && node test-fixtures/test_report.js && node test-fixtures/test_report_entry.js && node test-fixtures/test_extension_lifecycle.js && node test-fixtures/test_container.js",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node18 --sourcemap"
   },
   "dependencies": {

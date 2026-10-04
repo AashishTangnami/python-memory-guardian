@@ -40,6 +40,8 @@ Save a Python file that can run as a script. Click the pulse icon in the editor 
 
 The script runs in a VS Code terminal. After it finishes, the report opens and measured lines receive inline labels. The profile is written to `.pmg/profile.json` in the project folder. Add `.pmg/` to `.gitignore` if you do not want to commit profiles.
 
+To visualize an existing profile JSON, open it in the editor and click the graph icon in that tab's title bar. The report opens beside the JSON.
+
 ## Next
 
 - [Using the extension](02-using-the-extension.md) explains the report, warnings, and settings.

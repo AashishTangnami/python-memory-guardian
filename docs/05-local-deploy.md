@@ -11,6 +11,14 @@ npm ci
 npx vsce package
 ```
 
+For a local development install on macOS or Linux, run the single helper instead:
+
+```bash
+node scripts/install-local.js
+```
+
+It runs `npm ci`, packages the current manifest version (including the Python vendoring and TypeScript prepublish steps), then runs `code --install-extension <vsix> --force`. It stops if any step fails. Run `node scripts/install-local.js --dry-run` to print the steps without changing anything. Set `PMG_CODE_CLI=code-insiders` if you use VS Code Insiders; the normal `code` CLI must otherwise be on `PATH`. Reload the VS Code window after installation. This installs into the local VS Code profile; use the appropriate remote window or CLI for a remote extension host.
+
 `vsce package` runs this project's `vscode:prepublish` script, which vendors the pinned Python server dependencies and builds the TypeScript bundle. It produces a file named like `python-memory-guardian-1.4.0.vsix` for the current manifest version. The universal package supports the default Python backend; users need Python 3.9+ on the machine where the extension runs.
 
 Generated root-level VSIX and source-archive filenames are ignored by Git for every version; the Marketplace publishing guide under `docs/` is a source document to keep with the release changes.

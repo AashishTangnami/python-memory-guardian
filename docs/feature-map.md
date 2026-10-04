@@ -1,8 +1,27 @@
 # Python Memory Guardian: implemented feature map
 
-This map follows the source in this checkout. Solid Mermaid arrows represent runtime calls or data flow; dotted arrows marked **build-time** represent packaged dependencies. A process boundary is drawn where execution crosses the VS Code extension host, a language server, the profiler process, or a configured container. Static analysis examines source text; runtime profiling executes the saved script. Each diagram keeps the viewer's Mermaid colors while requesting a sans-serif font, straight lines, and consistent spacing; the Markdown viewer ultimately controls how Mermaid renders them. The [README](../README.md) provides product context; source code is the authority for implemented behavior.
+Use this map to trace a feature from its trigger to its result, implementation and tests. Static analysis examines source text; runtime profiling executes the saved script. Source code is the authority for implemented behavior. See the [README](../README.md) for product context and the [user guides](00-guides.md) for usage instructions.
 
-## 1. Core feature overview
+## Start here
+
+| What do you want to understand? | Start with |
+|---|---|
+| How the main pieces fit together | [System overview](#system-overview) |
+| Where a static warning comes from, or where to add a rule | [Static diagnostics](#static-diagnostics) |
+| What happens when you profile a script | [Runtime profiling](#runtime-profiling) |
+| Why a profile fails to load or becomes stale | [Profile loading and freshness](#profile-loading-and-freshness) |
+| How line labels, runtime warnings and severity changes work | [Editor annotations and warnings](#editor-annotations-and-warnings) |
+| How report charts and source navigation work | [Reports and source navigation](#reports-and-source-navigation) |
+| Which Python or language server runs | [Interpreter and backend setup](#interpreter-and-backend-setup) |
+| How host and container paths connect | [Container execution](#container-execution) |
+| How resources reach the installed extension | [Build and packaging](#build-and-packaging) |
+| Which components must change together | [Shared contracts and coordinated changes](#shared-contracts-and-coordinated-changes) |
+
+**Contents:** [Overview](#system-overview) · [Implemented features](#implemented-features) · [Developer reference](#developer-reference) · [Planned capabilities](#planned-incomplete-or-unused-capabilities) · [Verification and limits](#verification-and-limits)
+
+Each feature below follows the same order: **behavior → trigger/result → flow → code → branches → tests**. Filenames link to source; named functions identify the relevant entry points. Tables are the feature-to-code map, placed beside the behavior they explain.
+
+## System overview
 
 ```mermaid
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
@@ -19,7 +38,66 @@ flowchart TD
     Profile -->|publishes suspected leaks| Problems
 ```
 
-### Static rule families
+The two main paths meet in the editor: static findings arrive from the selected language server, while a validated runtime profile supplies annotations, runtime warnings, report data and freshness-gated prioritization of static findings.
+
+**Diagram key:** solid arrows show runtime calls or data flow; dotted arrows show build-time dependencies. Boxes group separate processes where relevant. Diagrams use top-down flow, the viewer's colors, a sans-serif font and straight lines.
+
+## Implemented features
+
+### Static diagnostics
+
+The selected Python or Rust language server recognizes source patterns and publishes findings with advice. These are suggestions in diagnostic text; no code actions or automatic edits are registered.
+
+**Trigger:** open, edit, save or close a Python `file` or `untitled` document. **Result:** editor squiggles and Problems entries, optionally adjusted using a fresh runtime profile.
+
+```mermaid
+%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+flowchart TD
+    subgraph EXT["VS Code extension host"]
+      Event["Python document event"]
+      Feedback["Diagnostic middleware"]
+      UI["Editor squiggles and Problems"]
+    end
+    subgraph PY["Python language-server process: one backend"]
+      Py["Document handlers and AST analyzer"]
+      PyKeep["Last good diagnostics"]
+    end
+    subgraph RS["Rust language-server process: alternative backend"]
+      Rs["Document handlers and tree-sitter analyzer"]
+      RsKeep["Last good diagnostics"]
+    end
+    Event -->|selected Python client sends LSP event| Py
+    Event -->|selected Rust client sends LSP event| Rs
+    Py -->|publishes deduplicated diagnostics| Feedback
+    Rs -->|publishes deduplicated diagnostics| Feedback
+    Py -->|invalid syntax retains| PyKeep
+    Rs -->|parse errors retain| RsKeep
+    Py -->|close publishes empty list| Feedback
+    Rs -->|close publishes empty list| Feedback
+    Feedback -->|applies fresh runtime evidence and renders| UI
+```
+
+**Implementation**
+
+| Responsibility | Files and symbols |
+|---|---|
+| Receive events, debounce edits and publish findings | [guardian_server.py](../server/guardian_server.py#L60): `did_open`, `did_change`, `did_save`, `did_close`, `_publish`; [main.rs](../rust-server/src/main.rs#L1206): `Backend::did_*`, `publish` |
+| Parse source, build scope indexes and visit patterns | [rules.py](../server/rules.py#L705): `analyze`, `index_file`, `classify`, `Visitor`; [main.rs](../rust-server/src/main.rs#L1111): `analyze`, `index_with_imports`, `classify`, `Visitor::visit` |
+| Render advice and sized or neutral messages | [messages.json](../server/messages.json); `render` and `prefix` in both analyzers |
+| Convert ranges and suppress marked findings | [rules.py](../server/rules.py#L661): `_utf16`, `_range`, `SUPPRESS`; [main.rs](../rust-server/src/main.rs#L1096): `to_utf16`, `lsp_range`, `SUPPRESS` |
+| Apply runtime evidence before display | [extension.ts](../src/extension.ts#L146): `startClient` middleware; [profileView.ts](../src/profileView.ts#L185): `adjust` |
+
+**Important branches and limits**
+
+- Open/save analyze immediately; edits debounce for 350 ms. Invalid syntax retains the last good diagnostics; closing publishes an empty list.
+- Python uses CPython `ast`, `pygls` and `lsprotocol`. Rust uses `tree-sitter-python` and `tower-lsp`. Parsers, scope indexes, visitors, message rendering, range conversion and suppression are separate implementations.
+- Both use the same [diagnostic message contract](#shared-contracts-and-coordinated-changes). Python reads the JSON at module import; Rust embeds it with `include_str!` at build time and parses it through `OnceLock` on first render. Message changes require a Rust rebuild.
+- Rule context includes import aliases, lexical bindings, loops and known thread targets. No project-wide dataflow analysis is implemented.
+- For runtime severity changes, see [Editor annotations and warnings](#editor-annotations-and-warnings).
+
+**Tests:** [parity_test.py](../test-fixtures/parity_test.py) and its rule fixtures compare backend diagnostics; [server_lifecycle_test.py](../test-fixtures/server_lifecycle_test.py) checks server events and lifecycle. Parity is tested, not guaranteed by shared implementation.
+
+#### Static rule families
 
 Both servers emit the following codes through their visitor/analyzer, with text and advice from `server/messages.json`. These are source-pattern suggestions in diagnostic messages; the extension registers no code actions or automatic edits.
 
@@ -36,419 +114,468 @@ Both servers emit the following codes through their visitor/analyzer, with text 
 
 There are **21 codes in 8 grouped rows** above. The source has ten naming prefixes if `cyclic-reference` and `gc-cycle-risk`, and `resource-leak` and `task-retention`, are counted separately. Diagnostics carry severity, code, source, UTF-16 range and sometimes related locations. A `memory-guardian: ignore` marker on the finding's starting line suppresses that static finding. It does not suppress runtime leak diagnostics.
 
-## 2. Feature execution flows
+[Back to navigation](#start-here)
 
-### 2.1 Activation, interpreter facts and backend selection
+### Runtime profiling
+
+The editor command and standalone CLI run the same profiler. It executes the target script, samples thread timing and records memory evidence according to the chosen mode.
+
+**Trigger:** `pythonMemoryGuardian.profileFile` (Profile Current File), or direct `pmg_profile.py` invocation. **Result:** task/terminal output and schema-3 `.pmg/profile.json`.
 
 ```mermaid
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
 flowchart TD
-    Trigger["Python document activates extension; setting change or Restart command"] -->|calls| Start["extension.ts: activate / restartClient / startClient"]
-    Start -->|calls| Probe["probeInterpreter"]
     subgraph EXT["VS Code extension host"]
-      Start
-      Probe
-      Select["serverOptions: backend setting"]
-      Client["LanguageClient over stdio"]
-      Output["Output channel or startup error"]
+      Command["Profile Current File"]
+      Task["Save file, choose mode and create task"]
     end
-    subgraph TARGET["Target Python process; container when configured"]
-      Facts["probe.py: version, sizes, GIL, allocator"]
+    CLI["Standalone profiler CLI"]
+    subgraph PROC["Target Python process: local or configured container"]
+      Main["Profiler entry point"]
+      Capture["Execute script and collect samples"]
+      Finish["Finalize measurements and report"]
     end
-    Probe -->|launches| Facts
-    Probe -->|after probe calls| Select
-    Facts -->|supplies initialization facts| Client
-    Probe -->|on failure supplies empty facts| Client
-    Select -->|configures| Client
-    Client -->|launches and initializes Python option| Py["guardian_server.py and vendored pygls"]
-    Client -->|launches and initializes Rust option| Rs["bin/guardian-server"]
-    Select -->|missing binary or failed start reports| Output
-    Client -->|logs LSP trace when configured| Output
+    JSON["Profile JSON"]
+    Command -->|checks editor and calls runProfiler| Task
+    Task -->|invalid editor, failed save or cancellation stops| Cancel["No task launched"]
+    Task -->|launches Python with profiler arguments| Main
+    CLI -->|calls main with script arguments| Main
+    Main -->|starts sampler and runs script as __main__| Capture
+    Capture -->|normal exit or handled exception calls finalizer| Finish
+    Finish -->|atomically writes schema 3| JSON
+    Main -->|setup failure prevents| Missing["No new profile"]
+    Finish -->|write failure prevents| Missing
 ```
 
-The Python server runs on `pythonMemoryGuardian.interpreter` (default `python3`, or `python` on Windows). The Rust server is a local packaged executable. **Container mode affects the probe and profiler, not the language server**: the selected server still runs in the extension host, using target-interpreter facts. The Python server probes itself only when initialization supplied no profile object; the extension normally sends an object, including `{}` after probe failure. Both servers then use neutral wording when sized facts are unavailable. Any setting under `pythonMemoryGuardian` restarts the client, and deactivation stops it. `trace.server` configures LSP traffic logging.
+**Implementation**
 
-### 2.2 Static diagnostics and advice
+| Responsibility | Files and symbols |
+|---|---|
+| Validate/save editor, choose mode, build argv and launch task | [profileView.ts](../src/profileView.ts#L79): `runProfiler`; [package.json](../package.json): profile settings |
+| Parse CLI arguments and execute target | [pmg_profile.py](../server/pmg_profile.py#L900): `main`, `runpy.run_path`, `finish` |
+| Sample stacks, time and RSS | [pmg_profile.py](../server/pmg_profile.py#L560): `Profiler.start`, `_run`, `_record_stack` |
+| Collect precise retention and possible holders | [pmg_profile.py](../server/pmg_profile.py#L511): `_snapshot`, `_leaks`, `_find_holders` |
+| Count optional line execution events | [pmg_profile.py](../server/pmg_profile.py#L217): `_enable_monitoring`, `_on_line_event` |
+| Finalize, bound timeline, verify source hashes and write JSON | [pmg_profile.py](../server/pmg_profile.py#L571): `stop`, `report`, `_remember_sources`, `_unchanged_source`, `_text_hash`; `main.finish` uses `os.replace` |
+
+**Important branches and limits**
+
+| Mode | Collected memory evidence |
+|---|---|
+| `fast` | Sampled process RSS growth attributed to Python lines |
+| `precise` | `tracemalloc` allocation, held memory, retention trends and bounded holder search |
+| `off` / time only | Memory omitted from line labels and heat; process RSS fields still recorded |
+
+- The editor requires a saved Python file and saves dirty text before prompting. Invalid editors warn; save failure or Quick Pick cancellation launches no task. The `memoryMode` setting supplies placeholder text; the actual selected item supplies the CLI mode.
+- Timing is sampled per thread and classified as Python, native, waiting or unsplit where clocks/GIL signals permit. Native timing is estimated at Python call sites; native stacks are not captured.
+- `profile.frames` / `--frames` controls precise traceback depth (1–64). `profile.monitoring=lines` / `--monitoring lines` uses Python 3.12+ `sys.monitoring` for line-event counts and records why activation failed when unavailable. Timing remains sampled.
+- The CLI also accepts `--root`, `--out`, `--interval` and target-script arguments.
+- Precise leak detection requires at least three trailing snapshot increases without an intervening decrease and at least 1 MiB retained at exit. Holder search is bounded; it provides possible references, not a complete ownership graph.
+- `stop` adds a post-script RSS/traced-memory sample; `report` retains the endpoint while bounding the timeline to 300 points. It also emits line/function data, stack samples, source metadata and verified hashes.
+- Normal exit, `SystemExit`, `KeyboardInterrupt` and script exceptions all attempt finalization. Non-daemon threads can defer it through `atexit`. Failure during setup or report writing can prevent output.
+- Container task staging and path arguments are described under [Container execution](#container-execution).
+
+**Tests:** [profiler_test.py](../test-fixtures/profiler_test.py) and [profiler_regression_test.py](../test-fixtures/profiler_regression_test.py) cover measurements, retention, monitoring and output; [test_model.js](../test-fixtures/test_model.js) checks consumed line-event data; [test_report.js](../test-fixtures/test_report.js) checks diagnosis from precise evidence.
+
+[Back to navigation](#start-here)
+
+### Profile loading and freshness
+
+A profile must pass schema validation before it replaces the loaded profile. Its measurements can inform current source only when the mapped path and source hash match.
+
+**Trigger:** startup discovery; `.pmg/profile.json` create/change; saved-report selection; JSON editor graph action; Python source edit. **Result:** an indexed profile, a warning on invalid data, or a freshness decision for each source file.
 
 ```mermaid
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
 flowchart TD
-    Event["Open, change, save, or close Python file/untitled document"] -->|calls LSP handlers| Dispatch["did_open / did_change / did_save / did_close"]
     subgraph EXT["VS Code extension host"]
-      Event
-      Middleware["profileView.adjust: fresh runtime evidence"]
-      UI["Problems and editor diagnostics"]
+      Load["Profile loader"]
+      Valid["Schema validator"]
+      Index["Path mapping and profile index"]
+      Fresh["Source freshness check"]
+      Current["Current editor evidence"]
+      Historical["Historical report"]
+      Previous["Previous profile"]
     end
-    subgraph PY["Python language server, selected backend"]
-      Dispatch
-      PyAnalyze["rules.analyze: ast, indexes, Visitor"]
-    end
-    subgraph RS["Rust language server, alternative backend"]
-      RustDispatch["Backend::did_* handlers"]
-      RsAnalyze["analyze: tree-sitter, Index, Visitor"]
-    end
-    Event -->|calls alternative LSP handlers| RustDispatch
-    Dispatch -->|open/save call; edits debounce 350 ms| PyAnalyze
-    RustDispatch -->|open/save call; edits debounce 350 ms| RsAnalyze
-    PyAnalyze -->|publishes deduplicated diagnostics| Middleware
-    RsAnalyze -->|publishes deduplicated diagnostics| Middleware
-    PyAnalyze -->|invalid syntax retains prior diagnostics| Keep["Last good diagnostics"]
-    RsAnalyze -->|parse errors retain prior diagnostics| Keep
-    Dispatch -->|close publishes empty list| Clear["Cleared static diagnostics"]
-    RustDispatch -->|close publishes empty list| Clear
-    Middleware -->|renders| UI
+    Load -->|reads disk or revealed editor text| Valid
+    Valid -->|accepts schema 2 or 3| Index
+    Valid -->|rejects data and keeps| Previous
+    Index -->|supplies mapped paths and hashes| Fresh
+    Fresh -->|matching source permits| Current
+    Fresh -->|stale source hides evidence and cues| Rerun["Re-run profiling"]
+    Index -->|supplies validated measurements even when stale| Historical
 ```
 
-The two backends share diagnostic message templates and interpreter facts. Python reads `server/messages.json` at runtime; Rust embeds it with `include_str!` at **build time**. Python uses CPython `ast`, `pygls` and `lsprotocol`; Rust uses `tree-sitter-python` and `tower-lsp`. Their separate parsers and visitors are checked by `test-fixtures/parity_test.py`; parity is tested, not structurally guaranteed. Source-level rule context includes import aliases, lexical bindings, loops and known thread targets. No project-wide dataflow analysis is implemented.
+**Implementation**
 
-### 2.3 Runtime profiling: command or CLI to profile
+| Responsibility | Files and symbols |
+|---|---|
+| Discover/watch profiles and refresh on Python edits | [profileView.ts](../src/profileView.ts#L37): constructor, `PROFILE_GLOB` |
+| Select a saved JSON file or receive an editor URI | [profileView.ts](../src/profileView.ts#L133): `openSavedReport`, `visualizeReport`; [package.json](../package.json): `visualizeReport` command and editor/title menu |
+| Read, validate, replace index and update consumers | [profileView.ts](../src/profileView.ts#L149): `load`; [profileModel.ts](../src/profileModel.ts#L67): `parseProfile`, `ProfileIndex` |
+| Normalize paths and compare current text with recorded hashes | [profileModel.ts](../src/profileModel.ts#L57): `normPath`, `textHash`, `ProfileIndex.state` |
+| Rewrite container paths before indexing | [containerPaths.ts](../src/containerPaths.ts#L53): `remapProfileKeys`, `toLocal` |
+| Clear loaded evidence and report state | [profileView.ts](../src/profileView.ts#L175): `clear` |
+
+**Important branches and limits**
+
+- Startup loads the first discovered profile. The watcher reads disk; saved-report selection and the JSON graph action use `load` with reveal, which reads an open document's current text, including unsaved edits.
+- The graph action is contributed for any local JSON file. It passes its URI to `visualizeReport`; validation decides whether it is a supported profile.
+- Unreadable selected files or malformed/unsupported profiles warn and retain the previous index/report. No partially validated profile is installed.
+- `ProfileIndex.state` returns `fresh`, `stale` or `absent`. Freshness requires a matching normalized file path and SHA-1 of decoded source text with CRLF normalized to LF. The producer records hashes only for verified unchanged source; the consumer hashes current editor text. See the [source identity contract](#shared-contracts-and-coordinated-changes).
+- Editing a file refreshes diagnostics, report freshness and decorations. Stale files lose current editor evidence and regain unadjusted static diagnostics; historical measurements can still appear in the report.
+- `pythonMemoryGuardian.clearProfile` or watched profile deletion clears the index, runtime diagnostics and report, restores raw static findings and removes decorations/status.
+
+**Tests:** [test_model.js](../test-fixtures/test_model.js), [test_report.js](../test-fixtures/test_report.js), [test_report_entry.js](../test-fixtures/test_report_entry.js) and [profiler_regression_test.py](../test-fixtures/profiler_regression_test.py) cover validation, report entry, hashing and freshness.
+
+[Back to navigation](#start-here)
+
+### Editor annotations and warnings
+
+A fresh profile supplies line/function labels, suspected runtime leak warnings and prioritization of static findings. The extension stores raw static diagnostics so it can restore them when the profile becomes stale or is cleared.
+
+**Trigger:** valid profile load, editor visibility/source change, static diagnostic publication or overlay toggle. **Result:** end-of-line annotations, runtime Problems entries, adjusted static severity and profile status.
 
 ```mermaid
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
 flowchart TD
-    Command["Profile Current File command"] -->|calls| Check["ProfileView.runProfiler: saved Python editor"]
-    CLI["pmg_profile.py CLI and script arguments"] -->|calls| Main["pmg_profile.main"]
     subgraph EXT["VS Code extension host"]
-      Command
-      Check
-      Choice["Quick Pick: fast, precise, time only"]
-      Task["VS Code ProcessExecution task"]
-      Warning["Warning, cancellation, or task error"]
+      Gate["Fresh profile evidence"]
+      Render["Editor renderer"]
+      Adjust["Static diagnostic adjustment"]
+      Labels["Line/function annotations"]
+      Runtime["Runtime leak warnings"]
+      Static["Static Problems entries"]
     end
-    subgraph PROC["Profiler Python process; inside container when configured"]
-      Main
-      Sample["Profiler: thread stacks and time samples"]
-      Memory["RSS; optional tracemalloc snapshots and holder scan"]
-      JSON[".pmg/profile.json, schema 3"]
-    end
-    Check -->|invalid editor reports| Warning
-    Check -->|saves dirty file; prompts| Choice
-    Choice -->|cancel returns quietly| Cancel["No task launched"]
-    Choice -->|launches| Task
-    Task -->|launches| Main
-    Main -->|executes saved script as __main__| Sample
-    Sample -->|records| Memory
-    Memory -->|writes atomically| JSON
-    Main -->|script exits or raises; finalizes partial run| JSON
+    Gate -->|supplies line and function data| Render
+    Gate -->|supplies heat and measured evidence| Adjust
+    Raw["Raw LSP diagnostics"] -->|middleware intercepts| Adjust
+    Render -->|overlay enabled renders| Labels
+    Render -->|leak_runs publishes| Runtime
+    Adjust -->|returns prioritized or raw findings| Static
 ```
 
-`--memory fast` attributes sampled RSS growth; `precise` adds `tracemalloc` allocation, held-memory and retention evidence plus a bounded holder search; `off` omits memory from line labels and heat while the profiler still records process RSS fields. Timing is sampled per thread and classified as Python, native, waiting or unsplit where clocks/GIL signals permit; these are estimates at Python lines, not native stack captures. Optional `--monitoring lines` uses Python 3.12+ `sys.monitoring` for execution counts and reports why it could not activate. The CLI also accepts `--root`, `--out`, `--interval`, `--frames` and target-script arguments. Current profiles append a post-script RSS/traced-memory sample and retain it when bounding the timeline to 300 points. The profiler writes JSON after normal exit, `SystemExit`, `KeyboardInterrupt` or an exception; a failure before/during profiler setup or report writing can prevent output.
+**Implementation**
 
-### 2.4 Profile loading, freshness, annotations, prioritization and report
+| Responsibility | Files and symbols |
+|---|---|
+| Store raw findings, check freshness and adjust severity | [profileView.ts](../src/profileView.ts#L185): `adjust`, `refreshDiagnostics` |
+| Classify heat and format diagnostic evidence | [profileModel.ts](../src/profileModel.ts#L194): `heat`, `memoryMb`, `adjustSeverity`, `evidence`, `ProfileIndex.insideSampledFunction` |
+| Render decorations, runtime diagnostics and status | [profileView.ts](../src/profileView.ts#L214): `render`, `thresholds` |
+| Format line/function totals and leak advice | [profileModel.ts](../src/profileModel.ts#L221): `lineLabel`, `funcLabel`, `leakMessage`, `unattributedNote` |
+| Register overlay and clear controls | [profileView.ts](../src/profileView.ts#L37): constructor; `pythonMemoryGuardian.toggleProfileOverlay` and `pythonMemoryGuardian.clearProfile` |
+
+**Important branches and limits**
+
+| Evidence state | Editor behavior |
+|---|---|
+| Fresh, hot line | Static severity rises one level; measured evidence is prefixed |
+| Fresh, cold line | Non-error findings become hints |
+| Sampled-function gap or line-event-only evidence | Heat stays unknown; severity stays unchanged |
+| Stale/absent profile evidence | Raw static diagnostics; no current runtime annotations/warnings |
+
+- `profile.hotShare` and `profile.hotMB` set hot thresholds; `leak_runs` also makes a line hot. This is **inferred runtime prioritization**, not a new language-server finding.
+- Labels show time split and mode-specific memory; precise mode distinguishes allocated, held and transient-peak quantities. Function annotations aggregate measurements.
+- Overlay toggling skips decorations only. Runtime leak warnings still publish for fresh source, and the static adjustment path is unchanged.
+- `memory-guardian: ignore` suppresses a static finding, not runtime leak warnings.
+- Status shows run duration, memory mode/peak or a stale re-run cue. Its click opens the report; the tooltip explains substantial unattributed precise memory and traceback-depth tuning.
+
+**Tests:** [test_model.js](../test-fixtures/test_model.js) and [test_report.js](../test-fixtures/test_report.js) cover model and consumed evidence behavior. These checks do not constitute an automated VS Code editor integration run.
+
+[Back to navigation](#start-here)
+
+### Reports and source navigation
+
+The webview presents an Overview, precise-memory diagnosis and a time-weighted Stack Explorer. It can display historical measurements when source is stale, but source navigation requires verified current text.
+
+**Trigger:** `pythonMemoryGuardian.showReport`, `pythonMemoryGuardian.openSavedReport`, `pythonMemoryGuardian.visualizeReport`, status click, or automatic opening after a profiling task's next valid load. **Result:** interactive charts, evidence cards, stack filters and verified source navigation.
 
 ```mermaid
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
 flowchart TD
-    Trigger["Profile file create/change; startup discovery"] -->|calls| Load["ProfileView.load"]
     subgraph EXT["VS Code extension host"]
-      Trigger
-      Load
-      Parse["parseProfile; remap container paths; ProfileIndex"]
-      Fresh["Compare file_hashes with current editor text"]
-      Feedback["render; adjust; refreshDiagnostics"]
-      Report["GuardianReport and reportWebview"]
-      Models["reportModel: overview, diagnose, callTree"]
+      Profile["Indexed profile"]
+      Models["Overview, diagnosis and call-tree models"]
+      Bridge["Report controller"]
+      Check["Location and freshness validation"]
+      Source["Source editor"]
     end
-    Load -->|validates schema 2 or 3| Parse
-    Load -->|invalid profile shows warning| Invalid["No new profile loaded"]
-    Parse -->|reads| Fresh
-    Fresh -->|fresh: renders and adjusts diagnostics| Feedback
-    Fresh -->|stale: hides editor evidence; shows stale status| Stale["Re-run cue"]
-    Feedback -->|renders| Editor["Line/function decorations and Problems"]
-    Parse -->|passes validated profile| Report
-    Report -->|calls| Models
-    Models -->|returns view data| Report
-    Report -->|posts data to| Webview["Overview timeline and hotspots; memory cards; Stack Explorer"]
-    Edit["Edit Python document"] -->|calls freshness refresh| Fresh
-    Open["Open Profile Report command or status click"] -->|calls| Report
-    Saved["Open Saved Profile Report command"] -->|selects JSON and calls load| Load
-    Toggle["Toggle overlay command"] -->|calls| Feedback
-    Clear["Clear Profile command or file delete"] -->|clears| Feedback
+    subgraph WEB["Report webview"]
+      Panel["Charts, cards and Stack Explorer"]
+    end
+    Profile -->|refresh projects measurements through| Models
+    Models -->|returns view data to| Bridge
+    Bridge -->|posts report payload| Panel
+    Panel -->|filter message selects metric/thread| Bridge
+    Panel -->|open message requests file/line| Check
+    Check -->|report-listed fresh source opens| Source
+    Check -->|stale or invalid location warns| Warning["Navigation warning"]
 ```
 
-Freshness requires a verified SHA-1 of normalized source text and a matching mapped file path. Edits clear current runtime warnings and decorations for stale files and restore unadjusted static diagnostics. The overlay toggle controls decorations; `render` still publishes runtime leak warnings. Hot static findings rise one severity level; cold non-errors become hints; sampled-function gaps and lines with execution events stay unknown. This is an **inferred runtime prioritization**, not a new server finding. The report Overview renders bounded process RSS and traced-memory timeline samples plus top sampled lines; time-only mode hides the memory chart. Only precise profiles produce memory diagnosis cards (`growing`, `retained`, `released`) and recommendations. The Stack Explorer aggregates sampled Python call stacks by metric and thread, including library frames; missing stacks leave it empty. Source navigation from the webview requires a report-listed location and a fresh file hash. Opening a report without a loaded profile shows an information message. The report may display stale historical measurements with a warning, while editor evidence is gated on freshness.
+**Implementation**
 
-### 2.5 Container path and execution branch
+| Responsibility | Files and symbols |
+|---|---|
+| Register report commands and update after valid loads | [profileView.ts](../src/profileView.ts#L37): constructor, `openSavedReport`, `visualizeReport`, `load`, `showNextReport` |
+| Create/reveal panel and exchange messages | [reportView.ts](../src/reportView.ts#L20): `GuardianReport.show`, `update`, `refresh` |
+| Project bounded timeline and top sampled lines | [reportModel.ts](../src/reportModel.ts#L17): `overview` |
+| Classify retention and suggest checks | [reportModel.ts](../src/reportModel.ts#L51): `diagnose`, `recommendations` |
+| Aggregate sampled stacks by time metric and thread | [reportModel.ts](../src/reportModel.ts#L103): `callTree` |
+| Render charts, cards, filters and source controls | [reportWebview.ts](../src/reportWebview.ts#L2): `reportHtml`, `memoryChart`, `overview` |
+| Validate requested location and current source before opening | [reportView.ts](../src/reportView.ts#L20): `GuardianReport.show` message handler, `fresh` |
+
+**Important branches and limits**
+
+- Overview shows run metrics, bounded RSS/traced-memory timeline and top sampled-line bars. Time-only mode hides the memory chart. `timeline` and `rss_kind` come from the profiler through schema validation.
+- Only precise profiles produce memory cards (`growing`, `retained`, `released`) and recommendations. Editor leak text and report recommendations are separate consumers of the same evidence.
+- Stack Explorer aggregates Python call stacks, including library frames, by elapsed/Python/native/system/unsplit time and thread. Missing stacks leave it empty. Sampled time across threads may exceed run duration; widths are aggregated time, not chronological order or allocation weights.
+- `ready` requests a refresh; `filter` selects metric/thread; `open` requests navigation. The controller validates message shape, metric and report-listed locations. Producer/consumer payload changes must stay coordinated.
+- Navigation accepts a profiled line or user stack-frame location only if its source hash is fresh; freshness is checked again after opening the document. Stale, unavailable or unverified source warns. Historical measurements remain visible with freshness warnings.
+- Opening a report with no loaded profile shows an information message.
+- `runProfiler` sets `showNextReport` before task execution; a valid `load` clears it and opens the report. If the task fails or its JSON is invalid, a later valid watcher load can still auto-open the report. This is a specific lifecycle coupling.
+
+**Tests:** [test_report.js](../test-fixtures/test_report.js) covers report projection, diagnosis, call trees, path remapping and webview script syntax; [test_report_entry.js](../test-fixtures/test_report_entry.js) checks the JSON editor URI and validation path; [profiler_test.py](../test-fixtures/profiler_test.py) checks produced report data. Navigation guards are supported by source inspection.
+
+[Back to navigation](#start-here)
+
+### Interpreter and backend setup
+
+Activation probes the target interpreter, then starts the selected language server over stdio. Probe facts let either backend render messages for the target Python.
+
+**Trigger:** Python document activation, `pythonMemoryGuardian.restart` or any Guardian setting change. **Result:** a running language client, logs/trace, or a startup error.
 
 ```mermaid
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
 flowchart TD
-    Settings["container.execPrefix, interpreter, pathMappings"] -->|reads| Config["extension.containerConfig / resolveMappings"]
-    subgraph HOST["VS Code extension host on host machine"]
-      Settings
-      Config
-      Stage["Stage probe.py or pmg_profile.py under workspace .pmg"]
-      Map["toContainer / containerCommand"]
-      Remap["toLocal / remapProfileKeys"]
+    subgraph EXT["VS Code extension host"]
+      Activate["Activation or serialized restart"]
+      Probe["Interpreter probe launcher"]
+      Select["Backend selection and language client"]
     end
-    Config -->|calls| Stage
-    Stage -->|maps host script and output paths| Map
+    subgraph TARGET["Target Python process: local or configured container"]
+      Facts["Version, sizes, GIL and allocator facts"]
+    end
+    subgraph PY["Python language-server process"]
+      Python["Python stdio server"]
+    end
+    subgraph RS["Rust language-server process"]
+      Rust["Packaged Rust stdio server"]
+    end
+    Activate -->|calls startClient| Probe
+    Probe -->|execFile runs probe.py| Facts
+    Facts -->|JSON stdout supplies initialization facts| Select
+    Probe -->|failure supplies empty facts| Select
+    Select -->|Python backend launches and initializes| Python
+    Select -->|Rust backend launches and initializes| Rust
+    Select -->|missing binary or start failure reports| Error["Startup error"]
+```
+
+**Implementation**
+
+| Responsibility | Files and symbols |
+|---|---|
+| Declare activation, commands and settings | [package.json](../package.json): `activationEvents`, `contributes` |
+| Construct profile view before starting server | [extension.ts](../src/extension.ts#L187): `activate` |
+| Select interpreter and launch probe with fallback | [extension.ts](../src/extension.ts#L37): `interpreter`, `probeInterpreter`; [probe.py](../server/probe.py#L51): `probe` |
+| Select server command and initialize stdio client | [extension.ts](../src/extension.ts#L112): `serverOptions`, `startClient`, `LanguageClient` |
+| Serialize stop/start and stop on deactivation | [extension.ts](../src/extension.ts#L177): `restartClient`, `deactivate` |
+| Consume initialization facts and serve LSP | [guardian_server.py](../server/guardian_server.py#L30): `on_initialize`, `start_io`; [main.rs](../rust-server/src/main.rs#L1176): `Backend::initialize`, `main` |
+
+**Important branches and limits**
+
+- `pythonMemoryGuardian.backend` selects Python or Rust. `pythonMemoryGuardian.interpreter` chooses Python; an empty setting falls back to `python3` (`python` on Windows). No automatic environment discovery is implemented.
+- The Python server runs on that interpreter. Rust runs the packaged `bin/guardian-server[.exe]`; missing binaries report a startup error. The server command is launched from the extension host in both cases.
+- **Container mode changes the probe and profiler, not the language-server launch.** Both backends receive target-interpreter facts via `initializationOptions.profile`.
+- Probe failure supplies `{}` and neutral wording where sized facts are unavailable. Python probes itself only if initialization supplies no facts object; an explicit empty object does not trigger a host probe.
+- Failed server start leaves static analysis unavailable. Profile tasks/report commands remain registered because `ProfileView` was constructed first.
+- Any `pythonMemoryGuardian` setting change restarts the client; deactivation waits for the serialized lifecycle and stops it. `trace.server` controls LSP traffic in the output channel.
+
+**Tests:** [test_extension_lifecycle.js](../test-fixtures/test_extension_lifecycle.js), [server_lifecycle_test.py](../test-fixtures/server_lifecycle_test.py) and [parity_test.py](../test-fixtures/parity_test.py) cover lifecycle, facts and backend behavior.
+
+[Back to navigation](#start-here)
+
+### Container execution
+
+With the editor on the host, a configured exec prefix launches the probe/profiler in a container. Path translation connects staged helpers and generated profile data to host-side source.
+
+**Trigger:** nonempty `pythonMemoryGuardian.container.execPrefix`. **Result:** target measurements from container Python, remapped editor/report paths, or a mapping/execution error.
+
+```mermaid
+%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+flowchart TD
+    subgraph HOST["VS Code extension host"]
+      Settings["Exec prefix, interpreter and path mappings"]
+      Stage["Stage helper and map outbound paths"]
+      Load["Load profile and remap inbound paths"]
+      Editor["Host source identity and feedback"]
+    end
     subgraph CONT["Configured container process"]
-      Target["Container Python process"]
+      Target["Python probe or profiler"]
     end
-    Map -->|launches exec prefix| Target
-    Target -->|writes profile in bind mount| Shared["Host-visible .pmg/profile.json"]
-    Shared -->|reads and remaps paths| Remap
-    Remap -->|publishes mapped profile| View["Host editor annotations and report"]
-    Map -->|unmapped path reports error| Failure["Probe neutral facts or profiler error"]
+    Shared["Bind-mounted workspace"]
+    Settings -->|resolved mappings and prefix configure| Stage
+    Stage -->|exec prefix launches mapped helper arguments| Target
+    Target -->|profiler writes JSON through| Shared
+    Shared -->|host-visible profile is read by| Load
+    Settings -->|supplies reverse mappings| Load
+    Load -->|rewrites paths before indexing| Editor
+    Stage -->|unmapped outbound path throws| Error["Neutral probe facts or task error"]
 ```
 
-An empty `execPrefix` leaves local or remote-extension-host execution in place. Plain Docker/Compose mode requires a bind-mounted workspace and path mappings. `toContainer` fails on an unmapped host path; `toLocal` leaves an unmapped container path unchanged, so that file will not match the host editor. `test-fixtures/test_container.js` exercises this with a path alias rather than a Docker daemon.
+**Implementation**
 
-## 3. Shared dependency graphs: implementation level
+| Responsibility | Files and symbols |
+|---|---|
+| Read container configuration and stage probe | [extension.ts](../src/extension.ts#L50): `containerConfig`, `stageHelper`, `probeInterpreter` |
+| Resolve mapping settings and compose container argv | [containerPaths.ts](../src/containerPaths.ts#L24): `resolveMappings`, `toContainer`, `containerCommand` |
+| Copy profiler under workspace `.pmg` and map task paths | [profileView.ts](../src/profileView.ts#L79): `runProfiler` |
+| Rewrite profile paths on load | [profileView.ts](../src/profileView.ts#L149): `load`; [containerPaths.ts](../src/containerPaths.ts#L53): `toLocal`, `remapProfileKeys` |
 
-The diagrams below reuse the same boundary names: **CONFIG** (`package.json` settings and commands), **FACTS** (`initializationOptions.profile`), **LSP** (the selected stdio language-server process), **DIAGNOSTICS** (`textDocument/publishDiagnostics`), **PROFILE** (`.pmg/profile.json`), **SOURCE** (profile file hashes versus current text), **PATHS** (host/container mapping), and **WEBVIEW** (`postMessage` in both directions). Repeated boundary nodes refer to the same contract across diagrams, not additional services. Solid edges are runtime calls or data transfers; dotted edges are build-time dependencies. Each edge says what crosses it.
+**Important branches and limits**
 
-### 3.1 Extension startup, interpreter facts and backend lifecycle
+- Empty `execPrefix` keeps local or remote-extension-host execution. Dev Containers, Codespaces, WSL and Remote-SSH normally run the extension beside Python and do not need this branch.
+- Plain Docker/Compose requires a bind-mounted workspace and configured path mappings. Helpers are staged under workspace `.pmg` so container Python can read them.
+- Probe and profiler intentionally share mapping/prefix helpers. The language server remains launched from the extension host.
+- `toContainer` throws on an unmapped outbound path: the probe falls back to neutral facts, while profiler setup reports an error.
+- `toLocal` leaves unmapped inbound paths unchanged. If they differ from host paths, source lookup/freshness can miss.
+- `remapProfileKeys` rewrites script, file/function keys, source hashes and stack-frame paths. Changes to profile path fields must update this contract.
+
+**Tests:** [test_container.js](../test-fixtures/test_container.js) simulates an exec prefix with a path alias and mapped paths; it does not launch Docker.
+
+[Back to navigation](#start-here)
+
+### Build and packaging
+
+Packaging creates the JavaScript bundle and vendors Python dependencies. Rust compilation is separate; its output must be placed at the path the extension expects.
+
+**Trigger:** npm build/package scripts, `build:rust`, or `node scripts/install-local.js`. **Result:** bundled resources, an optional Rust executable, a VSIX and optionally local VS Code installation.
+
+#### Extension and Python resources
 
 ```mermaid
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
 flowchart TD
-    CONFIG["CONFIG: package.json settings and commands"] -->|declares activation and settings| Activate["src/extension.ts: activate"]
-    Activate -->|constructs before server start| View["src/profileView.ts: ProfileView"]
-    Activate -->|calls| Restart["src/extension.ts: restartClient"]
-    Restart -->|calls| Start["src/extension.ts: startClient"]
-    Start -->|calls before client construction| Probe["src/extension.ts: probeInterpreter"]
-    PATHS["PATHS: container path contract"] -->|supplies container command if configured| Probe
-    Probe -->|launches with execFile| Target["server/probe.py: probe"]
-    Target -->|writes JSON facts to stdout| FACTS["FACTS: initializationOptions.profile"]
-    Probe -->|substitutes empty object on failure| FACTS
-    FACTS -->|returns profile for initialization options| Start
-    Start -->|calls| Options["src/extension.ts: serverOptions"]
-    Options -->|selects Python command| Py["server/guardian_server.py: start_io"]
-    Options -->|selects packaged Rust command| Rs["rust-server/src/main.rs: main"]
-    Py -->|serves stdio protocol| LSP["LSP: selected server process"]
-    Rs -->|serves stdio protocol| LSP
-    Options -->|missing Rust binary throws| Failure["VS Code startup error"]
-    Start -->|failed client start reports| Failure
+    Manifest["package.json: vscode:prepublish"]
+    Vendor["vendor:python"]
+    Compile["compile and bundle"]
+    Pins["requirements.txt"]
+    Libs["server/libs"]
+    Bundle["dist/extension.js"]
+    Server["Python language server"]
+    Manifest -. build-time invokes .-> Vendor
+    Manifest -. build-time invokes .-> Compile
+    Pins -. build-time supplies pinned packages .-> Vendor
+    Vendor -. build-time installs into .-> Libs
+    Sources["src/extension.ts and imported modules"] -. build-time esbuild bundles through .-> Compile
+    Compile -. build-time writes .-> Bundle
+    Server -->|early _vendor import prepends libs to sys.path| Libs
 ```
 
-Evidence for the edges: [manifest activation/settings and commands](../package.json#L26), [`activate` constructs `ProfileView` then restarts](../src/extension.ts#L187), [`restartClient` serializes stops and starts](../src/extension.ts#L177), [`probeInterpreter` launches the target and handles empty-fact fallback](../src/extension.ts#L77), [`probe` emits JSON](../server/probe.py#L51), [`startClient` passes `profile` and creates the `LanguageClient`](../src/extension.ts#L146), [`serverOptions` selects commands and checks `bin`](../src/extension.ts#L112), [Python stdio entry](../server/guardian_server.py#L82), and [Rust stdio entry](../rust-server/src/main.rs#L1234). The failure arrows matter: a failed probe changes diagnostic wording, while a failed server start removes static diagnostics; `ProfileView` was already constructed, so its task/report commands remain registered.
-
-### 3.2 Static analyzers, shared messages and duplicated implementations
+#### Rust executable
 
 ```mermaid
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
 flowchart TD
-    FACTS["FACTS: initializationOptions.profile"] -->|initializes facts dict| PyHandler["guardian_server.py: on_initialize / did_* / _publish"]
-    FACTS -->|initializes facts map| RsHandler["main.rs: Backend.initialize / did_* / publish"]
-    LSP["LSP: selected server process"] -->|delivers document events to Python option| PyHandler
-    LSP -->|delivers document events to Rust option| RsHandler
-    PyHandler -->|calls after edit debounce| PyAnalyze["rules.py: analyze / index_file"]
-    RsHandler -->|calls after edit debounce| RsAnalyze["main.rs: analyze / index"]
-    PyAnalyze -->|visits CPython AST| PyVisitor["rules.py: Visitor / classify"]
-    RsAnalyze -->|visits tree-sitter syntax tree| RsVisitor["main.rs: Visitor / classify"]
-    PyVisitor -->|finding keys feed message rendering| PyRender["rules.py: render / prefix / _range"]
-    RsVisitor -->|finding keys feed message rendering| RsRender["main.rs: render / prefix / lsp_range"]
-    Messages["server/messages.json: rule keys and text"] -->|read at Python import time| PyMessages["rules.py: MESSAGES"]
-    PyMessages -->|looked up by diagnostic code| PyRender
-    Messages -. build-time include_str embeds JSON .-> Embedded["main.rs: MESSAGES_JSON"]
-    Embedded -->|parsed by OnceLock on first render| RsRender
-    PyAnalyze -->|returns diagnostics for _publish| DIAGNOSTICS["DIAGNOSTICS: publishDiagnostics"]
-    RsAnalyze -->|returns diagnostics for publish| DIAGNOSTICS
-    PyAnalyze -->|parse failure retains previous result| Previous["Last published diagnostics"]
-    RsAnalyze -->|parse error retains previous result| Previous
+    Inputs["Rust crate source and Cargo.toml"]
+    Messages["server/messages.json"]
+    Build["build:rust: cargo build --release"]
+    Target["rust-server/target/release/guardian-server"]
+    Bin["bin/guardian-server"]
+    Client["Extension server selection"]
+    Inputs -. build-time compiled by .-> Build
+    Messages -. build-time include_str embeds bytes .-> Build
+    Build -. build-time writes executable .-> Target
+    Client -->|expects packaged executable at runtime| Bin
 ```
 
-Evidence: [Python initialization, handlers, debounce and publish](../server/guardian_server.py#L29), [Python AST/index/visitor and finding construction](../server/rules.py#L238), [Python message loading and `render`](../server/rules.py#L32), [Python UTF-16 range and suppression](../server/rules.py#L661), [Rust rule tables and `include_str!`](../rust-server/src/main.rs#L24), [Rust parser/visitor and diagnostics](../rust-server/src/main.rs#L1111), and [Rust initialization, debounce and publish](../rust-server/src/main.rs#L1163). The two parsers, scope indexes, visitors, message renderers, UTF-16 range conversions and suppression paths are **duplicated implementations** of one intended rule contract. `test-fixtures/parity_test.py` compares their emitted diagnostics; it does not make the implementations identical by construction. Python reads message JSON when the module loads; Rust includes its bytes at build time, so message edits require a Rust rebuild before that backend sees them.
+There is no scripted copy edge from `target/release` to `bin`. See [optional Rust packaging](05-local-deploy.md#optional-rust-backed-package) for placing the binary.
 
-### 3.3 Profiler task, CLI and profile production
+#### Local installer
 
 ```mermaid
 %%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
 flowchart TD
-    CONFIG["CONFIG: package.json profile settings"] -->|read by command| Run["src/profileView.ts: runProfiler"]
-    PATHS["PATHS: container path contract"] -->|maps task argv when configured| Run
-    Run -->|creates ProcessExecution| Task["VS Code pmg-profile task"]
-    Task -->|launches target Python| Main["server/pmg_profile.py: main"]
-    CLI["pmg_profile.py CLI argv"] -->|calls directly| Main
-    Main -->|calls before script| Start["Profiler.start"]
-    Main -->|executes user script| Script["runpy.run_path as __main__"]
-    Start -->|starts sampler thread| Sample["Profiler._run / _record_stack"]
-    Start -->|optionally enables LINE events| Monitor["Profiler._enable_monitoring"]
-    Sample -->|records RSS and sampled time| Report["Profiler.report"]
-    Sample -->|precise mode takes snapshots| Snapshot["Profiler._snapshot"]
-    Snapshot -->|supplies held-memory series| Report
-    Main -->|finish or atexit calls| Stop["Profiler.stop"]
-    Stop -->|supplies exit RSS and traced-memory sample| Report
-    Stop -->|precise mode checks leaks and possible holders| Leak["Profiler._leaks / _find_holders"]
-    Leak -->|supplies leak_runs and held_by| Report
-    Report -->|writes schema 3 via main.finish| PROFILE["PROFILE: .pmg/profile.json"]
-    Report -->|writes verified file_hashes| SOURCE["SOURCE: source hash contract"]
+    Installer["scripts/install-local.js"]
+    Ci["npm ci"]
+    Pack["npm run package -- --out"]
+    VSIX["Manifest-version VSIX"]
+    Code["VS Code extension installation"]
+    Installer -->|first launches| Ci
+    Ci -->|success permits installer to launch| Pack
+    Pack -. build-time prepublish bundles resources into .-> VSIX
+    VSIX -->|artifact existence permits code --install-extension --force| Code
 ```
 
-Evidence: [task setup, modes and argv](../src/profileView.ts#L77), [CLI parsing and `runpy`/`finish` lifecycle](../server/pmg_profile.py#L891), [sampler timing, RSS and snapshots](../server/pmg_profile.py#L377), [optional monitoring](../server/pmg_profile.py#L217), [precise stop/holder scan](../server/pmg_profile.py#L571), [leak trend criterion](../server/pmg_profile.py#L665), [schema/stack/hash fields in `report`](../server/pmg_profile.py#L743), and [atomic JSON replace](../server/pmg_profile.py#L921). Direct CLI use and the editor task converge on the same `main`. A script exception is caught and the finalizer still attempts a report; failure before `start` completes or during report writing can leave no new **PROFILE** file. `memoryMode` in the setting supplies Quick Pick placeholder text; the selected Quick Pick item supplies the actual CLI mode.
+**Implementation**
 
-### 3.4 Profile validation, path normalization and freshness contract
+| Responsibility | Files and symbols |
+|---|---|
+| Define compile, bundle, vendor, package and Rust build commands | [package.json](../package.json): `scripts`, `main` |
+| Pin Python packages and load vendored dependencies | [requirements.txt](../requirements.txt); [_vendor.py](../server/_vendor.py): `sys.path` setup; [guardian_server.py](../server/guardian_server.py) and [rules.py](../server/rules.py): early `_vendor` imports |
+| Compile Rust and embed diagnostic messages | [Cargo.toml](../rust-server/Cargo.toml); [main.rs](../rust-server/src/main.rs#L24): `MESSAGES_JSON` |
+| Check/load installed Rust binary | [extension.ts](../src/extension.ts#L112): `serverOptions` |
+| Derive VSIX filename, run ordered commands and stop on failure | [install-local.js](../scripts/install-local.js#L8): `manifest`, `vsix`, `run` |
 
-```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
-flowchart TD
-    PROFILE["PROFILE: .pmg/profile.json"] -->|watcher reads file| Load["src/profileView.ts: ProfileView.load"]
-    Saved["Saved schema 2/3 JSON"] -->|selected by openSavedReport; read by load| Load
-    Load -->|calls validator| Parse["src/profileModel.ts: parseProfile"]
-    Parse -->|constructs directly for local profile| Index["src/profileModel.ts: ProfileIndex"]
-    PATHS["PATHS: container path contract"] -->|calls toLocal for profile keys| Remap["src/containerPaths.ts: remapProfileKeys"]
-    Parse -->|passes valid container profile| Remap
-    Remap -->|supplies host paths| Index
-    SOURCE["SOURCE: file_hashes and current editor text"] -->|compared by textHash| State["ProfileIndex.state"]
-    Index -->|normalizes paths and looks up hashes| State
-    State -->|fresh result gates| Editor["ProfileView.adjust / render"]
-    State -->|fresh result gates navigation| Nav["GuardianReport.fresh / open"]
-    Parse -->|invalid data keeps prior index if any| Old["Previous profile remains loaded"]
-    State -->|stale result makes adjust return raw findings| Stale["Unadjusted static diagnostics"]
-```
+**Important branches and limits**
 
-Evidence: [file watcher, saved-report picker, `load`, remap, prior-index behavior and refresh](../src/profileView.ts#L44), [schema validator](../src/profileModel.ts#L63), [path normalization and freshness](../src/profileModel.ts#L130), [container key rewrite](../src/containerPaths.ts#L72), [profiler source identity check and decoded-text hash](../server/pmg_profile.py#L266), [editor hash implementation](../src/profileModel.ts#L59), and [report navigation freshness check](../src/reportView.ts#L61). The Python producer hashes unchanged decoded source text after CRLF normalization; the TypeScript consumer hashes current editor text the same way. This duplicated cross-process algorithm is necessary for the freshness gate. If the hash is absent or mismatched, editor evidence is withheld. A selected unreadable file or malformed JSON warns; `load` returns before replacing its previous `index`, so the old report remains loaded. This is a concrete failure propagation rather than a claim that the schema is generally harmful.
+- `vscode:prepublish` runs Python vendoring through `uv` and TypeScript compilation/bundling through `tsc`/`esbuild`. `_vendor` prepends `server/libs` before third-party imports; `package.json` points the extension entry to `dist/extension.js`.
+- `build:rust` writes into `rust-server/target/release`; `serverOptions` expects `bin/guardian-server[.exe]`. Repository scripts do not copy the binary. Missing it breaks Rust startup; that gap does not mean the Rust implementation is unused.
+- The local installer supports macOS/Linux, runs `npm ci` then packaging then `code --install-extension --force`, and stops when a command fails or the VSIX is missing.
+- `PMG_CODE_CLI` overrides the VS Code executable; `--dry-run` prints commands without running them. The filename comes from manifest name/version.
+- The installer does not build/copy Rust or reload an open VS Code window. See [local deployment](05-local-deploy.md) and [developer setup](04-developer-setup.md) for those steps.
 
-### 3.5 Editor annotations, runtime warnings and static priority
+**Checks:** `node scripts/install-local.js --dry-run` previews installer commands; [package_test.py](../test-fixtures/package_test.py) checks the VSIX.
 
-```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
-flowchart TD
-    DIAGNOSTICS["DIAGNOSTICS: publishDiagnostics"] -->|intercepted by client middleware| Adjust["ProfileView.adjust"]
-    SOURCE["SOURCE: file_hashes and current editor text"] -->|checked for freshness| State["ProfileIndex.state"]
-    State -->|gates profile use| Adjust
-    CONFIG["CONFIG: hotShare and hotMB"] -->|read by thresholds| Heat["profileModel.ts: heat"]
-    Adjust -->|calls with line entry| Heat
-    Heat -->|drives severity and evidence| Severity["adjustSeverity / evidence"]
-    Severity -->|returns adjusted findings via middleware| StaticUI["VS Code static Problems entries"]
-    PROFILE["PROFILE: indexed lines and functions"] -->|read by| Render["ProfileView.render"]
-    State -->|gates decorations and warnings| Render
-    Render -->|calls lineLabel and funcLabel| Labels["profileModel.ts: lineLabel / funcLabel"]
-    Labels -->|renders after-line decorations| Inline["VS Code editor overlay"]
-    Render -->|calls leakMessage for leak_runs| LeakText["profileModel.ts: leakMessage"]
-    LeakText -->|publishes runtime collection| RuntimeUI["VS Code runtime Problems entries"]
-    Edit["Python document edit"] -->|refreshDiagnostics replays via| Adjust
-    Edit -->|calls render again| Render
-    Toggle["ProfileView.toggleProfileOverlay command"] -->|changes overlay flag read by| Render
-    Clear["ProfileView.clear command"] -->|removes index and runtime data via| Render
-```
+[Back to navigation](#start-here)
 
-Evidence: [LSP middleware uses `ProfileView.adjust`](../src/extension.ts#L153), [overlay/clear command registration](../src/profileView.ts#L59), [`adjust` stores raw findings and applies freshness/heat/severity](../src/profileView.ts#L163), [`refreshDiagnostics` replays raw findings](../src/profileView.ts#L183), [`render` sets decorations, runtime leak warnings and status](../src/profileView.ts#L192), [heat/severity/evidence](../src/profileModel.ts#L175), [label functions](../src/profileModel.ts#L210), and [leak text](../src/profileModel.ts#L278). The same **PROFILE** and **SOURCE** contract serves inline labels, runtime warnings and static prioritization. `toggleProfileOverlay` only skips decorations; runtime warnings still publish. Staleness returns the raw static finding from `adjust` and clears current runtime evidence on the edited document.
+## Developer reference
 
-### 3.6 Report model, webview messages and navigation
+### Shared contracts and coordinated changes
 
-```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
-flowchart TD
-    PROFILE["PROFILE: indexed profile"] -->|passed on load| Update["GuardianReport.update / refresh"]
-    SOURCE["SOURCE: file_hashes and current text"] -->|checked by| Fresh["GuardianReport.fresh"]
-    Update -->|calls for timeline and top lines| Overview["reportModel.ts: overview"]
-    Update -->|calls for precise profile| Diagnose["reportModel.ts: diagnose / recommendations"]
-    Update -->|calls for stack samples| Tree["reportModel.ts: callTree"]
-    Overview -->|returns bounded chart and hotspot data| Update
-    Diagnose -->|returns cards to refresh| Update
-    Tree -->|returns weighted tree to refresh| Update
-    WEBVIEW["WEBVIEW: postMessage report/filter/open"]
-    Html["reportWebview.ts: reportHtml"] -->|renders HTML in| Panel["GuardianReport.show panel"]
-    Command["ProfileView.showReport / status command"] -->|calls show| Panel
-    Saved["ProfileView.openSavedReport command"] -->|selects JSON and calls load| Load["ProfileView.load"]
-    Load -->|updates indexed profile| Update
-    Load -->|calls show after valid load| Panel
-    Auto["ProfileView.load: showNextReport"] -->|calls show after valid load| Panel
-    Update -->|posts report payload| WEBVIEW
-    WEBVIEW -->|filter message selects metric/thread| Update
-    WEBVIEW -->|open message requests source| Open["GuardianReport.show message handler"]
-    Open -->|validates report-listed location| Fresh
-    Fresh -->|fresh source allows| Nav["vscode.openTextDocument / showTextDocument"]
-    Fresh -->|stale or absent source warns| Reject["Navigation warning"]
-```
+Feature sections own their detailed code/test mappings. This table identifies the data and configuration shared across features; repeated references describe the same contract, not additional services.
 
-Evidence: [report/status command registration](../src/profileView.ts#L59), [auto-open after valid profile load](../src/profileView.ts#L145), [`GuardianReport.update`, `show`, message validation and navigation](../src/reportView.ts#L14), [`fresh` and `refresh` payload](../src/reportView.ts#L70), [overview projection and payload bound](../src/reportModel.ts#L17), [precise retention diagnosis and recommendations](../src/reportModel.ts#L49), [sampled call-tree aggregation](../src/reportModel.ts#L101), and [webview chart, hotspot, filter and source rendering](../src/reportWebview.ts#L36). The report uses the same profile and freshness contract as editor feedback, but it can show stale historical measurements with a warning; navigation still requires verified source. The webview messages form a separate two-way contract: its report overview and `filter`/`open` payloads and the extension's validation must change together. The timeline is a persisted `PROFILE` field produced by [the sampler and exit path](../server/pmg_profile.py#L571), bounded in [`Profiler.report`](../server/pmg_profile.py#L834), and validated by [`profileModel.parseProfile`](../src/profileModel.ts#L63); adding or changing a timeline field requires coordinated changes in those producers and consumers.
-
-### 3.7 Container execution and path translation
-
-```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
-flowchart TD
-    CONFIG["CONFIG: container.execPrefix / interpreter / pathMappings"] -->|read by| Config["extension.ts: containerConfig"]
-    Config -->|calls| Resolve["containerPaths.ts: resolveMappings"]
-    PATHS["PATHS: resolved host/container mappings"] -->|used by probe branch| Probe["extension.ts: probeInterpreter / stageHelper"]
-    Resolve -->|produces| PATHS
-    PATHS -->|used by profiler branch| Run["profileView.ts: runProfiler"]
-    Probe -->|calls toContainer and containerCommand| Argv["Container exec argv"]
-    Run -->|stages script and maps argv| Argv
-    Argv -->|launches target Python| Target["Container probe.py or pmg_profile.py"]
-    Target -->|profiler writes through bind mount| PROFILE["PROFILE: host-visible .pmg/profile.json"]
-    PROFILE -->|read by| Load["ProfileView.load"]
-    Load -->|calls remapProfileKeys and toLocal| Remap["containerPaths.ts: remapProfileKeys / toLocal"]
-    Remap -->|supplies host path keys| SOURCE["SOURCE: host editor file identity"]
-    PATHS -->|toContainer throws for unmapped host path| Error["Neutral probe facts or task error"]
-    Remap -->|unmapped inbound path stays unchanged| Miss["Possible host editor path miss"]
-```
-
-Evidence: [container setting fields](../package.json#L100), [`containerConfig`, helper staging and probe failure](../src/extension.ts#L50), [container task argv and error handling](../src/profileView.ts#L99), [profile load remapping](../src/profileView.ts#L131), and [`resolveMappings`, `toContainer`, `toLocal`, `containerCommand`, `remapProfileKeys`](../src/containerPaths.ts#L24). This is deliberate sharing: probe and profiler use the same configured mapping and prefix, while the language server remains in the extension host. An unmapped outbound path throws, causing neutral probe facts or a visible profiler error. An unmapped inbound profile path remains unchanged and can miss the host editor when those paths differ; the mapping must cover profile file keys, function keys, hashes and stack frames, all rewritten by `remapProfileKeys`.
-
-### 3.8 Build artifacts and resource loading
-
-Extension and Python packaging:
-
-```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
-flowchart TD
-    CONFIG["CONFIG: package.json scripts"] -. vscode:prepublish invokes .-> Vendor["package.json: vendor:python"]
-    CONFIG -. vscode:prepublish invokes .-> Compile["package.json: compile / bundle"]
-    Req["requirements.txt"] -. vendor:python reads pins .-> Vendor
-    Vendor -. installs dependencies into .-> Libs["server/libs"]
-    Py["guardian_server.py / rules.py"] -->|imports before third-party modules| Shim["server/_vendor.py"]
-    Shim -->|prepends to sys.path at runtime| Libs
-    Src["src/extension.ts"] -. esbuild bundles .-> Compile
-    Compile -. writes bundle .-> Dist["dist/extension.js"]
-    Messages["server/messages.json"] -->|rules.py reads at Python import time| Py
-```
-
-Rust compilation and runtime binary lookup:
-
-```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
-flowchart TD
-    CONFIG["CONFIG: package.json scripts"] -. declares separate build:rust script .-> Cargo["cargo build --release"]
-    Messages["server/messages.json"] -. include_str embeds bytes .-> RustSrc["rust-server/Cargo.toml / src/main.rs"]
-    RustSrc -. compiled by .-> Cargo
-    Cargo -. writes executable .-> Target["rust-server/target/release/guardian-server"]
-    Options["extension.ts: serverOptions"] -->|expects at runtime| Bin["bin/guardian-server"]
-```
-
-Evidence: [npm build, vendor and prepublish scripts](../package.json#L174), [Python package pins](../requirements.txt), [Python server's early `_vendor` import](../server/guardian_server.py#L15), [`_vendor` prepends `server/libs`](../server/_vendor.py#L14), [extension entry/bundle path](../package.json#L29), [Rust `include_str!`](../rust-server/src/main.rs#L24), [Rust crate inputs](../rust-server/Cargo.toml), and [runtime `bin` lookup](../src/extension.ts#L117). Dotted arrows here are build-time dependencies. There is deliberately **no arrow** from the Cargo output to `bin/guardian-server`: the repository scripts build into `rust-server/target/release`, while `serverOptions` loads `bin/guardian-server`, and no copy step appears in `package.json`. That gap explains the missing-binary startup failure in this un-packaged checkout; it does not imply the Rust source is unused.
-
-### Import cycles, propagation and coordinated changes
-
-The local TypeScript source imports point from `extension.ts` to `profileView.ts` and `containerPaths.ts`; from `profileView.ts` to `profileModel.ts`, `containerPaths.ts` and `reportView.ts`; from `reportView.ts` to `profileModel.ts`, `reportModel.ts` and `reportWebview.ts`; and from `reportModel.ts` to `profileModel.ts`. Some TypeScript imports are type-only uses and can be elided at build time. Python `guardian_server.py` imports `_vendor.py`, `probe.py` and `rules.py`; `rules.py` imports `_vendor.py`; `pmg_profile.py` has no local server-module import. These local import graphs are acyclic in this checkout. The report/filter and diagnostic refresh arrows above are runtime message/call loops, not import cycles. Evidence: [extension imports](../src/extension.ts#L28), [profile view imports](../src/profileView.ts#L12), [report view imports](../src/reportView.ts#L4), [report model import](../src/reportModel.ts#L2), [Python server imports](../server/guardian_server.py#L15), and [rules imports](../server/rules.py#L29).
-
-| Change or failure | Components affected and evidence | Assessment |
+| Contract | Producer / definition | Consumers |
 |---|---|---|
-| Add or alter a static rule | [Python `Visitor`/`analyze`](../server/rules.py#L351), [Rust `Visitor`/`analyze`](../rust-server/src/main.rs#L717), [message keys/text](../server/messages.json), [parity fixtures](../test-fixtures/parity_test.py) | Coordinated edits are required because the two implementations intentionally target equivalent diagnostics; drift is possible and parity tests are the check. |
-| Edit diagnostic text only | [Python loads JSON at import](../server/rules.py#L35); [Rust embeds it with `include_str!`](../rust-server/src/main.rs#L24); [Rust build script](../package.json#L176) | Intentional shared wording with different load times; rebuild Rust before comparing or packaging. |
-| Change interpreter fact names or meaning | [probe producer](../server/probe.py#L51), [initialization bridge](../src/extension.ts#L146), [Python initialization/rendering](../server/guardian_server.py#L29), [Rust initialization/rendering](../rust-server/src/main.rs#L1176), [message placeholders](../server/messages.json) | Cross-process contract. Missing facts select neutral wording; GIL-state facts also affect CPU-thread findings. |
-| Change profile fields, mode names or schema | [Python `Profiler.report`](../server/pmg_profile.py#L743), [TypeScript `Profile`/`parseProfile`](../src/profileModel.ts#L32), [editor consumer](../src/profileView.ts#L131), [report consumers](../src/reportModel.ts#L17) | Cross-process persisted contract. `timeline` and `rss_kind` also feed the report Overview. Validator rejection prevents the new profile from loading; backward compatibility with schema 2 is explicit. |
-| Change runtime leak criteria or advice | [profiler `_leaks`](../server/pmg_profile.py#L665) and [`_find_holders`](../server/pmg_profile.py#L597), [runtime `leakMessage`](../src/profileModel.ts#L278), [report `diagnose`/`recommendations`](../src/reportModel.ts#L10) | Coordinated semantics across produced `leak_runs`, editor warning text and report cards. These are separate consumers, not one shared message formatter. |
-| Change file identity or hash normalization | [profiler `_remember_sources`/`_text_hash`](../server/pmg_profile.py#L270), [extension `textHash`/`ProfileIndex.state`](../src/profileModel.ts#L59), [report `fresh`](../src/reportView.ts#L61) | Duplicated algorithm is intentional verification. A mismatch suppresses editor evidence and report navigation. |
-| Change container paths or profile path fields | [mapping and remap functions](../src/containerPaths.ts#L24), [probe branch](../src/extension.ts#L77), [task/load branches](../src/profileView.ts#L99), [profiler report keys](../server/pmg_profile.py#L855) | Intentional shared path contract. A missing outbound mapping errors; a missing inbound mapping prevents freshness matches. |
-| Change webview payloads | [report postMessage and handlers](../src/reportView.ts#L29), [webview overview, filters and rendering](../src/reportWebview.ts#L36) | Coordinated two-way message contract; source navigation is validated again after the message crosses the boundary. |
-| Change command IDs, settings or packaging | [manifest](../package.json#L26), [extension registrations and server options](../src/extension.ts#L112), [profile registrations/task](../src/profileView.ts#L59), [vendored import path](../server/_vendor.py#L14) | Manifest and consumers must agree. `serverOptions` expects `bin/guardian-server`; `build:rust` creates `rust-server/target/release/guardian-server`, so packaging must place the binary at the expected path. |
-| Invalid profile or failed server start | [`ProfileView.load` returns before replacing `index`](../src/profileView.ts#L131); [`startClient` catches and reports startup error](../src/extension.ts#L163) | These failures propagate differently: invalid profile retains prior report state, while failed server start removes static analysis. Neither alone proves harmful coupling between otherwise shared modules. |
-| Profiler task fails before a valid profile loads | [`runProfiler` sets `showNextReport` before task execution](../src/profileView.ts#L123); [invalid `load` returns before clearing it](../src/profileView.ts#L138); [next valid `load` clears it and opens the report](../src/profileView.ts#L145) | A later valid watcher event can auto-open the report after the original task failed. This is a specific UI lifecycle coupling, evidenced by the flag's set/clear paths, rather than a general claim about shared modules. |
+| Commands and settings | [package.json](../package.json) | [extension.ts](../src/extension.ts), [profileView.ts](../src/profileView.ts), build/install scripts |
+| Interpreter facts: `initializationOptions.profile` | [probe.py](../server/probe.py) via `probeInterpreter` | Python/Rust initialization and message renderers |
+| Diagnostic codes and text | [messages.json](../server/messages.json), Python/Rust analyzers | LSP handlers, `ProfileView.adjust` and editor diagnostics |
+| Profile schema 2/3, modes, timeline and measurements | [pmg_profile.py](../server/pmg_profile.py#L749): `Profiler.report` | [profileModel.ts](../src/profileModel.ts#L32): `Profile`/`parseProfile`; editor and report models |
+| Source identity: `file_hashes` and normalized text | [pmg_profile.py](../server/pmg_profile.py#L307): `_text_hash`, verified source | [profileModel.ts](../src/profileModel.ts#L63): `textHash`/`ProfileIndex.state`; report navigation |
+| Host/container paths | [containerPaths.ts](../src/containerPaths.ts), container settings | Probe/task argv, profile loader, source identity |
+| Runtime retention: `leak_runs`, `held_by`, trends | [pmg_profile.py](../server/pmg_profile.py#L671): `_leaks`/`_find_holders`/`report` | `leakMessage` in [profileModel.ts](../src/profileModel.ts); `diagnose`/`recommendations` in [reportModel.ts](../src/reportModel.ts) |
+| Webview `report`/`clear` and `ready`/`filter`/`open` messages | [reportView.ts](../src/reportView.ts) ↔ [reportWebview.ts](../src/reportWebview.ts) | Report rendering, filters and validated navigation |
 
-The shared message catalog, interpreter facts, path helpers and profile model are intentional reuse supported by direct calls and imports. The replicated Python/Rust rules and Python/TypeScript hash code are **coordination risks** because source changes can diverge across processes; the parity and freshness tests exercise those contracts. The `showNextReport` flag is the concrete potentially harmful lifecycle coupling identified here. Ordinary sharing is not labeled a defect.
+**When changing a contract**
 
-## Feature-to-code map
+- **Static rule or diagnostic wording:** coordinate Python/Rust rules, message keys/placeholders and parity fixtures. Python loads messages at import; Rust needs a rebuild.
+- **Interpreter facts:** coordinate the probe, initialization bridge, both server renderers and message placeholders. Missing sized facts select neutral wording; GIL facts also affect CPU-thread findings.
+- **Profile fields or mode/schema names:** coordinate Python production, TypeScript types/validation, editor and report consumers. Schema 2 compatibility is explicit; validator rejection preserves the old profile. Timeline changes involve sampler/exit production, report bounds, validation and Overview rendering.
+- **Retention criteria/advice:** coordinate produced evidence with both editor leak messages and report diagnosis/recommendations. These consumers have separate formatters.
+- **Source identity:** coordinate Python and TypeScript hash algorithms. A normalization mismatch suppresses editor evidence and report navigation.
+- **Paths:** update outbound mapping and every inbound profile path field. Missing outbound mappings error; unmatched inbound paths can prevent freshness matches.
+- **Webview payloads:** update both message producers/consumers and extension validation together.
+- **Commands/settings or packaging:** keep manifest IDs, registrations, argv and resource lookup paths consistent. The local installer derives version/output path from the manifest.
+- **Task/report lifecycle:** review `showNextReport` set/clear paths; failed tasks or invalid loads can leave automatic opening pending for a later valid profile.
 
-Paths are relative to the repository root. Tests listed are relevant checks, not proof of all UI behavior.
+Shared messages, facts, path helpers and the profile model are intentional reuse. Separate Python/Rust analyzers and Python/TypeScript hash algorithms create coordination risks; parity and freshness checks exercise them. The pending-report flag is the specific lifecycle coupling identified in [Reports](#reports-and-source-navigation).
 
-| Feature | Trigger | Main files and symbols | Output | Shared dependencies | Relevant tests |
-|---|---|---|---|---|---|
-| Activation, server selection and restart | Python language activation; `pythonMemoryGuardian.restart`; any Guardian setting change | `package.json`; `src/extension.ts` `activate`, `restartClient`, `serverOptions`, `deactivate` | Running LSP client or startup error/output log | `pythonMemoryGuardian.backend`, interpreter setting, `vscode-languageclient`, probe facts | `test-fixtures/test_extension_lifecycle.js`, `test-fixtures/server_lifecycle_test.py` |
-| Target interpreter selection, probing and measured messages | Server start/restart | `src/extension.ts` `interpreter`, `probeInterpreter`; `server/probe.py` `probe`; `server/rules.py` `render`; `rust-server/src/main.rs` `render` | Target facts, sized or neutral diagnostic wording | `server/messages.json`, `initializationOptions.profile`, Python process or container prefix | `test-fixtures/parity_test.py`, `test-fixtures/server_lifecycle_test.py` |
-| Static diagnostics, rules and suppression | Open/edit/save/close Python `file` or `untitled` document | `server/guardian_server.py` `did_open`, `did_change`, `did_save`, `did_close`, `_publish`; `server/rules.py` `analyze`, `Visitor`, `index_file`, `classify`; `rust-server/src/main.rs` `Backend::did_*`, `analyze`, `Visitor::visit`, `index_with_imports`, `classify` | LSP diagnostics with advice; empty list on close | `server/messages.json`, probe facts, parser libraries, `memory-guardian: ignore` | `test-fixtures/parity_test.py`, `test-fixtures/server_lifecycle_test.py` and rule fixtures |
-| Runtime profiler task and standalone CLI | `pythonMemoryGuardian.profileFile`; direct `pmg_profile.py` invocation | `src/profileView.ts` `ProfileView.runProfiler`; `server/pmg_profile.py` `main`, `Profiler.start`, `Profiler._run`, `Profiler.stop`, `Profiler.report` | VS Code task output and schema-3 `.pmg/profile.json` | Saved script, target interpreter, profile settings, standard-library clocks/RSS readers | `test-fixtures/profiler_test.py`, `test-fixtures/profiler_regression_test.py` |
-| Precise retention and holder evidence | Profile with `--memory precise` | `server/pmg_profile.py` `Profiler._snapshot`, `Profiler._leaks`, `Profiler._find_holders`, `Profiler.report`; `src/reportModel.ts` `diagnose` | Retention trend, suspected leak data, memory cards and recommendations | `tracemalloc`, profile JSON, source metadata | `test-fixtures/profiler_test.py`, `test-fixtures/profiler_regression_test.py`, `test-fixtures/test_report.js` |
-| Optional line execution coverage | `pythonMemoryGuardian.profile.monitoring=lines` or CLI `--monitoring lines` | `server/pmg_profile.py` `Profiler._enable_monitoring`, `Profiler._on_line_event`, `Profiler.report` | Line-event counts and activation/failure status in profile | Python 3.12+ `sys.monitoring`, profile schema | `test-fixtures/profiler_regression_test.py`, `test-fixtures/test_model.js` |
-| Profile discovery, validation and freshness | `.pmg/profile.json` create/change/delete, extension startup, saved JSON selection, source edit | `src/profileView.ts` `ProfileView.openSavedReport`, `load`, `clear`; `src/profileModel.ts` `parseProfile`, `ProfileIndex.state`, `textHash` | Loaded/cleared profile, stale status, warning on invalid JSON | Profile schema 2/3, `file_hashes`, normalized paths | `test-fixtures/test_model.js`, `test-fixtures/test_report.js`, `test-fixtures/profiler_regression_test.py` |
-| Inline annotations, runtime warnings and diagnostic prioritization | Fresh profile; editor visibility/change; `pythonMemoryGuardian.toggleProfileOverlay` | `src/profileView.ts` `ProfileView.render`, `adjust`, `refreshDiagnostics`; `src/profileModel.ts` `lineLabel`, `funcLabel`, `heat`, `adjustSeverity`, `leakMessage` | End-of-line labels, function totals, status bar, runtime leak warnings, adjusted static diagnostics | ProfileIndex, source hashes, hot thresholds, LSP diagnostic collection | `test-fixtures/test_model.js`, `test-fixtures/test_report.js` |
-| Profile Overview visualizations | Report auto-open; `pythonMemoryGuardian.showReport`; `pythonMemoryGuardian.openSavedReport`; status-bar click | `src/reportView.ts` `GuardianReport.refresh`; `src/reportModel.ts` `overview`; `src/reportWebview.ts` `reportHtml`, `memoryChart`, `overview` | Run metrics, RSS/traced-memory timeline, top sampled-line bars and verified source navigation | ProfileIndex, `timeline`, `rss_kind`, per-line measurements, freshness validation | `test-fixtures/test_report.js`, `test-fixtures/profiler_test.py` |
-| Interactive diagnosis, stack report and source navigation | `pythonMemoryGuardian.showReport`; status-bar click; auto-open after task profile loads | `src/reportView.ts` `GuardianReport.show`, `refresh`, `fresh`; `src/reportModel.ts` `diagnose`, `callTree`; `src/reportWebview.ts` `reportHtml` | Memory diagnosis cards and time-weighted Stack Explorer with metric/thread filters | ProfileIndex, stack samples, freshness validation, webview messages | `test-fixtures/test_report.js` |
-| Container execution and path translation | Nonempty `pythonMemoryGuardian.container.execPrefix` | `src/extension.ts` `containerConfig`, `stageHelper`, `probeInterpreter`; `src/profileView.ts` `runProfiler`, `load`; `src/containerPaths.ts` `resolveMappings`, `toContainer`, `toLocal`, `containerCommand`, `remapProfileKeys` | Probe/profile run in container; host-side editor mappings or error | Bind mount, configured prefix/interpreter/path mappings, staged helpers | `test-fixtures/test_container.js` |
+### Imports and process boundaries
+
+Local imports are acyclic in this checkout. Runtime refresh/message loops are distinct from import cycles; some TypeScript imports are type-only and can be elided during compilation.
+
+| Module | Local imports |
+|---|---|
+| [extension.ts](../src/extension.ts) | `profileView`, `containerPaths` |
+| [profileView.ts](../src/profileView.ts) | `profileModel`, `containerPaths`, `reportView` |
+| [reportView.ts](../src/reportView.ts) | `profileModel`, `reportModel`, `reportWebview` |
+| [reportModel.ts](../src/reportModel.ts) | `profileModel` |
+| [guardian_server.py](../server/guardian_server.py) | `_vendor`, `probe`, `rules` |
+| [rules.py](../server/rules.py) | `_vendor` |
+| [pmg_profile.py](../server/pmg_profile.py) | No local server-module imports |
+
+The extension uses `vscode-languageclient` to communicate with the selected language server over stdio LSP (`textDocument/publishDiagnostics` carries findings), launches the probe/profiler as separate processes, reads persisted profile JSON and exchanges `postMessage` messages with the report webview. A configured container changes the probe/profiler process location. Runtime and build-time relationships are separated in the feature diagrams.
+
+[Back to navigation](#start-here)
 
 ## Planned, incomplete or unused capabilities
 
@@ -476,6 +603,11 @@ The intended priority is memory-stack attribution and leak diagnosis, then inter
 
 ## Verification and limits
 
-The code paths above were checked against `package.json`, `src`, `server`, `rust-server/src/main.rs`, the shared messages and tests. The Rust choice requires `bin/guardian-server[.exe]`; this checkout has a release binary under `rust-server/target/release` but no `bin` directory, so selecting Rust in this un-packaged tree reports a missing binary. Runtime tests can exercise that release binary through `test-fixtures/parity_test.py`.
+This map describes the current `package.json`, `src`, `server`, `rust-server/src/main.rs`, shared messages and test entry points. Feature tables identify relevant checks; their presence does not establish full UI coverage.
 
-Mermaid flowcharts use top-down direction and separate feature sections. All 15 styling directives were checked as JSON, the diagram blocks and edge labels were checked structurally, and the local TypeScript/Python import graphs were checked for cycles. No Mermaid renderer is bundled in `node_modules` or available on `PATH` in this checkout, so a rendered visual preview could not be confirmed here; a viewer may also ignore or override diagram-level styling. Container tests simulate an exec prefix and mapped paths; they do not start Docker. UI flows are supported by source inspection and model tests, not an automated VS Code-host integration run.
+- Rust startup requires `bin/guardian-server[.exe]`. The build output is under `rust-server/target/release` and requires placement at the installed lookup path. Parity tests can exercise the release binary directly.
+- Container tests simulate an exec prefix and mapped paths; they do not start Docker.
+- UI flows are supported by source inspection and model/entry/lifecycle tests, rather than an automated VS Code-host integration run.
+- For this documentation refactor, local file/heading links, Mermaid block structure, edge labels and styling JSON were checked. No Mermaid renderer is installed locally, so rendered layout could not be confirmed; viewers may override diagram styling.
+
+[Back to navigation](#start-here)

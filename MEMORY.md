@@ -7,7 +7,7 @@ Use this file as a short orientation for future work. It is an index, not a seco
 - **Static analysis:** Python and Rust language-server backends, diagnostic rules and advice, shared messages, interpreter facts, and backend selection.
 - **Runtime profiling:** the VS Code profile command and standalone CLI, time and memory measurement, precise retention and holder evidence, and optional line monitoring.
 - **Profile consumption:** profile schema validation, path mapping and source freshness, inline annotations, runtime warnings, and prioritization of static diagnostics.
-- **Report and navigation:** memory diagnosis, the time-weighted Stack Explorer, and navigation back to source.
+- **Report and navigation:** profile Overview, memory diagnosis, the time-weighted Stack Explorer, direct visualization from JSON editor tabs, and navigation back to source.
 - **Execution environments:** local and container profiling, helper staging, interpreter probing, path translation, and build-time resource packaging.
 
 The map's **Planned, incomplete or unused capabilities** section is separate from implemented behavior. Do not treat a roadmap item as an available feature without confirming it in code.
