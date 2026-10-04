@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- Stack Explorer explains where each frame comes from: boxes are colored by origin (your code, one color per installed package, standard library, Python internals) with a legend, frames such as `<frozen importlib._bootstrap_external>` read as "Python import system", durations show in ms, and the details line gives each frame's share of the run and whether time was spent in it or in its callees.
+- Stack Explorer adds a **Frames** control: group consecutive library or Python-internal frames into one box (default), show all frames, or show only your code with library time counted in the calling function. Totals are identical in every view.
 - The sampler walks each thread's stack once per sample instead of twice and caches per-function facts, about 2.8× less sampler work per sample on deep multi-threaded stacks. Less time holding the GIL also means less distortion of the native/Python time split. Report output is unchanged.
 - Line-event coverage (`profile.monitoring: lines`) now switches itself off for library and standard-library lines after their first event, instead of running a Python callback on every library line. On a library-heavy workload, its overhead fell from 3.2× to 1.25× while user-line counts stay exact.
 - The profiler's memory timeline is now bounded during the run (at most 600 evenly spaced points), so long runs no longer grow profiler memory that was charged to your busiest line as RSS or allocation growth. RSS is read once per sample, and the reported RSS peak still includes spikes between kept points.

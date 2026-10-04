@@ -51,6 +51,7 @@ import threading
 import time
 import tokenize
 import tracemalloc
+from typing import Callable, Literal
 
 SCHEMA = 3
 # In-memory timeline bound. The report shows <= 300 points; keeping 300-600 evenly spaced ones
@@ -133,7 +134,7 @@ def _make_rss_reader():
         return (lambda: 0), None
 
 
-def _thread_cpu_clock(ident: int):
+def _thread_cpu_clock(ident: int) -> Callable[[], float] | None:
     """Zero-arg callable returning this thread's CPU seconds, or None if unsupported."""
     getid = getattr(time, "pthread_getcpuclockid", None)
     if getid is None:
@@ -196,12 +197,13 @@ class Profiler:
             paths.get("stdlib"), paths.get("platstdlib"), paths.get("purelib"), paths.get("platlib"))
             if p})
         self._user_cache: dict[str, bool] = {}
-        self._clocks: dict[int, object] = {}
+        self._clocks: dict[int, Callable[[], float] | None] = {}   # None: no per-thread CPU clock
         self.rss, self.rss_kind = _make_rss_reader()
         self.split = _gil_enabled()
         self.switch = sys.getswitchinterval()
         self.sleep_overhead = 0.0
-        self.snapshots: list[tuple[float, dict, dict]] = []  # (t, held{loc:bytes}, None)
+        # (elapsed s, bytes held per allocating user line, bytes held with no user frame)
+        self.snapshots: list[tuple[float, dict[tuple[str, int], int], int]] = []
         self.snap_cost = 0.0
         self.timeline: list[tuple[float, float, float]] = []
         self._timeline_every = 1    # keep one sample in this many; doubles each time the cap is hit
@@ -223,8 +225,8 @@ class Profiler:
         self._line_files: dict[str, str | None] = {}   # co_filename -> absolute user path, or None
         self._monitoring_disable = None                  # sys.monitoring.DISABLE once enabled
         self.monitoring_dropped = 0
-        self.memory_tracing_lost_s = None   # elapsed time when the script stopped tracemalloc
-        self.sampler_error = None
+        self.memory_tracing_lost_s: float | None = None   # elapsed s when the script stopped tracemalloc
+        self.sampler_error: str | None = None
 
     def _enable_monitoring(self):
         """Optional execution evidence; sampled timing still uses _current_frames()."""
@@ -431,14 +433,14 @@ class Profiler:
         return False
 
     # ------------------------------------------------------------ sampling loop
-    def _run(self):
+    def _run(self) -> None:
         """Sampler thread. A failure ends sampling but is reported, never a lost profile."""
         try:
             self._sample_loop()
         except Exception as e:
             self.sampler_error = f"{type(e).__name__}: {e}"
 
-    def _sample_loop(self):
+    def _sample_loop(self) -> None:
         me = threading.get_ident()
         main = threading.main_thread().ident
         last_wall = time.perf_counter()
@@ -465,9 +467,9 @@ class Profiler:
             for ident, frame in sys._current_frames().items():
                 if ident == me:
                     continue
-                clock = self._clocks.get(ident, 0)
-                if clock == 0:
-                    clock = self._clocks[ident] = _thread_cpu_clock(ident)
+                if ident not in self._clocks:
+                    self._clocks[ident] = _thread_cpu_clock(ident)
+                clock = self._clocks[ident]
                 if clock is not None:
                     try:
                         c = clock()
@@ -540,9 +542,9 @@ class Profiler:
                     transient = interval_peak - max(traced, prev_traced)
                 else:
                     transient = 0
-                tgt = max(per_thread, key=lambda t: (t[1] is not None, t[2] or 0)) if per_thread else None
-                if tgt is not None and tgt[1] is not None:
-                    st = self._stats(tgt[1])
+                busiest = max(per_thread, key=lambda t: (t[1] is not None, t[2] or 0)) if per_thread else None
+                if busiest is not None and busiest[1] is not None:
+                    st = self._stats(busiest[1])
                     if traced > prev_traced:
                         st.traced_up += traced - prev_traced     # cheap, no snapshot needed
                     if transient > max(10 << 20, 0.25 * traced):
@@ -603,6 +605,8 @@ class Profiler:
         raw = getattr(getattr(snap, "traces", None), "_traces", None)
         held: dict[tuple[str, int], int] = {}
         unattributed = 0
+        # A traceback resolves to a user line, False (the profiler's own memory) or None (unattributed).
+        loc: tuple[str, int] | Literal[False] | None
         if raw is None:                      # private layout changed: slow, public path
             for stat in snap.statistics("traceback"):
                 for fr in reversed(stat.traceback):
@@ -721,12 +725,12 @@ class Profiler:
             if fn and self._is_user(fn) and getattr(m, "__name__", "") != "__main__":
                 spaces.append((m.__name__, vars(m)))
         seen = set()
-        for mod, g in spaces:                          # 1) module globals
+        for space, g in spaces:                        # 1) module globals
             for k, v in list(g.items()):  # memory-guardian: ignore (snapshot of a live module dict)
                 if k.startswith("__") or id(v) in seen:
                     continue
                 seen.add(id(v))
-                label = f"global {k}" if mod == "__main__" else f"{mod}.{k}"
+                label = f"global {k}" if space == "__main__" else f"{space}.{k}"
                 if self._origin(v) in want:            # the global *is* the leaked object
                     found.setdefault(self._origin(v), []).append(
                         {"holder": label, "type": type(v).__name__, "items": 1, "matching": 1})
@@ -736,8 +740,8 @@ class Profiler:
                 break
             cls = type(obj)
             mod = sys.modules.get(getattr(cls, "__module__", ""), None)
-            user_cls = cls.__module__ == "__main__" or (
-                mod is not None and getattr(mod, "__file__", None) and self._is_user(mod.__file__))
+            mod_file = getattr(mod, "__file__", None) if mod is not None else None
+            user_cls = cls.__module__ == "__main__" or bool(mod_file and self._is_user(mod_file))
             if user_cls and not isinstance(obj, type) and hasattr(obj, "__dict__"):
                 for k, v in list(vars(obj).items()):  # memory-guardian: ignore (snapshot of a live __dict__)
                     if id(v) not in seen:
@@ -925,25 +929,27 @@ class Profiler:
         timeline = self.timeline[::step]
         if timeline and timeline[-1] != self.timeline[-1]:
             timeline.append(self.timeline[-1])
-        stack_frames, frame_ids, stack_samples = [], {}, []
+        stack_frames: list[dict] = []
+        frame_ids: dict[tuple, int] = {}
+        stack_samples: list[dict] = []
         for (ident, name, stack), values in self.stack_totals.items():
             ids = []
-            for k in range(0, len(stack), 2):
-                file, name, first_line, user = self._codes[stack[k]][:4]
+            for i in range(0, len(stack), 2):
+                file, func, first_line, user = self._codes[stack[i]][:4]   # not `name`: the thread's
                 # Merge by content, not code object: a reloaded function is still one frame.
-                fr = (file, stack[k + 1], name, first_line, user)
-                if fr not in frame_ids:
-                    frame_ids[fr] = len(stack_frames)
-                    stack_frames.append(dict(zip(('file', 'line', 'name', 'first_line', 'user'), fr)))
-                ids.append(frame_ids[fr])
+                key = (file, stack[i + 1], func, first_line, user)
+                if key not in frame_ids:
+                    frame_ids[key] = len(stack_frames)
+                    stack_frames.append(dict(zip(('file', 'line', 'name', 'first_line', 'user'), key)))
+                ids.append(frame_ids[key])
             stack_samples.append({'thread': ident, 'thread_name': name, 'frames': ids,
                                   'python_s': round(values[0], 6), 'native_s': round(values[1], 6),
                                   'system_s': round(values[2], 6), 'unsplit_s': round(values[3], 6),
                                   'samples': values[4]})
         # Caller-only files still need a verified hash for source navigation.
-        for fr in stack_frames:
-            path = fr['file']
-            if fr['user'] and path not in files:
+        for frame in stack_frames:
+            path = frame['file']
+            if frame['user'] and path not in files:
                 files[path] = {}
                 source = self._unchanged_source(path)
                 if source is not None:

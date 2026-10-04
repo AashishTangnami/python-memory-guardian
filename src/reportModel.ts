@@ -95,13 +95,82 @@ function recommendations(e: LineEntry, status: Diagnosis['status']): string[] {
   return out;
 }
 
+export type FrameKind = 'user' | 'library' | 'stdlib' | 'internal';
+/** Where a stack frame's code comes from, in words a user can act on. */
+export interface FrameOrigin { kind: FrameKind; label: string; detail: string; }
+/** A box in the Stack Explorer: one frame, or (grouped view) a run of frames from the same origin. */
+export interface ReportFrame extends StackFrame { origin: FrameOrigin; group?: { count: number; names: string[] }; }
+/** all: every frame; grouped: merge runs of non-user frames with one origin; mine: user frames only. */
+export type FrameView = 'all' | 'grouped' | 'mine';
+
+// Frozen modules are compiled into the interpreter, so their "file" is a placeholder like
+// <frozen importlib._bootstrap_external>. Name the job they do instead.
+const FROZEN: Record<string, [string, string]> = {
+  'importlib._bootstrap': ['Python import system', 'loading a module (import)'],
+  'importlib._bootstrap_external': ['Python import system', 'finding and reading module files (import)'],
+  'zipimport': ['Python import system', 'importing from a zip archive'],
+  'runpy': ['Python script launcher', 'starting your script'],
+};
+
+/** Classify a frame from its path alone, so reports from any profiler version get the same labels. */
+export function frameOrigin(f: StackFrame): FrameOrigin {
+  const file = f.file.replace(/\\/g, '/');
+  const base = file.slice(file.lastIndexOf('/') + 1);
+  // A package's __init__.py says nothing alone; name its folder too.
+  const shown = base === '__init__.py' ? file.split('/').slice(-2).join('/') : base;
+  if (f.user) return { kind: 'user', label: `${shown}:${f.line}`, detail: 'your code' };
+  const frozen = /^<frozen ([\w.]+)>$/.exec(file);
+  if (frozen) {
+    const [label, detail] = FROZEN[frozen[1]] ?? ['Python internals', `built into the interpreter (${frozen[1]})`];
+    return { kind: 'internal', label, detail };
+  }
+  if (file === '<string>') return { kind: 'internal', label: 'code run with exec() or eval()', detail: 'compiled at runtime, so there is no file to open' };
+  if (file.startsWith('<')) return { kind: 'internal', label: 'generated code', detail: `created at runtime (${file.slice(1, -1)})` };
+  const pkg = /\/(?:site|dist)-packages\/([^/]+)/.exec(file);
+  if (pkg) {
+    const name = pkg[1].replace(/\.py$/, '');
+    return { kind: 'library', label: `${name} (installed package)`, detail: '' };
+  }
+  const std = /\/(?:lib\/python\d+(?:\.\d+)?t?|Lib)\/(.+)\.py$/i.exec(file);
+  if (std) {
+    const mod = std[1].replace(/\/__init__$/, '').replace(/\//g, '.');
+    const top = mod.split('.')[0];
+    return { kind: 'stdlib', label: `${top} (standard library)`, detail: mod === top ? '' : `module ${mod}` };
+  }
+  return { kind: 'library', label: `${base} (outside your project)`, detail: '' };
+}
+
 export type CallMetric = 'elapsed' | 'python' | 'native' | 'system' | 'unsplit';
 export interface CallNode { id: number; parent: number; frame: number; value: number; self: number; children: number[]; }
-export interface CallTree { nodes: CallNode[]; frames: StackFrame[]; omitted: number; }
+export interface CallTree { nodes: CallNode[]; frames: ReportFrame[]; omitted: number; }
 
 /** Add each sampled stack once; parent time includes descendants, self time does not. */
-export function callTree(profile: Profile, metric: CallMetric, thread = '', limit = 25000): CallTree {
+export function callTree(profile: Profile, metric: CallMetric, thread = '', limit = 25000,
+                         view: FrameView = 'all'): CallTree {
+  const all = profile.stacks?.frames ?? [];
+  const origins = new Map<number, FrameOrigin>();
+  const originOf = (id: number) => {
+    let o = origins.get(id);
+    if (!o) { o = frameOrigin(all[id]); origins.set(id, o); }
+    return o;
+  };
+  // A sample's display path. Steps that share a key under the same parent merge into one node;
+  // a group step carries the frames it stands for.
+  const path = (ids: number[]): { key: string; ids: number[] }[] => {
+    if (view === 'mine') ids = ids.filter(id => all[id].user);   // callee time stays in the nearest user frame
+    if (view !== 'grouped') return ids.map(id => ({ key: `f${id}`, ids: [id] }));
+    const steps: { key: string; ids: number[] }[] = [];
+    for (let i = 0; i < ids.length;) {
+      const o = originOf(ids[i]);
+      let j = i + 1;
+      if (o.kind !== 'user') while (j < ids.length && originOf(ids[j]).kind === o.kind && originOf(ids[j]).label === o.label) j++;
+      steps.push(o.kind === 'user' ? { key: `f${ids[i]}`, ids: [ids[i]] } : { key: `g${o.kind}|${o.label}`, ids: ids.slice(i, j) });
+      i = j;
+    }
+    return steps;
+  };
   const nodes: CallNode[] = [{ id: 0, parent: -1, frame: -1, value: 0, self: 0, children: [] }];
+  const members: Set<number>[] = [new Set()];          // profile frame ids each node stands for
   const edges = new Map<string, number>();
   let omitted = 0;
   for (const sample of profile.stacks?.samples ?? []) {
@@ -109,37 +178,49 @@ export function callTree(profile: Profile, metric: CallMetric, thread = '', limi
     const weight = metric === 'elapsed' ? sample.python_s + sample.native_s + sample.system_s + sample.unsplit_s
       : sample[`${metric}_s`];
     if (weight <= 0 || !sample.frames.length) continue;
+    const steps = path(sample.frames);
     // Refuse the complete sample if its missing suffix would exceed the limit.
     let probe = 0, missing = 0;
-    for (const frame of sample.frames) {
-      const child = edges.get(`${probe}:${frame}`);
+    for (const step of steps) {
+      const child = edges.get(`${probe}:${step.key}`);
       if (missing || child == null) missing++;
       else probe = child;
     }
     if (nodes.length + missing > limit) { omitted += weight; continue; }
     let parent = 0;
     nodes[0].value += weight;
-    for (const frame of sample.frames) {
-      const key = `${parent}:${frame}`;
+    for (const step of steps) {
+      const key = `${parent}:${step.key}`;
       let child = edges.get(key);
       if (child == null) {
         child = nodes.length;
         edges.set(key, child);
-        nodes.push({ id: child, parent, frame, value: 0, self: 0, children: [] });
+        nodes.push({ id: child, parent, frame: step.ids[0], value: 0, self: 0, children: [] });
+        members.push(new Set());
         nodes[parent].children.push(child);
       }
+      for (const id of step.ids) members[child].add(id);
       nodes[child].value += weight;
       parent = child;
     }
-    nodes[parent].self += weight;
+    nodes[parent].self += weight;                     // includes 'mine' samples whose leaf was library code
   }
   for (const n of nodes) n.children.sort((a, b) => nodes[b].value - nodes[a].value);
   // Send only frames the tree references: a thread/metric filter or the node cap can leave most unused.
-  const all = profile.stacks?.frames ?? [], frames: StackFrame[] = [], remap = new Map<number, number>();
+  // A group that turned out to hold a single function is shown as that function.
+  const frames: ReportFrame[] = [], remap = new Map<number, number>();
   for (const n of nodes) {
     if (n.frame < 0) continue;
+    const ids = members[n.id];
+    if (ids.size > 1) {
+      const origin = originOf(n.frame), names = [...new Set([...ids].map(id => all[id].name))];
+      n.frame = frames.length;
+      frames.push({ name: origin.label, file: '', line: 0, first_line: 0, user: false, origin,
+        group: { count: ids.size, names: names.slice(0, 8) } });
+      continue;
+    }
     let id = remap.get(n.frame);
-    if (id == null) { id = frames.length; remap.set(n.frame, id); frames.push(all[n.frame]); }
+    if (id == null) { id = frames.length; remap.set(n.frame, id); frames.push({ ...all[n.frame], origin: originOf(n.frame) }); }
     n.frame = id;
   }
   return { nodes, frames, omitted };

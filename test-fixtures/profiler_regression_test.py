@@ -157,6 +157,21 @@ class ProfileRegressions(unittest.TestCase):
             self.assertEqual(p.lines[call].traced_up, 12 * MB, 'the live copy is credited once to the call line')
             self.assertEqual(p.lines[call].transient, 0, 'a 6 MB in-call buffer is below 25% of 60 MB traced')
 
+    def test_stack_samples_keep_thread_names(self):
+        source = ('import threading, time\n'
+                  'def busy_worker():\n'
+                  '    t = time.perf_counter()\n'
+                  '    while time.perf_counter() - t < 0.3:\n'
+                  '        pass\n'
+                  'w = threading.Thread(target=busy_worker, name="ingest-worker")\n'
+                  'w.start()\n'
+                  'w.join()\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self.run_script(Path(tmp), source)
+            names = {s['thread_name'] for s in report['stacks']['samples']}
+            self.assertIn('ingest-worker', names)
+            self.assertLessEqual(names, {'MainThread', 'ingest-worker'}, 'thread names, not function names')
+
     def test_sampler_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = profiler.Profiler(tmp, .01, 'off')

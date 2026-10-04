@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import { ProfileIndex, runNotes } from './profileModel';
-import { diagnose, callTree, overview, CallMetric } from './reportModel';
+import { diagnose, callTree, overview, CallMetric, FrameView } from './reportModel';
 import { reportHtml } from './reportWebview';
 
 export class GuardianReport implements vscode.Disposable {
@@ -10,6 +10,7 @@ export class GuardianReport implements vscode.Disposable {
   private index?: ProfileIndex;
   private metric: CallMetric = 'elapsed';
   private thread = '';
+  private frames: FrameView = 'grouped';
 
   /** docState lets open documents reuse the controller's per-version hash instead of rehashing their text. */
   constructor(private readonly docState?: (doc: vscode.TextDocument) => string) {}
@@ -34,9 +35,10 @@ export class GuardianReport implements vscode.Disposable {
       if (!m || typeof m !== 'object') return;
       if (m.type === 'ready') this.refresh();
       if (m.type === 'filter' && ['elapsed', 'python', 'native', 'system', 'unsplit'].includes(m.metric)
-        && typeof m.thread === 'string') {
+        && typeof m.thread === 'string' && ['grouped', 'all', 'mine'].includes(m.frames)) {
         this.metric = m.metric;
         this.thread = m.thread;
+        this.frames = m.frames;
         this.refresh();
       }
       if (m.type === 'open' && typeof m.file === 'string' && Number.isInteger(m.line) && m.line >= 1) {
@@ -81,7 +83,8 @@ export class GuardianReport implements vscode.Disposable {
     void this.panel.webview.postMessage({ type: 'report', script: p.script, wall: p.wall_s,
       mode: p.memory_mode, overview: overview(p), diagnoses: diagnoses.slice(0, 200),
       diagnosisCount: diagnoses.length, growingCount: diagnoses.filter(d => d.status === 'growing').length,
-      freshness, tree: callTree(p, this.metric, this.thread), metric: this.metric, thread: this.thread,
+      freshness, tree: callTree(p, this.metric, this.thread, 25000, this.frames), metric: this.metric, thread: this.thread,
+      frames: this.frames,
       threads, stacksAvailable: !!p.stacks, dropped: p.stacks?.dropped_s ?? 0,
       depthLimited: p.stacks?.depth_limited ?? false, monitoring: p.monitoring,
       notes: runNotes(p), tracingLostS: p.memory_tracing_lost_s ?? null });
