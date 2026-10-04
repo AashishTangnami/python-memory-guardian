@@ -1,0 +1,3 @@
+# Optional: only pyarrow_example.py and polars_example.py need these. generators.py uses the standard library.
+pyarrow>=14
+polars>=1.0

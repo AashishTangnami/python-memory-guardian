@@ -22,13 +22,21 @@ On free-threaded builds there is no GIL signal; CPU time is reported unsplit.
 
 MEMORY
   fast     (default) RSS growth attributed to the line running when it happened.
-           ~free; counts Python *and* native memory; coarse (RSS can lag frees).
-  precise  tracemalloc: bytes still held per allocating line at the peak and at exit,
-           untraced ("native") growth per line, and leak detection (held memory grew
-           across >= 3 consecutive snapshots and was still held at exit).
-           Costs ~2-5x runtime (measured: 2.9x at the default 2-frame depth), because
-           tracemalloc hooks every allocation. Snapshot cost is predicted from
-           tracemalloc's bookkeeping size and capped at 10% of elapsed time.
+           ~free; counts Python *and* native memory; coarse. The OS assigns pages when
+           memory is first written, so growth lands on the line that writes it, not the
+           one that allocated it; freed memory often stays resident (pymalloc keeps a
+           1 MiB arena until every block in it is free), so RSS rarely falls.
+  precise  tracemalloc: every Python object allocation at its requested size, whether
+           pymalloc or malloc serves it; not memory C extensions take from malloc
+           directly. Reports net traced growth per line ("alloc"; churn between two
+           samples is not counted), bytes still held per line at the peak and at exit,
+           allocation stacks at those two snapshots, untraced ("native") growth, and
+           leak detection (held memory grew across >= 3 consecutive snapshots and was
+           still held at exit). Costs ~2-5x runtime (measured: 2.9x at the default
+           2-frame depth), because tracemalloc hooks every allocation. Routine snapshots
+           are capped at 10% of elapsed time; peak-capture snapshots (plateau, doubling)
+           have their own budgets. Snapshot cost is predicted from tracemalloc's
+           bookkeeping size.
 
 Optional Python 3.12+ LINE events record execution coverage. They do not replace
 the interval sampler or measure elapsed time, native stacks, or allocations.
@@ -51,12 +59,22 @@ import threading
 import time
 import tokenize
 import tracemalloc
+import types
 from typing import Callable, Literal
 
 SCHEMA = 3
 # In-memory timeline bound. The report shows <= 300 points; keeping 300-600 evenly spaced ones
 # makes the profiler's own memory constant instead of growing (and being charged to user lines).
 TIMELINE_CAP = 600
+# Distinct allocation stacks kept per memory-stack table; smaller ones are summed as other_bytes.
+MEMORY_STACK_CAP = 20_000
+# Largest objects still held at exit: how many to report, the smallest worth reporting, and how many
+# container items to size before extrapolating.
+LARGEST_OBJECTS = 20
+LARGEST_MIN_BYTES = 1 << 20
+CONTAINER_SAMPLE = 10_000
+# Total time report() may spend parsing source files to name memory-stack frames.
+NAME_PARSE_BUDGET_S = 2.0
 THIS_FILE = os.path.normcase(os.path.abspath(__file__))
 
 
@@ -188,7 +206,10 @@ class Profiler:
         self.interval = interval
         self.memory = memory
         self.frames = frames
-        self.snap_rate = 25e-9   # s per byte of tracemalloc bookkeeping (measured), refined live
+        # s per byte of tracemalloc bookkeeping: measured at 5-8 ns on macOS/CPython 3.13 at 2 and 6 frames.
+        # Refined only from snapshots with at least 8 MB of bookkeeping: small snapshots are dominated by
+        # fixed costs, and learning from them inflated predictions 20x, blocking every large snapshot.
+        self.snap_rate = 8e-9
         self.lines: dict[tuple[str, int], LineStats] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="pmg-sampler", daemon=True)
@@ -205,10 +226,25 @@ class Profiler:
         # (elapsed s, bytes held per allocating user line, bytes held with no user frame)
         self.snapshots: list[tuple[float, dict[tuple[str, int], int], int]] = []
         self.snap_cost = 0.0
+        self._snap_high = 0          # highest traced memory any snapshot has captured
+        self._run_high = 0           # running maximum of traced memory at samples
+        self._stalled = 0            # consecutive samples without the running maximum rising by 1%
+        self.peak_snapshots = 0      # snapshots taken by the plateau trigger, reported for transparency
+        self.peak_snap_cost = 0.0    # their cost, budgeted separately from routine snapshots
+        self._plateau_cost = 0.0     # plateau and doubling snapshots have their own budgets, so doubling
+        self._doubling_cost = 0.0    # snapshots on the way up cannot use up the plateau's
         self.timeline: list[tuple[float, float, float]] = []
         self._timeline_every = 1    # keep one sample in this many; doubles each time the cap is hit
         self._timeline_tick = 0
         self.rss_max = 0            # every sample's RSS, so thinning the timeline never hides the peak
+        # Bytes per allocation traceback, kept only for the snapshot where user lines held the most
+        # (the same snapshot as the per-line "held" labels) and for the latest one: (t, bytes, truncated).
+        self._peak_stacks: tuple[float, dict, set] | None = None
+        self._peak_stacks_held = -1
+        self._last_stacks: tuple[float, dict, set] | None = None
+        self._scopes_cache: dict[str, list] = {}
+        self.largest: dict | None = None      # largest objects still held at exit (fast and precise modes)
+        self._parse_spent = 0.0
         self.peak_traced = 0
         self.samples = 0
         self._source_versions: dict[str, tuple[tuple, str]] = {}
@@ -227,6 +263,8 @@ class Profiler:
         self.monitoring_dropped = 0
         self.memory_tracing_lost_s: float | None = None   # elapsed s when the script stopped tracemalloc
         self.sampler_error: str | None = None
+        self.argv: list[str] = []          # the script's own arguments, so compared runs can check the workload
+        self.started_at: str | None = None
 
     def _enable_monitoring(self):
         """Optional execution evidence; sampled timing still uses _current_frames()."""
@@ -562,20 +600,61 @@ class Profiler:
                 period = min(2.0, max(0.25, elapsed / 10))
                 due = spike or (traced > max(last_snap_traced * 1.25, 1 << 20)
                                 and elapsed - last_snap_t > 0.25) or elapsed - last_snap_t > period
+                # Peak capture: the snapshot holding the most memory feeds the peak memory stacks and the
+                # "held" labels, but routine snapshots are rationed and cost grows with traced memory, so
+                # allocation-heavy runs rarely got one near the peak. Memory that grows until exit is
+                # captured by the exit snapshot. Two triggers cover the rest, for memory 25% and 5 MB above
+                # anything a snapshot has captured:
+                #   plateau: the running maximum stopped rising (under 1% for 5 samples) and traced is still
+                #            within 10% of it, so memory that rises, stays, then falls is caught where it stays;
+                #   doubling: traced is twice the captured high, so a peak too brief for the sampler to see
+                #            (one C call holding the GIL) is still captured at half or more of its size.
+                # Doubling bounds their total cost at about twice the last snapshot.
+                if traced > self._run_high * 1.01:
+                    self._run_high, self._stalled = traced, 0
+                else:
+                    self._stalled += 1
+                above = self._run_high > 1.25 * self._snap_high and self._run_high - self._snap_high > (5 << 20)
+                plateau_due = above and self._stalled >= 5 and traced >= 0.9 * self._run_high
+                doubling_due = above and traced >= 2 * self._snap_high
                 prev_traced = traced
-                # Predict the snapshot's cost from tracemalloc's bookkeeping size and only
-                # take it if total snapshot time stays within 10% of elapsed runtime.
+                # Predict the snapshot's cost from tracemalloc's bookkeeping size. Routine snapshots stay
+                # within 10% of elapsed runtime (at least 0.5 s in total, so short programs still get a few).
+                # Peak-capture snapshots have their own budgets: plateau up to the elapsed runtime (at least
+                # 2 s), doubling up to half of it (at least 1 s). The report states their count and cost.
                 book = tracemalloc.get_tracemalloc_memory()
-                # 10% of runtime, but at least 0.5 s in total, so short programs still get
-                # a few snapshots (their peak and trend) instead of none.
-                if due and self.snap_cost + book * self.snap_rate <= max(0.10 * elapsed, 0.5):
+                one = book * self.snap_rate
+                routine_ok = due and self.snap_cost - self.peak_snap_cost + one <= max(0.10 * elapsed, 0.5)
+                plateau_ok = plateau_due and self._plateau_cost + one <= max(elapsed, 2.0)
+                doubling_ok = not plateau_ok and doubling_due and self._doubling_cost + one <= max(0.5 * elapsed, 1.0)
+                peak_ok = plateau_ok or doubling_ok
+                if routine_ok or peak_ok:
                     s = time.perf_counter()
                     self._snapshot(elapsed)
                     cost = time.perf_counter() - s
+                    # The snapshot's own temporary objects are traced; without a reset they would raise the
+                    # next interval's peak, inflating peak_traced and charging a "spike" to a user line.
+                    # This interval's real peak was already read above.
+                    if hasattr(tracemalloc, "reset_peak"):
+                        tracemalloc.reset_peak()
                     self.snap_cost += cost
-                    if book:
-                        self.snap_rate = 0.5 * self.snap_rate + 0.5 * (cost / book)
+                    if peak_ok and not routine_ok:
+                        self.peak_snap_cost += cost
+                        self.peak_snapshots += 1
+                        if plateau_ok:
+                            self._plateau_cost += cost
+                        else:
+                            self._doubling_cost += cost
+                    if book >= 8 << 20:
+                        # A slow average clamped to 2-3x the measured range: one snapshot slowed by GC or
+                        # first-time path resolution must not block the next (plateau) snapshot.
+                        self.snap_rate = min(20e-9, max(4e-9, 0.8 * self.snap_rate + 0.2 * (cost / book)))
                     last_snap_t, last_snap_traced = elapsed, traced
+                    self._snap_high = max(self._snap_high, traced)
+                    # The snapshot held the GIL, so user threads only waited for it. Restart the interval
+                    # here, or the next sample charges that pause to whichever user line runs next
+                    # (measured: 0.5 s of "waiting" on a 0.04 s generator, from 2.1 s of snapshots).
+                    last_wall, last_proc = time.perf_counter(), time.process_time()
 
     def _record_timeline(self, point):
         """Keep at most TIMELINE_CAP evenly spaced samples: when full, drop every other point
@@ -619,12 +698,15 @@ class Profiler:
             self.snapshots.append((t, held, unattributed))
             return
         own = (os.path.normcase(os.path.abspath(__file__)), os.path.normcase(tracemalloc.__file__))
-        cache: dict = {}
-        skip = object()
+        # The loop runs while tracemalloc is still tracing, so every object it creates is itself traced,
+        # and an integer addition creates one (about 1 us per trace, 96% of the loop). Each trace therefore
+        # only appends a reference to its existing size object; sums run in C (sum()) once per traceback,
+        # and per-line "held" totals and the memory-stack table are derived from those. Measured 9x faster.
+        cells: dict[tuple, list] = {}                       # traceback -> [sizes, truncated, user line | False | None]
         for trace in raw:
             frames = trace[2]
-            loc = cache.get(frames, skip)
-            if loc is skip:
+            cell = cells.get(frames)
+            if cell is None:
                 loc = None
                 for fn, ln in frames:                       # most recent first
                     if fn.startswith("<"):
@@ -636,12 +718,27 @@ class Profiler:
                     if self._is_user(fn):
                         loc = (os.path.abspath(fn), ln)
                         break
-                cache[frames] = loc
+                cell = cells[frames] = [[], False, loc]
+            cell[0].append(trace[1])
+            if not cell[1] and trace[3] > len(frames):
+                cell[1] = True
+        by_stack: dict[tuple, int] = {}
+        truncated: set = set()
+        for frames, (sizes, cut, loc) in cells.items():
+            size = sum(sizes)
             if loc:
-                held[loc] = held.get(loc, 0) + trace[1]
+                held[loc] = held.get(loc, 0) + size
             elif loc is None:
-                unattributed += trace[1]
+                unattributed += size
+            if loc is not False:                            # every allocation but the profiler's own
+                by_stack[frames] = size
+                if cut:
+                    truncated.add(frames)
         self.snapshots.append((t, held, unattributed))
+        total_held = sum(held.values())
+        self._last_stacks = (t, by_stack, truncated)
+        if total_held > self._peak_stacks_held:
+            self._peak_stacks_held, self._peak_stacks = total_held, self._last_stacks
 
     def start(self):
         self._remember_sources()
@@ -649,6 +746,7 @@ class Profiler:
         if self.memory == "precise":
             tracemalloc.start(self.frames)
         self.rss0 = self.rss() if self.rss_kind else None
+        self.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.t0 = time.perf_counter()
         self.cpu0 = time.process_time()
         self._thread.start()
@@ -661,6 +759,7 @@ class Profiler:
         self.wall = time.perf_counter() - self.t0
         self.cpu = time.process_time() - self.cpu0
         self.holders: dict = {}
+        self.largest: dict | None = None
         self.rss1 = self.rss() if self.rss_kind else None    # before our own snapshot work
         traced_now = 0
         precise = self._precise(self.wall)
@@ -676,6 +775,82 @@ class Profiler:
             if leaks:                          # needs tracemalloc still running
                 self.holders = self._find_holders(set(leaks), main_globals)
             tracemalloc.stop()
+        if self.memory != "off":
+            self.largest = self._largest_objects(main_globals)
+
+    # ------------------------------------------------------------ largest objects at exit
+    _SKIP_TYPES = (types.ModuleType, type, types.FunctionType, types.BuiltinFunctionType, types.MethodType,
+                   types.CodeType, types.FrameType)
+
+    @staticmethod
+    def _sized(obj) -> tuple[int, int | None, bool]:
+        """(bytes, items, estimated) for one object: its own sys.getsizeof (each library's __sizeof__),
+        plus its items one level deep for builtin containers, extrapolated past CONTAINER_SAMPLE items."""
+        try:
+            size = sys.getsizeof(obj)
+        except Exception:
+            return 0, None, False
+        if isinstance(obj, dict):
+            parts = (x for kv in obj.items() for x in kv)
+            count = 2 * len(obj)
+        elif isinstance(obj, (list, tuple, set, frozenset)) or type(obj).__name__ == "deque":
+            parts, count = iter(obj), len(obj)
+        else:
+            return size, None, False
+        seen = 0
+        sized = 0
+        for x in parts:
+            if seen >= CONTAINER_SAMPLE:
+                break
+            try:
+                sized += sys.getsizeof(x)
+            except Exception:
+                pass
+            seen += 1
+        estimated = seen < count
+        if estimated and seen:
+            sized = sized * count // seen
+        return size + sized, len(obj), estimated
+
+    def _largest_objects(self, main_globals: dict | None, budget_s: float = 1.0) -> dict:
+        """The biggest objects still referenced at exit by module globals or attributes of user-class
+        instances, for any library: sizes come from the objects themselves (sys.getsizeof). A library that
+        does not report its memory (Polars, for one) shows only its Python wrapper here; the per-line
+        native estimate covers that memory instead."""
+        deadline = time.perf_counter() + budget_s
+        roots: list[tuple[str, object]] = []
+        if main_globals is not None:
+            roots += [(f"global {k}", v) for k, v in list(main_globals.items()) if not k.startswith("__")]
+        for m in list(sys.modules.values()):  # memory-guardian: ignore (snapshot: imports may mutate it)
+            file = getattr(m, "__file__", None)
+            if file and self._is_user(file) and getattr(m, "__name__", "") != "__main__":
+                roots += [(f"{m.__name__}.{k}", v) for k, v in list(vars(m).items()) if not k.startswith("__")]
+        complete = True
+        for obj in gc.get_objects():
+            if time.perf_counter() > deadline:
+                complete = False
+                break
+            cls = type(obj)
+            mod = sys.modules.get(getattr(cls, "__module__", ""), None)
+            mod_file = getattr(mod, "__file__", None) if mod is not None else None
+            if (cls.__module__ == "__main__" or bool(mod_file and self._is_user(mod_file))) \
+                    and not isinstance(obj, type) and hasattr(obj, "__dict__"):
+                roots += [(f"{cls.__qualname__}.{k}", v) for k, v in list(vars(obj).items())]
+        found: dict[int, dict] = {}
+        for label, value in roots:
+            if time.perf_counter() > deadline:
+                complete = False
+                break
+            if isinstance(value, self._SKIP_TYPES) or id(value) in found:
+                continue
+            size, items, estimated = self._sized(value)
+            cls = type(value)
+            module = getattr(cls, "__module__", "") or ""
+            name = cls.__qualname__ if module in ("builtins", "__main__") else f"{module.split('.')[0]}.{cls.__qualname__}"
+            found[id(value)] = {"holder": label, "type": name, "mb": round(size / 1e6, 3),
+                                "items": items, "estimated": estimated}
+        objects = sorted((o for o in found.values() if o["mb"] * 1e6 >= LARGEST_MIN_BYTES), key=lambda o: -o["mb"])
+        return {"objects": objects[:LARGEST_OBJECTS], "complete": complete}
 
     # ------------------------------------------------------------ who holds leaked memory
     def _origin(self, obj):
@@ -833,6 +1008,86 @@ class Profiler:
                 out.setdefault(first, {"scope": None, "assigns": [], "calls": []})['end_line'] = node.end_lineno
         return out
 
+    def _function_at(self, file: str, line: int, enclosing: bool = False) -> tuple[str, int]:
+        """(qualified name, first line) of the code object containing a line, matching what the
+        sampler records from co_qualname/co_firstlineno, so memory and time frames share an identity.
+        enclosing=True skips a lambda/comprehension that starts on this line: tracemalloc gives only
+        file and line, so the caller of an inline scope looks identical to the scope itself.
+        Returns ('', line) when the source is unavailable or the parse budget is spent."""
+        scopes = self._scopes_cache.get(file)
+        if scopes is None:
+            scopes = []
+            if not file.startswith('<') and self._parse_spent < NAME_PARSE_BUDGET_S:
+                started = time.perf_counter()
+                try:
+                    if os.path.getsize(file) <= 4 << 20:
+                        with open(file, 'rb') as f:
+                            tree = ast.parse(f.read())
+                        scopes = [(1, 10 ** 9, '<module>', 1, False)]
+
+                        def walk(node, prefix):
+                            for child in ast.iter_child_nodes(node):
+                                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                                    first = min([child.lineno] + [d.lineno for d in child.decorator_list])
+                                    qual = prefix + child.name
+                                    scopes.append((first, child.end_lineno or child.lineno, qual, first, False))
+                                    walk(child, qual + '.')
+                                elif isinstance(child, (ast.Lambda, ast.GeneratorExp)) or (
+                                        isinstance(child, (ast.ListComp, ast.SetComp, ast.DictComp))
+                                        and sys.version_info < (3, 12)):   # inlined since 3.12 (PEP 709)
+                                    name = {ast.Lambda: '<lambda>', ast.GeneratorExp: '<genexpr>', ast.ListComp: '<listcomp>',
+                                            ast.SetComp: '<setcomp>', ast.DictComp: '<dictcomp>'}[type(child)]
+                                    scopes.append((child.lineno, child.end_lineno or child.lineno, prefix + name, child.lineno, True))
+                                    walk(child, prefix)
+                                else:
+                                    walk(child, prefix)
+                        walk(tree, '')
+                except (OSError, SyntaxError, ValueError):
+                    scopes = []
+                self._parse_spent += time.perf_counter() - started
+            self._scopes_cache[file] = scopes
+        best = None
+        for start, end, qual, first, inline in scopes:        # innermost: latest start that still contains the line
+            if enclosing and inline and start == line:
+                continue
+            if start <= line <= end and (best is None or start >= best[0]):
+                best = (start, qual, first)
+        return (best[1], best[2]) if best else ('', line)
+
+    def _memory_stacks(self) -> dict | None:
+        """Peak and exit allocation stacks for the report, outermost frame first."""
+        if self.memory != 'precise' or self._last_stacks is None:
+            return None
+        frames: list[dict] = []
+        frame_ids: dict[tuple, int] = {}
+
+        def table(entry):
+            t, by_stack, truncated = entry
+            ranked = sorted(by_stack.items(), key=lambda kv: -kv[1])
+            out = []
+            for tb, size in ranked[:MEMORY_STACK_CAP]:
+                ids = []
+                outer_first = tb[::-1]                         # tracemalloc stores most recent first
+                for i, (filename, line) in enumerate(outer_first):
+                    # The same file and line as the next (inner) frame: this frame called an inline scope there.
+                    enclosing = i + 1 < len(outer_first) and outer_first[i + 1] == (filename, line)
+                    key = (filename, line, enclosing)
+                    if key not in frame_ids:
+                        file = filename if filename.startswith('<') else os.path.abspath(filename)
+                        name, first_line = self._function_at(file, line, enclosing)
+                        frame_ids[key] = len(frames)
+                        frames.append({'file': file, 'line': line, 'name': name, 'first_line': first_line,
+                                       'user': not filename.startswith('<') and self._is_user(filename)})
+                    ids.append(frame_ids[key])
+                # Like time stacks, start at the outermost user frame: the launcher and profiler frames
+                # above the script are not part of the program. Stacks without user code stay whole.
+                first_user = next((i for i, fid in enumerate(ids) if frames[fid]['user']), 0)
+                out.append({'frames': ids[first_user:], 'bytes': size, 'truncated': tb in truncated})
+            return {'t': round(t, 4), 'stacks': out, 'total_bytes': sum(by_stack.values()),
+                    'other_bytes': sum(size for _, size in ranked[MEMORY_STACK_CAP:])}
+        peak = table(self._peak_stacks) if self._peak_stacks else None
+        return {'depth': self.frames, 'frames': frames, 'peak': peak, 'exit': table(self._last_stacks)}
+
     def report(self, script: str) -> dict:
         peak_idx = max(range(len(self.snapshots)), key=lambda i: sum(self.snapshots[i][1].values()),
                        default=None)
@@ -963,10 +1218,12 @@ class Profiler:
                            "active": self.monitoring_enabled,
                            "reason": self.monitoring_reason,
                            "dropped_line_events": self.monitoring_dropped},
+            "run": {"argv": self.argv, "started_at": self.started_at, "platform": sys.platform},
             "sleep_overhead_s": round(self.sleep_overhead, 6),
             "rss_kind": self.rss_kind,
             "per_thread_cpu": any(c is not None for c in self._clocks.values()),
             "snapshot_cost_s": round(self.snap_cost, 3), "snapshots": len(self.snapshots),
+            "peak_snapshots": self.peak_snapshots, "peak_snapshot_cost_s": round(self.peak_snap_cost, 3),
             # Held at the peak by allocations whose traceback never reached your code
             # (deep library internals, e.g. `import pandas`). Raise --frames to attribute more.
             "unattributed_peak_mb": (round((self.snapshots[peak_idx][2] or 0) / 1e6, 3)
@@ -987,6 +1244,8 @@ class Profiler:
                                    if self.memory == "precise" and self.rss_kind == "current" else None),
             "timeline": [[round(a, 3), round(b, 3), round(c, 3)] for a, b, c in timeline],
             "file_hashes": hashes, "files": files, "functions": funcs,
+            'memory_stacks': self._memory_stacks(),
+            'largest_objects': self.largest,
             'stacks': {'frames': stack_frames, 'samples': stack_samples,
                        'dropped_s': round(self.stack_dropped_s, 6),
                        'depth_limited': self.stack_depth_limited},
@@ -1017,6 +1276,7 @@ def main(argv=None) -> int:
     out = os.path.abspath(ns.out)  # Target code may change the working directory.
     prof = Profiler(ns.root or os.path.dirname(script), ns.interval, ns.memory, ns.frames,
                     ns.monitoring)
+    prof.argv = list(script_args[1:])
     sys.argv = [script] + script_args[1:]
     sys.path.insert(0, os.path.dirname(script))
     code = 0

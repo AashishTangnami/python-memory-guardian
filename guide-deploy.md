@@ -71,7 +71,7 @@ Run these commands from the repository root, the folder containing `package.json
 
 ```bash
 npm ci                     # exact dependency versions from package-lock.json
-npx vsce package           # -> python-memory-guardian-1.4.1.vsix
+npx vsce package           # -> python-memory-guardian-1.4.2.vsix
 ```
 
 `vsce package` automatically runs the `vscode:prepublish` script first. That script bundles the version-pinned packages from `requirements.txt` into `server/libs/`, and bundles the TypeScript client into `dist/extension.js`.
@@ -79,7 +79,7 @@ npx vsce package           # -> python-memory-guardian-1.4.1.vsix
 It doesn't matter which Python version you package with. `requirements.txt` pins versions compatible with the oldest supported Python (3.9) and lists every dependency explicitly, so the bundle is consistent and works on 3.9 through 3.14. The `vendor:python` script uses uv with Python 3.9 as its target. Don't replace it with an unpinned install of `pygls`; that can select dependencies incompatible with Python 3.9 and 3.10. A successful run ends with:
 
 ```
- DONE  Packaged: python-memory-guardian-1.4.1.vsix
+ DONE  Packaged: python-memory-guardian-1.4.2.vsix
 ```
 
 To see exactly what went into the package:
@@ -99,7 +99,7 @@ cp rust-server/target/release/guardian-server bin/        # Windows: copy ...\gu
 npx vsce package --target linux-x64                       # use YOUR platform from Part 0
 ```
 
-The result is `python-memory-guardian-linux-x64-1.4.1.vsix`. Only install it on a matching machine. Delete `bin/` before building the universal package again, so the binary doesn't end up in it.
+The result is `python-memory-guardian-linux-x64-1.4.2.vsix`. Only install it on a matching machine. Delete `bin/` before building the universal package again, so the binary doesn't end up in it.
 
 ### 1.3 Install it
 
@@ -113,7 +113,7 @@ Use this section after building a package in 1.1 or 1.2, or when someone has giv
 **From the command line:**
 
 ```bash
-code --install-extension python-memory-guardian-1.4.1.vsix
+code --install-extension python-memory-guardian-1.4.2.vsix
 ```
 
 ### 1.4 Check that it works
@@ -128,7 +128,7 @@ code --install-extension python-memory-guardian-1.4.1.vsix
 
 ```bash
 code --user-data-dir /tmp/pmg-clean --extensions-dir /tmp/pmg-ext \
-     --install-extension python-memory-guardian-1.4.1.vsix
+     --install-extension python-memory-guardian-1.4.2.vsix
 code --user-data-dir /tmp/pmg-clean --extensions-dir /tmp/pmg-ext test-fixtures
 ```
 
@@ -161,8 +161,8 @@ Installs from a `.vsix` **don't auto-update**. Announce new versions, and have t
 ### 1.7 Update or uninstall a local install
 
 ```bash
-code --install-extension python-memory-guardian-1.4.1.vsix          # newer version replaces older
-code --install-extension python-memory-guardian-1.4.1.vsix --force  # reinstall the same version
+code --install-extension python-memory-guardian-1.4.2.vsix          # newer version replaces older
+code --install-extension python-memory-guardian-1.4.2.vsix --force  # reinstall the same version
 code --uninstall-extension your-publisher-id.python-memory-guardian
 code --list-extensions --show-versions | rg python-memory-guardian
 ```
@@ -237,7 +237,7 @@ Run through this before **every** release. Each item maps to a real Marketplace 
 
 ```bash
 npm ci
-npx vsce package            # -> python-memory-guardian-1.4.1.vsix
+npx vsce package            # -> python-memory-guardian-1.4.2.vsix
 ```
 
 **With the Rust backend**, build one package per platform. Section [3.5](#35-building-rust-packages-for-other-platforms) explains how to build binaries for platforms other than your own; the CI workflow in 3.6 builds all of them automatically.
@@ -247,7 +247,7 @@ npx vsce package            # -> python-memory-guardian-1.4.1.vsix
 **First release:**
 1. Go to **https://marketplace.visualstudio.com/manage** and select your publisher.
 2. Click **New extension → Visual Studio Code**.
-3. Upload `python-memory-guardian-1.4.1.vsix`.
+3. Upload `python-memory-guardian-1.4.2.vsix`.
 4. Wait while it's verified (usually a few minutes). The status changes when it's live.
 
 **Later releases:** on the same page, open the extension's **⋯** menu, choose **Update**, and upload the new `.vsix`.
@@ -271,7 +271,7 @@ npx vsce package            # -> python-memory-guardian-1.4.1.vsix
 3. **Publish:**
    ```bash
    npx vsce publish                                                   # builds and publishes the universal package
-   npx vsce publish --packagePath python-memory-guardian-linux-x64-1.4.1.vsix   # each prebuilt platform package
+   npx vsce publish --packagePath python-memory-guardian-linux-x64-1.4.2.vsix   # each prebuilt platform package
    ```
    All packages of one release must carry the same version number. Build every platform package first, then publish them all, and only then bump the version for the next release.
 

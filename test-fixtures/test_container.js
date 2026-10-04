@@ -58,6 +58,7 @@ const hostFile = path.join(host, "service.py");
 assert.strictEqual(idx.state(hostFile, fs.readFileSync(hostFile, "utf8")), "fresh", "remapped to the host file");
 const e13 = idx.line(hostFile, 13);
 assert(e13 && e13.leak_runs && e13.held_by[0].holder === "Service.history", "leak + holder survive the round trip");
+assert(p.memory_stacks.frames.filter((f) => f.user).every((f) => f.file === hostFile), "memory-stack frames are remapped too");
 console.log("PASS profile ran 'in the container', mapped back to the host file:", m.lineLabel(e13, p));
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log("ALL CONTAINER TESTS PASSED");

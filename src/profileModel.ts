@@ -47,9 +47,23 @@ export interface Profile {
   files: Record<string, Record<string, LineEntry>>;
   functions: Record<string, Record<string, FuncEntry>>;
   stacks?: { frames: StackFrame[]; samples: StackSample[]; dropped_s: number; depth_limited: boolean };
+  /** precise mode: bytes per allocation traceback at the peak and exit snapshots, outermost frame first. */
+  memory_stacks?: MemoryStacks | null;
+  /** fast/precise: objects still held at exit by globals or your instances' attributes, sized by sys.getsizeof. */
+  largest_objects?: { objects: LargestObject[]; complete: boolean } | null;
   monitoring?: { requested: 'off' | 'lines'; active: boolean; reason: string | null;
     dropped_line_events: number };
+  /** How the run was started: the script's own arguments, UTC start time, sys.platform. Used to compare runs. */
+  run?: { argv: string[]; started_at: string | null; platform: string };
 }
+
+export interface MemoryStackTable {
+  t: number; total_bytes: number; other_bytes: number;
+  stacks: { frames: number[]; bytes: number; truncated: boolean }[];
+}
+export interface MemoryStacks { depth: number; frames: StackFrame[]; peak: MemoryStackTable | null; exit: MemoryStackTable; }
+
+export interface LargestObject { holder: string; type: string; mb: number; items: number | null; estimated: boolean; }
 
 export interface Thresholds { hotShare: number; hotMb: number; }
 
@@ -131,12 +145,31 @@ export function parseProfile(json: string): Profile | undefined {
           && Array.isArray(v.frames) && v.frames.length <= 128
           && v.frames.every((id: unknown) => Number.isInteger(id) && Number(id) >= 0 && Number(id) < s.frames.length))) return undefined;
     }
+    if (p.memory_stacks != null) {
+      const ms = p.memory_stacks;
+      const table = (t: unknown) => record(t) && numeric(t, ['t', 'total_bytes', 'other_bytes']) && Array.isArray(t.stacks)
+        && t.stacks.every((s: unknown) => record(s) && number(s.bytes) && typeof s.truncated === 'boolean'
+          && Array.isArray(s.frames) && s.frames.length <= 256
+          && s.frames.every((id: unknown) => Number.isInteger(id) && Number(id) >= 0 && Number(id) < ms.frames.length));
+      if (!record(ms) || !Number.isInteger(ms.depth) || ms.depth < 1 || !Array.isArray(ms.frames)
+        || !ms.frames.every((f: unknown) => record(f) && typeof f.file === 'string' && typeof f.name === 'string'
+          && typeof f.user === 'boolean' && Number.isInteger(f.line) && f.line >= 0 && Number.isInteger(f.first_line) && f.first_line >= 0)
+        || !table(ms.exit) || (ms.peak != null && !table(ms.peak))) return undefined;
+    }
+    if (p.largest_objects != null) {
+      const lo = p.largest_objects;
+      if (!record(lo) || typeof lo.complete !== 'boolean' || !Array.isArray(lo.objects) || lo.objects.length > 100
+        || !lo.objects.every((o: unknown) => record(o) && typeof o.holder === 'string' && typeof o.type === 'string'
+          && number(o.mb) && typeof o.estimated === 'boolean' && (o.items == null || (Number.isSafeInteger(o.items) && o.items >= 0)))) return undefined;
+    }
     if (p.monitoring != null && (!record(p.monitoring)
       || !['off', 'lines'].includes(p.monitoring.requested)
       || typeof p.monitoring.active !== 'boolean'
       || (p.monitoring.reason != null && typeof p.monitoring.reason !== 'string')
       || !Number.isSafeInteger(p.monitoring.dropped_line_events)
       || p.monitoring.dropped_line_events < 0)) return undefined;
+    if (p.run != null && (!record(p.run) || !Array.isArray(p.run.argv) || !p.run.argv.every((a: unknown) => typeof a === 'string')
+      || (p.run.started_at != null && typeof p.run.started_at !== 'string') || typeof p.run.platform !== 'string')) return undefined;
     return p as unknown as Profile;
   } catch {
     return undefined;
@@ -199,10 +232,19 @@ export class ProfileIndex {
   private readonly spans = new Map<string, [number, number][]>();
 }
 
+/**
+ * Precise mode: process-memory growth beyond traced Python growth on the same line, for any library.
+ * Both are charged to the line running at each sample; RSS grows where memory is first written and
+ * rarely shrinks, so this is an estimate of native memory (C extensions, their own allocators).
+ */
+export function nativeMb(e: { rss_growth_mb?: number; alloc_mb?: number } | undefined): number {
+  return e ? Math.max(0, (e.rss_growth_mb ?? 0) - (e.alloc_mb ?? 0)) : 0;
+}
+
 export function memoryMb(e: LineEntry | undefined, mode: Profile["memory_mode"]): number {
   if (!e) return 0;
   if (mode === "precise") {
-    return Math.max(e.alloc_mb ?? 0, e.transient_peak_mb ?? 0, e.peak_mb ?? 0);
+    return Math.max(e.alloc_mb ?? 0, e.transient_peak_mb ?? 0, e.peak_mb ?? 0, nativeMb(e));
   }
   return mode === "fast" ? e.rss_growth_mb : 0;
 }
@@ -246,13 +288,15 @@ export function lineLabel(e: LineEntry, p: Profile): string {
     if (e.rss_growth_mb >= 1) out.push(`▲ RSS +${mb(e.rss_growth_mb)}${into}`);
   } else if (p.memory_mode === "precise") {
     // Three different quantities - never shown as one number:
-    //   alloc = total allocated by this line over the run (can far exceed what is alive)
+    //   alloc = net growth of traced memory while this line ran, summed over the run (can exceed what
+    //           is alive; allocate-and-free churn between two samples is not counted)
     //   held  = still referenced at the memory peak
     //   spike = short-lived peak that rose and fell between two samples
     const mem: string[] = [];
     if ((e.alloc_mb ?? 0) >= 1) mem.push(`alloc ${mb(e.alloc_mb!)}`);
     if ((e.peak_mb ?? 0) >= 1) mem.push(`held ${mb(e.peak_mb!)}`);
     if ((e.transient_peak_mb ?? 0) >= 1) mem.push(`spike ${mb(e.transient_peak_mb!)}`);
+    if (nativeMb(e) >= 1) mem.push(`native ≈ +${mb(nativeMb(e))}`);
     if (mem.length) out.push(`▲ ${mem.join(" · ")}${into}`);
   }
   if (e.leak_runs) {
@@ -270,6 +314,7 @@ export function funcLabel(f: FuncEntry, p: Profile): string {
     ? Math.max(f.peak_mb, f.transient_peak_mb, f.alloc_mb ?? 0)
     : p.memory_mode === "fast" ? (f.rss_growth_mb ?? 0) : 0;
   if (m >= 1) out.push(p.memory_mode === "fast" ? `· RSS +${mb(m)}` : `· ${mb(m)}`);
+  if (p.memory_mode === "precise" && nativeMb(f) >= 1) out.push(`· native ≈ +${mb(nativeMb(f))}`);
   return out.join(" ");
 }
 

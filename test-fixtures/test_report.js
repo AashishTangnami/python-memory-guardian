@@ -1,6 +1,6 @@
 const assert = require('assert');
 const m = require('../out/profileModel');
-const { diagnose, callTree, overview, frameOrigin } = require('../out/reportModel');
+const { diagnose, callTree, overview, frameOrigin, topFunctions, neighbors, functionKey } = require('../out/reportModel');
 const { remapProfileKeys, toLocal } = require('../out/containerPaths');
 const { reportHtml } = require('../out/reportWebview');
 const file = '/app/work.py';
@@ -66,6 +66,11 @@ assert.strictEqual(callTree(p, 'python').nodes[0].value, 1);
 assert.strictEqual(callTree(p, 'elapsed', '2').nodes[0].value, 2);
 assert.strictEqual(callTree(p, 'native').nodes[0].value, 0);
 assert.strictEqual(callTree(p, 'elapsed', '', 2).omitted, 3, 'display cap reports omissions');
+const capped = callTree(p, 'elapsed', '', 2);
+assert.strictEqual(capped.nodes[0].value, 3, 'the node limit never drops time from upper levels');
+assert.deepStrictEqual([capped.nodes[1].value, capped.nodes[1].omitted], [3, 3], 'cut-off calls are counted on the deepest node shown');
+for (const t of [capped])
+  for (const n of t.nodes) assert.strictEqual(n.value, n.self + n.omitted + n.children.reduce((sum, id) => sum + t.nodes[id].value, 0), 'value = self + omitted + children');
 const recursive = structuredClone(p); recursive.stacks.samples[0].frames = [0, 1, 1, 3];
 assert.strictEqual(named(callTree(recursive, 'python'), 'left').length, 2);
 const mapped = remapProfileKeys(p, s => toLocal(s, [{ local: '/host', container: '/app' }]));
@@ -113,6 +118,11 @@ for (const [v, t] of Object.entries(views)) {
   assert.strictEqual(t.nodes.reduce((sum, n) => sum + n.self, 0), 5, `${v}: self time conserved`);
   for (const n of t.nodes) assert.strictEqual(n.value, n.self + n.children.reduce((sum, id) => sum + t.nodes[id].value, 0), v);
 }
+for (const v of ['all', 'grouped', 'mine']) {
+  const small = callTree(mixed, 'python', '', 4, v);
+  assert.strictEqual(small.nodes[0].value, 5, `${v}: a tight node limit keeps the full total`);
+  for (const n of small.nodes) assert.strictEqual(n.value, n.self + n.omitted + n.children.reduce((sum, id) => sum + small.nodes[id].value, 0), v);
+}
 const box = (t, n) => t.frames[n.frame];
 const kids = (t, n) => n.children.map(id => t.nodes[id]);
 const g = views.grouped, gMain = kids(g, g.nodes[0])[0];
@@ -134,6 +144,101 @@ const mMain = kids(mine, mine.nodes[0])[0], mHandler = kids(mine, mMain)[0];
 assert.deepStrictEqual([mMain.self, mHandler.self], [2, 3], 'library time is counted in the calling user function');
 assert.strictEqual(views.all.frames.filter(f => f.group).length, 0, 'all frames: nothing grouped');
 assert.strictEqual(views.all.nodes.length, callTree(mixed, 'python').nodes.length, 'all is the default');
+// Top functions: summed across call paths; total counted once per stack; memory only for your functions.
+const withMemory = { ...mixed, memory_mode: 'precise',
+  functions: { '/app/main.py': { 1: { name: 'main', time_s: 5, python_s: 5, native_s: 0, system_s: 0, peak_mb: 3, transient_peak_mb: 7, alloc_mb: 5 } } } };
+const top = topFunctions(withMemory, 'python');
+const row = name => top.find(r => r.name === name);
+assert.strictEqual(top[0].name, 'encode', 'ranked by self time');
+assert.deepStrictEqual([row('main').self, row('main').total, row('main').callers, row('main').memoryMb], [0, 5, 0, 7]);
+assert.deepStrictEqual([row('read_csv').self, row('read_csv').total, row('read_csv').callers], [1, 2, 2], 'called from handler and the import system');
+assert.deepStrictEqual([row('_load_unlocked').self, row('_load_unlocked').callers], [1, 2]);
+assert.strictEqual(row('read_csv').memoryMb, null, 'no memory claim for library code');
+assert.strictEqual(top.reduce((sum, r) => sum + r.self, 0), 5, 'self time adds up to the total');
+assert(topFunctions(withMemory, 'python', '', 'mine').every(r => r.user), 'only my code: your functions only');
+const recursive2 = { ...mixed, stacks: { ...mixed.stacks, samples: [{ ...mixed.stacks.samples[0], frames: [0, 1, 1, 1, 6], python_s: 3 }] } };
+const rec = topFunctions(recursive2, 'python');
+assert.deepStrictEqual([rec.find(r => r.name === 'handler').total, rec.find(r => r.name === 'handler').callers], [3, 1],
+  'recursion is counted once, and a function does not count as its own caller');
+const key = name => functionKey(mixed.stacks.frames.find(f => f.name === name));
+const csv = neighbors(mixed, 'python', key('read_csv'));
+assert.deepStrictEqual([csv.value, csv.self], [2, 1]);
+assert.deepStrictEqual(csv.callers.map(n => [n.name, n.value]).sort(), [['_find_and_load', 1], ['handler', 1]]);
+assert.deepStrictEqual(csv.callees.map(n => [n.name, n.value]), [['_load_unlocked', 1]]);
+const h = neighbors(mixed, 'python', key('handler'));
+assert.deepStrictEqual([h.value, h.self, h.callers.map(n => n.name), h.callees.map(n => [n.name, n.value])],
+  [3, 0, ['main'], [['dumps', 2], ['read_csv', 1]]]);
+// Memory measures: memory-stack tables feed the same tree, table and callers code, weighted by bytes.
+const memFrames = [fr('<module>', '/app/main.py', true), fr('Svc.handle', '/app/svc.py', true), fr('leaf', '/app/svc.py', true),
+  { name: '', file: '<frozen importlib._bootstrap>', line: 5, first_line: 5, user: false }];
+const memTable = (scale) => ({ t: 1, total_bytes: 4500 * scale, other_bytes: 0, stacks: [
+  { frames: [0, 1, 2], bytes: 3000 * scale, truncated: true }, { frames: [0, 1], bytes: 1000 * scale, truncated: false },
+  { frames: [3], bytes: 500 * scale, truncated: true }] });
+const withStacks = { ...mixed, memory_mode: 'precise', memory_stacks: { depth: 2, frames: memFrames, peak: memTable(2), exit: memTable(1) } };
+assert(m.parseProfile(JSON.stringify(withStacks)), 'memory stacks are accepted');
+const badStacks = structuredClone(withStacks); badStacks.memory_stacks.exit.stacks[0].frames = [99];
+assert.strictEqual(m.parseProfile(JSON.stringify(badStacks)), undefined, 'a frame id outside the table is rejected');
+const memExit = callTree(withStacks, 'mem_exit');
+assert.strictEqual(memExit.nodes[0].value, 4500, 'exit tree totals the exit table');
+assert.strictEqual(callTree(withStacks, 'mem_peak').nodes[0].value, 9000, 'peak tree uses the peak table');
+assert.strictEqual(callTree(withStacks, 'mem_exit', '1').nodes[0].value, 4500, 'memory stacks have no thread, so the thread filter does not hide them');
+assert(memExit.frames.some(f => f.name === 'line 5' && f.origin.label === 'Python import system'), 'nameless frames show their line and origin');
+const memTop = topFunctions(withStacks, 'mem_exit');
+assert.deepStrictEqual(memTop.slice(0, 3).map(r => [r.name, r.self, r.total]),
+  [['leaf', 3000, 3000], ['Svc.handle', 1000, 4000], ['line 5', 500, 500]], 'ranked by bytes allocated directly');
+assert.strictEqual(memTop.find(r => r.name === '<module>').total, 4000);
+assert.deepStrictEqual(neighbors(withStacks, 'mem_exit', functionKey(memFrames[1])).callees.map(n => [n.name, n.value]), [['leaf', 3000]]);
+assert.strictEqual(callTree(withStacks, 'python').nodes[0].value, 5, 'time measures are unchanged');
+assert.strictEqual(callTree(mixed, 'mem_exit').nodes[0].value, 0, 'no memory stacks: an empty memory tree');
+// Inverted (bottom-up) view: functions where value is spent on top, callers below, merged by function.
+for (const [label, prof, metric] of [['time', mixed, 'python'], ['memory', withStacks, 'mem_exit']]) {
+  const inv = callTree(prof, metric, '', 25000, 'all', true);
+  const id = (file, line, name) => `${file}|${line}|${name}`;   // displayed identity: nameless frames show as "line N"
+  const tops = new Map(inv.nodes[0].children.map(c => { const f = inv.frames[inv.nodes[c].frame]; return [id(f.file, f.first_line, f.name), inv.nodes[c].value]; }));
+  for (const r of topFunctions(prof, metric)) assert.strictEqual(tops.get(id(r.file, r.line, r.name)) ?? 0, r.self, `${label}: inverted top level = self value of ${r.name}`);
+  assert.strictEqual(inv.nodes[0].value, callTree(prof, metric).nodes[0].value, `${label}: same total as top-down`);
+  for (const n of inv.nodes) assert.strictEqual(n.value, n.self + n.omitted + n.children.reduce((sum, id) => sum + inv.nodes[id].value, 0), label);
+}
+const inv = callTree(mixed, 'python', '', 25000, 'all', true);
+const chain = [];
+for (let n = inv.nodes[inv.nodes[0].children.find(id => inv.frames[inv.nodes[id].frame].name === 'encode')]; n; n = inv.nodes[n.children[0]]) chain.push(inv.frames[n.frame].name);
+assert.deepStrictEqual(chain, ['encode', 'dumps', 'handler', 'main'], 'below a function: its callers, innermost first');
+const twoLines = { ...mixed, stacks: { ...mixed.stacks,
+  frames: [fr('main', '/app/main.py', true), { name: 'work', file: '/app/w.py', line: 12, first_line: 10, user: true }, { name: 'work', file: '/app/w.py', line: 15, first_line: 10, user: true }],
+  samples: [[0, 1], [0, 2]].map(frames => ({ thread: '1', thread_name: 'MainThread', frames, python_s: 1, native_s: 0, system_s: 0, unsplit_s: 0, samples: 1 })) } };
+const merged = callTree(twoLines, 'python', '', 25000, 'all', true);
+assert.deepStrictEqual(merged.nodes[0].children.map(id => [merged.frames[merged.nodes[id].frame].name, merged.frames[merged.nodes[id].frame].line, merged.nodes[id].value]),
+  [['work', 10, 2]], 'one box per function across call lines, at its first line');
+assert.strictEqual(callTree(twoLines, 'python').nodes[1].children.length, 2, 'top-down keeps the two call lines apart');
+// Time windows: diagnosis from each line's retention snapshots inside the window only.
+const windowed = structuredClone(p);
+const wl = Object.values(windowed.files)[0], wkey = Object.keys(wl)[0];
+wl[wkey] = { ...wl[wkey], leak_runs: undefined, end_mb: 2, held_by: [{ holder: 'global CACHE', type: 'dict', items: 9, matching: 4 }],
+  retention: { snapshots: 7, rises: 4, releases: 2, growth_mb: 2, observed_s: 6, peak_mb: 40,
+    points: [[0, 1], [1, 10], [2, 20], [3, 40], [4, 5], [5, 3], [6, 2]] } };
+const whole = diagnose(windowed).find(d => d.line === Number(wkey));
+const early = diagnose(windowed, { from: 0, to: 3 }).find(d => d.line === Number(wkey));
+assert.deepStrictEqual([early.status, early.peakMb, early.endMb, early.points.length], ['growing', 40, 40, 4], 'rising window: growing, peak and end at 40 MB');
+assert.deepStrictEqual(early.holders, [], 'holders are found at exit, outside this window');
+assert(early.evidence.some(e => e.includes('only searched at exit')));
+const late = diagnose(windowed, { from: 3.5, to: 6 }).find(d => d.line === Number(wkey));
+assert.deepStrictEqual([late.status, late.peakMb, late.endMb], ['retained', 5, 2], 'falling window: retained, with its own peak');
+assert.strictEqual(late.holders.length, 1, 'a window that reaches exit cites the exit holders');
+assert.strictEqual(diagnose(windowed, { from: 7, to: 9 }).find(d => d.line === Number(wkey)), undefined, 'no snapshots in the window: no card');
+assert.strictEqual(whole.peakMb, 40, 'no window: whole-run diagnosis unchanged');
+assert.deepStrictEqual(diagnose({ ...windowed, memory_mode: 'fast' }, { from: 0, to: 3 }), [], 'fast mode has no retention evidence');
+// Native estimate in the report: overview card value, top-line memory text, Top functions column.
+const nat = structuredClone(withMemory); nat.rss_kind = 'current'; nat.native_untraced_mb = 363;
+nat.functions['/app/main.py'][1].rss_growth_mb = 130; nat.functions['/app/main.py'][1].alloc_mb = 3;
+const natFile = Object.keys(nat.files)[0], natLine = Object.keys(nat.files[natFile])[0];
+Object.assign(nat.files[natFile][natLine], { time_s: 1, rss_growth_mb: 127, alloc_mb: 0, peak_mb: 0, transient_peak_mb: 0, leak_runs: undefined });
+assert.strictEqual(overview(nat).nativeUntracedMb, 363);
+assert.strictEqual(overview({ ...nat, memory_mode: 'fast' }).nativeUntracedMb, null, 'fast mode: no estimate card');
+assert.strictEqual(overview(nat).topLines.find(l => l.line === Number(natLine)).memory, 'native ≈ +127.0 MB');
+const natTop = topFunctions(nat, 'python');
+assert.strictEqual(natTop.find(r => r.name === 'main').nativeMb, 127);
+assert.strictEqual(natTop.find(r => r.name === 'read_csv').nativeMb, null, 'no estimate for library code');
+assert(topFunctions({ ...nat, memory_mode: 'fast' }, 'python').every(r => r.nativeMb === null), 'precise mode only');
 const html = reportHtml('abcdef');
 assert(html.includes("default-src 'none'"));
 assert(html.includes('id="overviewTab"') && html.includes('id="memoryTimeline"') && html.includes('id="hotspots"'));

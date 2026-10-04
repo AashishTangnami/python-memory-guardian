@@ -6,6 +6,7 @@
  *   - severity adjustment of the static diagnostics (hot up, cold down)
  * Profiles are ignored for any file whose text changed since profiling.
  */
+import { execFile } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -14,6 +15,8 @@ import {
   ProfileIndex, runNotes, textHash, Thresholds, unattributedNote,
 } from "./profileModel";
 import { ContainerConfig, containerCommand, remapProfileKeys, toContainer, toLocal } from "./containerPaths";
+import { baselineFileName } from "./compareModel";
+import { buildSummary, Freshness as SummaryFreshness, StaticFinding } from "./summaryModel";
 import { GuardianReport } from "./reportView";
 
 const PROFILE_GLOB = "**/.pmg/profile.json";
@@ -39,6 +42,12 @@ export class ProfileView implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly report: GuardianReport;
   private showNextReport = false;
+  /** The loaded profile as written (before path remapping), so a baseline is an exact copy of it. */
+  private loaded: { uri: vscode.Uri; text: string } | undefined;
+  /** The last profiling run's profile (a .pmg/profile.json), whose summary is kept in .pmg/summary.json beside it. */
+  private run: { index: ProfileIndex; profilePath: string; summaryPath: string } | undefined;
+  private summaryTimer: ReturnType<typeof setTimeout> | undefined;
+  private summaryFailed = false;
 
   constructor(
     private readonly ctx: vscode.ExtensionContext,
@@ -46,13 +55,18 @@ export class ProfileView implements vscode.Disposable {
     private readonly interpreter: () => string,
     private readonly container: () => ContainerConfig | undefined = () => undefined,
   ) {
-    this.report = new GuardianReport((doc) => this.docState(doc));
+    this.report = new GuardianReport((doc) => this.docState(doc), {
+      dir: () => this.baselineDir(),
+      parse: (text) => this.parse(text),
+      save: () => this.saveBaseline(),
+      changed: () => this.scheduleSummary(),
+    });
     const watcher = vscode.workspace.createFileSystemWatcher(PROFILE_GLOB);
     this.disposables.push(
       watcher, this.runtime, this.status, this.lineDeco, this.hotDeco, this.report,
       watcher.onDidCreate((u) => this.load(u)),
       watcher.onDidChange((u) => this.load(u)),
-      watcher.onDidDelete(() => this.clear()),
+      watcher.onDidDelete((u) => this.profileDeleted(u)),
       vscode.window.onDidChangeVisibleTextEditors(() => this.render()),
       vscode.workspace.onDidChangeTextDocument((e) => this.onEdit(e.document)),
       vscode.workspace.onDidCloseTextDocument((d) => this.forget(d.uri)),
@@ -65,6 +79,7 @@ export class ProfileView implements vscode.Disposable {
         this.render();
       }),
       vscode.commands.registerCommand("pythonMemoryGuardian.clearProfile", () => this.clear()),
+      vscode.commands.registerCommand("pythonMemoryGuardian.saveBaseline", () => this.saveBaseline()),
     );
     this.status.command = "pythonMemoryGuardian.showReport";
     void vscode.workspace.findFiles(PROFILE_GLOB, undefined, 1).then((u) => u[0] && this.load(u[0]));
@@ -163,14 +178,18 @@ export class ProfileView implements vscode.Disposable {
       if (reveal) vscode.window.showWarningMessage("Python Memory Guardian: could not read the selected profile JSON.");
       return;
     }
-    let p = parseProfile(text);
-    const cc = this.container();
-    if (p && cc) p = remapProfileKeys(p, (k) => toLocal(k, cc.mappings));   // /app/x.py -> host path
+    const p = this.parse(text);
     if (!p) {
       vscode.window.showWarningMessage("Python Memory Guardian: unreadable profile JSON (schema 2 or 3 required).");
       return;
     }
     this.index = new ProfileIndex(p);
+    this.loaded = { uri, text };
+    // A profiling run's output (any .pmg/profile.json) gets a summary; other opened JSON files do not replace it.
+    if (path.basename(uri.fsPath) === "profile.json" && path.basename(path.dirname(uri.fsPath)) === ".pmg") {
+      this.run = { index: this.index, profilePath: uri.fsPath, summaryPath: path.join(path.dirname(uri.fsPath), "summary.json") };
+      this.scheduleSummary();
+    }
     this.lastState.clear();
     this.runtime.clear();
     this.report.update(this.index);
@@ -179,8 +198,119 @@ export class ProfileView implements vscode.Disposable {
     this.render();
   }
 
+  /** Validate profile JSON and map container paths to host paths. */
+  private parse(text: string) {
+    const p = parseProfile(text);
+    const cc = this.container();
+    return p && cc ? remapProfileKeys(p, (k) => toLocal(k, cc.mappings)) : p;   // /app/x.py -> host path
+  }
+
+  // ---------------------------------------------------------------- baselines
+  /** <workspace folder>/.pmg/baselines for the loaded profile (or, outside a workspace, next to its .pmg folder). */
+  private baselineDir(): string | undefined {
+    const uri = this.loaded?.uri;
+    if (!uri) return vscode.workspace.workspaceFolders?.[0] && path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, ".pmg", "baselines");
+    const root = vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath
+      ?? (path.basename(path.dirname(uri.fsPath)) === ".pmg" ? path.dirname(path.dirname(uri.fsPath)) : path.dirname(uri.fsPath));
+    return path.join(root, ".pmg", "baselines");
+  }
+
+  /** Copy the loaded profile to .pmg/baselines/<name>.json with the git commit, so later runs can be compared to it. */
+  private async saveBaseline(): Promise<void> {
+    const loaded = this.loaded, dir = this.baselineDir(), p = this.index?.profile;
+    if (!loaded || !dir || !p) {
+      void vscode.window.showInformationMessage("Run Profile Current File first, then save the run as a baseline.");
+      return;
+    }
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, "").replace("T", "-");
+    const name = await vscode.window.showInputBox({
+      prompt: "Baseline name (letters, digits, dot, dash, underscore)",
+      value: `${path.basename(p.script).replace(/\.pyw?$/, "")}-${stamp}`,
+      validateInput: (v) => baselineFileName(v) ? undefined : "Use 1-80 letters, digits, dots, dashes or underscores, starting with a letter or digit.",
+    });
+    const file = name && baselineFileName(name);
+    if (!file) return;
+    const target = path.join(dir, file);
+    if (fs.existsSync(target) && await vscode.window.showWarningMessage(`Baseline "${name!.trim()}" exists. Replace it?`,
+      { modal: true }, "Replace") !== "Replace") return;
+    const root = path.dirname(path.dirname(dir));
+    const git = (args: string[]) => new Promise<string | null>((resolve) =>
+      execFile("git", args, { cwd: root, timeout: 5000, windowsHide: true }, (err, out) => resolve(err ? null : out.trim())));
+    const [commit, status] = await Promise.all([git(["rev-parse", "HEAD"]), git(["status", "--porcelain", "--untracked-files=no"])]);
+    try {
+      const json = JSON.parse(loaded.text);
+      json.baseline = { name: name!.trim(), saved_at: new Date().toISOString(), git_commit: commit || null,
+        git_dirty: status == null ? null : status.length > 0 };
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(target + ".tmp", JSON.stringify(json));
+      fs.renameSync(target + ".tmp", target);
+    } catch (e) {
+      void vscode.window.showErrorMessage(`Could not save the baseline: ${e}`);
+      return;
+    }
+    this.report.baselinesChanged(name!.trim());
+    void vscode.window.showInformationMessage(`Saved baseline "${name!.trim()}". Change your code, profile again, and open the report's Compare tab.`);
+  }
+
+  // ---------------------------------------------------------------- run summary
+  /** Rewrite the summary shortly after its inputs change: static findings arrive, freshness changes, a baseline is picked. */
+  private scheduleSummary(): void {
+    if (!this.run) return;
+    if (this.summaryTimer) clearTimeout(this.summaryTimer);
+    this.summaryTimer = setTimeout(() => this.writeSummary(), 500);
+  }
+
+  private writeSummary(): void {
+    this.summaryTimer = undefined;
+    const run = this.run;
+    if (!run) return;
+    try {
+      const p = run.index.profile;
+      const freshness: Record<string, SummaryFreshness> = {};
+      const staticDiagnostics: Record<string, StaticFinding[]> = {};
+      const coll = this.diagnostics();
+      const severity = ["error", "warning", "information", "hint"] as const;
+      for (const file of Object.keys(p.files)) {
+        const uri = vscode.Uri.file(file);
+        const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString());
+        if (doc) {
+          freshness[file] = run.index === this.index ? this.docState(doc) === "fresh" ? "fresh" : "stale"
+            : run.index.state(file, doc.getText()) === "fresh" ? "fresh" : "stale";
+          // Both language servers analyze open documents only.
+          staticDiagnostics[file] = (coll?.get(uri) ?? []).map((d) => ({ line: d.range.start.line + 1,
+            code: String(typeof d.code === "object" ? d.code.value : d.code ?? ""), severity: severity[d.severity] ?? "hint", message: d.message }));
+        } else {
+          try {
+            freshness[file] = run.index.state(file, fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "")) === "fresh" ? "fresh" : "stale";
+          } catch { freshness[file] = "unverified"; }
+        }
+      }
+      const root = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(run.profilePath))?.uri.fsPath ?? path.dirname(path.dirname(run.profilePath));
+      const summary = buildSummary({ profile: p, profilePath: run.profilePath, root, generatedAt: new Date().toISOString(),
+        generator: `python-memory-guardian ${this.ctx.extension?.packageJSON?.version ?? ""}`.trim(), freshness, staticDiagnostics,
+        thresholds: this.thresholds(), comparison: this.report.comparisonFor(run.index) });
+      fs.writeFileSync(run.summaryPath + ".tmp", JSON.stringify(summary, null, 1));
+      fs.renameSync(run.summaryPath + ".tmp", run.summaryPath);
+      this.summaryFailed = false;
+    } catch (e) {
+      if (!this.summaryFailed) void vscode.window.showWarningMessage(`Python Memory Guardian: could not write ${run.summaryPath}: ${e}`);
+      this.summaryFailed = true;
+    }
+  }
+
+  /** The profile was deleted: its summary would describe a profile that no longer exists. */
+  private profileDeleted(uri: vscode.Uri): void {
+    if (this.run && this.run.profilePath === uri.fsPath) {
+      if (this.summaryTimer) clearTimeout(this.summaryTimer);
+      try { fs.rmSync(this.run.summaryPath, { force: true }); } catch { /* already gone */ }
+      this.run = undefined;
+    }
+    this.clear();
+  }
+
   private clear(): void {
     this.index = undefined;
+    this.loaded = undefined;
     this.lastState.clear();
     this.report.update(undefined);
     this.runtime.clear();
@@ -194,6 +324,7 @@ export class ProfileView implements vscode.Disposable {
     // Servers publish [] on close; dropping it keeps full refreshes proportional to files with findings.
     if (diags.length) this.raw.set(uri.toString(), diags);
     else this.raw.delete(uri.toString());
+    if (this.run?.index.has(uri.fsPath)) this.scheduleSummary();
     const idx = this.index;
     if (!idx || !diags.length) return diags;
     const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString());
@@ -240,6 +371,7 @@ export class ProfileView implements vscode.Disposable {
     const key = doc.uri.toString();
     if (this.lastState.get(key) === state) return;
     this.lastState.set(key, state);
+    this.scheduleSummary();
     if (state !== "fresh") this.runtime.delete(doc.uri);
     this.refreshDiagnostics(doc.uri);
     this.report.refresh();
@@ -330,6 +462,7 @@ export class ProfileView implements vscode.Disposable {
   }
 
   dispose(): void {
+    if (this.summaryTimer) clearTimeout(this.summaryTimer);
     for (const d of this.disposables) d.dispose();
   }
 }

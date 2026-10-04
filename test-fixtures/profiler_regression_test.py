@@ -19,13 +19,13 @@ spec.loader.exec_module(profiler)
 
 
 class ProfileRegressions(unittest.TestCase):
-    def run_script(self, directory, source, memory='off', interval='0.01', monitoring='off'):
+    def run_script(self, directory, source, memory='off', interval='0.01', monitoring='off', frames='2'):
         script = directory / 'main.py'
         script.write_text(source)
         report = directory / 'profile.json'
         result = subprocess.run(
             [sys.executable, str(PROFILER), '--memory', memory, '--interval', interval,
-             '--monitoring', monitoring,
+             '--monitoring', monitoring, '--frames', frames,
              '--root', str(directory), '--out', str(report), str(script)],
             capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -157,6 +157,45 @@ class ProfileRegressions(unittest.TestCase):
             self.assertEqual(p.lines[call].traced_up, 12 * MB, 'the live copy is credited once to the call line')
             self.assertEqual(p.lines[call].transient, 0, 'a 6 MB in-call buffer is below 25% of 60 MB traced')
 
+    def test_snapshot_pause_is_not_charged_to_user_lines(self):
+        # A precise snapshot holds the GIL, so the user thread only waits for it. That pause is profiler
+        # overhead: the next sample must cover one interval, not interval + snapshot.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'precise')
+            p.rss, p.rss_kind = lambda: 0, None
+            clock = [0.0]
+            ident = profiler.threading.get_ident() + 1
+            p._clocks[ident] = lambda: 1.0                  # blocked: no CPU time while the snapshot runs
+            loc = (str(Path(tmp) / 'work.py'), 3)
+            sleeps = []
+
+            def sleep(seconds):
+                clock[0] += seconds
+                sleeps.append(True)
+                if len(sleeps) == 3:
+                    p._stop.set()
+
+            def snapshot(_t):
+                clock[0] += .5
+
+            MB = 1_000_000
+            with patch.object(profiler.time, 'sleep', side_effect=sleep), \
+                    patch.object(profiler.time, 'perf_counter', side_effect=lambda: clock[0]), \
+                    patch.object(profiler.time, 'process_time', return_value=0.0), \
+                    patch.object(profiler.sys, '_current_frames', return_value={ident: None}), \
+                    patch.object(p, '_walk', return_value=(loc, ('work', 1), ())), \
+                    patch.object(profiler.tracemalloc, 'get_traced_memory', return_value=(20 * MB, 20 * MB)), \
+                    patch.object(profiler.tracemalloc, 'reset_peak'), \
+                    patch.object(profiler.tracemalloc, 'is_tracing', return_value=True), \
+                    patch.object(profiler.tracemalloc, 'get_tracemalloc_memory', return_value=0), \
+                    patch.object(p, '_snapshot', side_effect=snapshot):
+                p._run()
+            self.assertIsNone(p.sampler_error)
+            self.assertGreater(p.snap_cost, .4, 'the first sample saw a 20 MB spike and snapshotted')
+            st = p.lines[loc]
+            self.assertEqual(st.samples, 3)
+            self.assertAlmostEqual(st.python_s + st.native_s + st.system_s + st.cpu_s, .03, places=6)
+
     def test_stack_samples_keep_thread_names(self):
         source = ('import threading, time\n'
                   'def busy_worker():\n'
@@ -171,6 +210,127 @@ class ProfileRegressions(unittest.TestCase):
             names = {s['thread_name'] for s in report['stacks']['samples']}
             self.assertIn('ingest-worker', names)
             self.assertLessEqual(names, {'MainThread', 'ingest-worker'}, 'thread names, not function names')
+
+    def test_memory_stacks_attribute_bytes_to_call_paths(self):
+        source = ('import time\n'
+                  'def leaf(n):\n'
+                  '    return [bytearray(1000) for _ in range(n)]\n'
+                  'class Svc:\n'
+                  '    def handle(self):\n'
+                  '        return leaf(20_000)\n'
+                  'keep = Svc().handle()\n'
+                  'time.sleep(0.6)\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self.run_script(Path(tmp), source, memory='precise', frames='4')
+        ms = report['memory_stacks']
+        self.assertEqual(ms['depth'], 4)
+        for name in ('peak', 'exit'):
+            table = ms[name]
+            self.assertEqual(sum(s['bytes'] for s in table['stacks']) + table['other_bytes'], table['total_bytes'],
+                             f'{name}: kept stacks plus other add up to the total')
+        self.assertLessEqual(ms['peak']['t'], ms['exit']['t'])
+        top = max(ms['exit']['stacks'], key=lambda s: s['bytes'])
+        names = [ms['frames'][i]['name'] for i in top['frames']]
+        expected = ['<module>', 'Svc.handle', 'leaf'] + (['leaf.<listcomp>'] if sys.version_info < (3, 12) else [])
+        self.assertEqual(names, expected, 'outermost first, named like the code objects the sampler records')
+        self.assertGreater(top['bytes'], 20_000_000)
+        handle = next(ms['frames'][i] for i in top['frames'] if ms['frames'][i]['name'] == 'Svc.handle')
+        self.assertEqual((handle['first_line'], handle['user']), (5, True), 'first line of the def, as co_firstlineno')
+
+    def test_memory_frame_names_match_code_objects(self):
+        source = ('import functools\n'                 # 1
+                  'def outer():\n'                    # 2
+                  '    def inner():\n'                # 3
+                  '        return 1\n'                # 4
+                  '    return inner\n'                # 5
+                  'class Svc:\n'                      # 6
+                  '    LIMIT = 3\n'                   # 7
+                  '    @functools.cache\n'            # 8
+                  '    def run(self):\n'              # 9
+                  '        f = lambda x: x\n'         # 10
+                  '        return f\n'                # 11
+                  'X = 1\n')                          # 12
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'mod.py'
+            path.write_text(source)
+            p = profiler.Profiler(tmp, .01, 'precise')
+            got = {line: p._function_at(str(path), line) for line in (4, 5, 7, 9, 10, 12)}
+            self.assertEqual(got, {4: ('outer.inner', 3), 5: ('outer', 2), 7: ('Svc', 6),
+                                   9: ('Svc.run', 8), 10: ('Svc.run.<lambda>', 10), 12: ('<module>', 1)})
+            self.assertEqual(p._function_at('<frozen importlib._bootstrap>', 5), ('', 5), 'no source: no name')
+            self.assertEqual(p._function_at(str(path), 10, enclosing=True), ('Svc.run', 8),
+                             'the caller of a lambda on the same line is the enclosing function')
+
+    def run_scripted_memory(self, levels_mb, book_bytes):
+        """Drive the sampler with scripted traced-memory levels; return traced MB at each snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'precise')
+            p.rss, p.rss_kind = lambda: 0, None
+            levels = iter([(mb * 1_000_000, mb * 1_000_000) for mb in levels_mb])
+            current, taken, sleeps = [0], [], []
+
+            def traced():
+                current[0] = next(levels)
+                return current[0]
+
+            def sleep(_):
+                sleeps.append(True)
+                if len(sleeps) == len(levels_mb):
+                    p._stop.set()
+
+            with patch.object(profiler.time, 'sleep', side_effect=sleep), \
+                    patch.object(profiler.sys, '_current_frames', return_value={}), \
+                    patch.object(profiler.tracemalloc, 'get_traced_memory', side_effect=traced), \
+                    patch.object(profiler.tracemalloc, 'reset_peak'), \
+                    patch.object(profiler.tracemalloc, 'is_tracing', return_value=True), \
+                    patch.object(profiler.tracemalloc, 'get_tracemalloc_memory', return_value=book_bytes), \
+                    patch.object(p, '_snapshot', side_effect=lambda _t: taken.append(current[0][0] / 1e6)):
+                p._run()
+            self.assertIsNone(p.sampler_error)
+            return taken, p
+
+    def test_peak_capture_snapshots_on_doubling_and_plateau(self):
+        # Gradual growth (no routine spike), a plateau at 17 MB for six samples, then release.
+        taken, p = self.run_scripted_memory([1, 5, 9, 13, 17, 17, 17, 17, 17, 17, 1], book_bytes=1_000_000)
+        self.assertEqual(taken, [9, 17], 'doubling at 9 MB, then the plateau at 17 MB, and nothing else')
+        self.assertEqual(p.peak_snapshots, 2)
+
+    def test_peak_capture_respects_its_budget(self):
+        taken, p = self.run_scripted_memory([1, 5, 9, 13, 17, 17, 17, 17, 17, 17, 1], book_bytes=10 ** 12)
+        self.assertEqual((taken, p.peak_snapshots), ([], 0), 'a predicted cost far over budget takes no snapshot')
+
+    def test_largest_objects_at_exit_by_holder(self):
+        source = ('BIG = bytearray(20_000_000)\n'
+                  'CACHE = {i: bytearray(100_000) for i in range(100)}\n'
+                  'small = [1, 2, 3]\n'
+                  'class Svc:\n'
+                  '    def __init__(self):\n'
+                  '        self.history = [bytearray(50_000) for _ in range(200)]\n'
+                  'class Opaque:\n'                      # stands in for a library that does not report its memory
+                  '    def __init__(self):\n'
+                  '        self._buffer = None\n'
+                  '    def __sizeof__(self):\n'
+                  '        return 64\n'
+                  'svc = Svc()\n'
+                  'opaque = Opaque()\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self.run_script(Path(tmp), source, memory='fast')
+        largest = report['largest_objects']
+        self.assertTrue(largest['complete'])
+        by = {o['holder']: o for o in largest['objects']}
+        self.assertEqual(by['global BIG']['type'], 'bytearray')
+        self.assertAlmostEqual(by['global BIG']['mb'], 20, delta=1)
+        self.assertEqual((by['global CACHE']['type'], by['global CACHE']['items']), ('dict', 100))
+        self.assertAlmostEqual(by['global CACHE']['mb'], 10, delta=1, msg='a container counts its items one level deep')
+        self.assertAlmostEqual(by['Svc.history']['mb'], 10, delta=1, msg='attributes of your own class instances')
+        self.assertNotIn('global small', by, 'under 1 MB is not listed')
+        self.assertNotIn('global opaque', by, 'an object reporting a tiny size is not claimed to be large')
+        self.assertEqual([o['holder'] for o in largest['objects']][:1], ['global BIG'], 'largest first')
+
+    def test_container_sizes_are_extrapolated_past_the_sample(self):
+        size, items, estimated = profiler.Profiler._sized([bytearray(1000) for _ in range(25_000)])
+        self.assertEqual((items, estimated), (25_000, True))
+        self.assertAlmostEqual(size / 25_000, 1000 + 57 + 8, delta=40)
 
     def test_sampler_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:

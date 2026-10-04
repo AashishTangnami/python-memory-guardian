@@ -2,7 +2,7 @@
   "name": "python-memory-guardian",
   "displayName": "Python Memory Guardian",
   "description": "Static + runtime analysis for CPython: flags heap inflation, RAM fragmentation, text inflation, memory swell and single-threaded stalls as you type, and measures per-line time (Python / native / system) and memory with a built-in low-overhead profiler.",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "publisher": "your-publisher-id",
   "license": "MIT",
   "engines": {
@@ -51,6 +51,10 @@
         "command": "pythonMemoryGuardian.visualizeReport",
         "title": "Python Memory Guardian: Visualize This Report",
         "icon": "$(graph)"
+      },
+      {
+        "command": "pythonMemoryGuardian.saveBaseline",
+        "title": "Python Memory Guardian: Save Profile as Baseline"
       },
       {
         "command": "pythonMemoryGuardian.toggleProfileOverlay",
@@ -198,7 +202,7 @@
     "vscode:prepublish": "npm run vendor:python && npm run compile",
     "package": "vsce package",
     "test": "npm run compile && npm run test:parity && npm run test:runtime",
-    "test:runtime": "node scripts/py.js test-fixtures/profiler_regression_test.py && node scripts/py.js test-fixtures/server_lifecycle_test.py && node scripts/py.js test-fixtures/profiler_test.py && node test-fixtures/test_model.js && node test-fixtures/test_report.js && node test-fixtures/test_report_entry.js && node test-fixtures/test_editor_events.js && node test-fixtures/test_extension_lifecycle.js && node test-fixtures/test_container.js",
+    "test:runtime": "node scripts/py.js test-fixtures/profiler_regression_test.py && node scripts/py.js test-fixtures/server_lifecycle_test.py && node scripts/py.js test-fixtures/profiler_test.py && node test-fixtures/test_model.js && node test-fixtures/test_report.js && node test-fixtures/test_compare.js && node test-fixtures/test_summary.js && node test-fixtures/test_report_entry.js && node test-fixtures/test_editor_events.js && node test-fixtures/test_extension_lifecycle.js && node test-fixtures/test_container.js",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node18 --sourcemap"
   },
   "dependencies": {

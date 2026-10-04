@@ -12,6 +12,7 @@ Use this map to trace a feature from its trigger to its result, implementation a
 | Why a profile fails to load or becomes stale | [Profile loading and freshness](#profile-loading-and-freshness) |
 | How line labels, runtime warnings and severity changes work | [Editor annotations and warnings](#editor-annotations-and-warnings) |
 | How report charts and source navigation work | [Reports and source navigation](#reports-and-source-navigation) |
+| What `.pmg/summary.json` contains and when it is written | [Run summary](#run-summary) |
 | Which Python or language server runs | [Interpreter and backend setup](#interpreter-and-backend-setup) |
 | How host and container paths connect | [Container execution](#container-execution) |
 | How resources reach the installed extension | [Build and packaging](#build-and-packaging) |
@@ -163,32 +164,37 @@ subgraph PROC[" "]
 | Responsibility | Files and symbols |
 |---|---|
 | Validate/save editor, choose mode, build argv and launch task | [profileView.ts](../src/profileView.ts#L85): `runProfiler`; [package.json](../package.json): profile settings |
-| Parse CLI arguments and execute target | [pmg_profile.py](../server/pmg_profile.py#L990): `main`, `runpy.run_path`, `finish` |
-| Sample stacks, time and RSS | [pmg_profile.py](../server/pmg_profile.py#L642): `Profiler.start`, `_run`/`_sample_loop`, `_walk`, `_code`, `_record_stack` |
-| Collect precise retention and possible holders | [pmg_profile.py](../server/pmg_profile.py#L593): `_snapshot`, `_leaks`, `_find_holders` |
-| Count optional line execution events | [pmg_profile.py](../server/pmg_profile.py#L229): `_enable_monitoring`, `_on_line_event` |
-| Finalize, bound timeline, verify source hashes and write JSON | [pmg_profile.py](../server/pmg_profile.py#L653): `stop`, `report`, `_remember_sources`, `_unchanged_source`, `_text_hash`; `main.finish` uses `os.replace` |
+| Parse CLI arguments and execute target | [pmg_profile.py](../server/pmg_profile.py#L1247): `main`, `runpy.run_path`, `finish` |
+| Sample stacks, time and RSS | [pmg_profile.py](../server/pmg_profile.py#L737): `Profiler.start`, `_run`/`_sample_loop`, `_walk`, `_code`, `_record_stack` |
+| Collect precise retention and possible holders | [pmg_profile.py](../server/pmg_profile.py#L668): `_snapshot`, `_leaks`, `_find_holders` |
+| Snapshot memory per traceback; name frames; capture the peak | [pmg_profile.py](../server/pmg_profile.py#L668): `_snapshot` (one append per trace, C-level `sum()` per traceback), `_memory_stacks`, `_function_at`, `_sample_loop` (plateau and doubling triggers) |
+| Count optional line execution events | [pmg_profile.py](../server/pmg_profile.py#L267): `_enable_monitoring`, `_on_line_event` |
+| Finalize, bound timeline, verify source hashes and write JSON | [pmg_profile.py](../server/pmg_profile.py#L748): `stop`, `report`, `_remember_sources`, `_unchanged_source`, `_text_hash`; `main.finish` uses `os.replace` |
 
 **Important branches and limits**
 
 | Mode | Collected memory evidence |
 |---|---|
-| `fast` | Sampled process RSS growth attributed to Python lines |
-| `precise` | `tracemalloc` allocation, held memory, retention trends and bounded holder search |
+| `fast` | Sampled process RSS growth attributed to Python lines: charged where memory is first written; RSS rarely falls after frees (pymalloc keeps arenas until every block in them is free) |
+| `precise` | `tracemalloc` (every Python object allocation, not memory C extensions take from `malloc` directly): net traced growth per line (`alloc`), held memory, retention trends, bounded holder search, and peak/exit allocation stacks (`memory_stacks`) |
 | `off` / time only | Memory omitted from line labels and heat; process RSS fields still recorded |
 
 - The editor requires a saved Python file and saves dirty text before prompting. Invalid editors warn; save failure or Quick Pick cancellation launches no task. The `memoryMode` setting supplies placeholder text; the actual selected item supplies the CLI mode.
 - Timing is sampled per thread and classified as Python, native, waiting or unsplit where clocks/GIL signals permit. Native timing is estimated at Python call sites; native stacks are not captured. Each sample walks a thread's frames once (`_walk`): the innermost user frame gives line attribution, and the frames from the outermost user call to the active frame (at most 128) become the stack, keyed by interned code ids so the sampler hashes small ints; `report` decodes them into frame records, merged by content.
 - `profile.frames` / `--frames` controls precise traceback depth (1–64). `profile.monitoring=lines` / `--monitoring lines` uses Python 3.12+ `sys.monitoring` for line-event counts and records why activation failed when unavailable. Timing remains sampled. `_on_line_event` returns `sys.monitoring.DISABLE` for library and stdlib lines, turning LINE events off at that location for this tool after one event, and resolves user paths once per file name; user lines keep exact counts.
-- The CLI also accepts `--root`, `--out`, `--interval` and target-script arguments.
+- The CLI also accepts `--root`, `--out`, `--interval` and target-script arguments. `report` records how the run started as `run`: the script's own arguments, the UTC start time and `sys.platform`; [compareModel.ts](../src/compareModel.ts) uses it to warn when compared runs differ.
+- A snapshot holds the GIL, so user threads only wait while it runs. `_sample_loop` restarts its wall and process clocks after each snapshot, so that pause is not charged to the next sampled line (it remains in `wall_s` and `snapshot_cost_s`). Before this, 2.1 s of snapshots in a `generators.py` run put 0.5 s of waiting time on a generator that takes 0.04 s.
 - Precise leak detection requires at least four snapshots in the run (including the exit snapshot), at least three trailing snapshot increases without an intervening decrease, and at least 1 MiB retained at exit (`_leaks`). A run too short for four snapshots reports no suspected leaks; its retention cards can still appear in the report. Holder search is bounded; it provides possible references, not a complete ownership graph.
+- Each snapshot sums bytes per allocation traceback. The loop runs while `tracemalloc` traces it, so each trace only appends a reference to its existing size object and `sum()` totals each traceback in C (about 9x faster than adding in Python, which created one traced integer per trace); per-line `held` totals and the memory-stack tables derive from those sums. The bytes-per-traceback tables of the snapshot where user lines held the most and of the latest snapshot are kept; `_memory_stacks` writes them as `memory_stacks.peak` and `.exit`, at most 20,000 stacks each (the rest summed as `other_bytes`), outermost frame first, trimmed to start at the outermost user frame like time stacks, and flagged when `tracemalloc` cut the traceback. `_function_at` names frames from source (`co_qualname`-style names and decorator-adjusted first lines, inline-scope callers resolved from the traceback, comprehension scopes before 3.12, a 2 s parse budget) so time and memory frames share an identity.
+- Peak capture: routine snapshots stay within 10% of elapsed time. A plateau snapshot is taken when the running maximum of traced memory has not risen 1% for five samples, is still within 10% of it, and is 25% and 5 MB above any captured high (budget: the elapsed time, at least 2 s); a doubling snapshot whenever traced memory is twice the captured high (budget: half the elapsed time, at least 1 s). `peak_snapshots` and `peak_snapshot_cost_s` report them. Cost is predicted from `tracemalloc` bookkeeping at 8 ns/byte (measured 5–8), refined only from snapshots with at least 8 MB of bookkeeping and clamped to 4–20 ns. `tracemalloc.reset_peak()` runs after each snapshot so its own objects do not inflate the traced peak.
+- At exit, in fast and precise modes, `_largest_objects` lists up to 20 objects of at least 1 MB still referenced by `__main__` or user-module globals or by attributes of user-class instances, within a 1 s budget (`complete` says whether it finished). Sizes come from `sys.getsizeof`, so each library's `__sizeof__` decides; builtin containers add their items one level deep, extrapolated past 10,000 items (`estimated`). Measured: NumPy, pandas and PyArrow report their buffers exactly; Polars reports only its wrapper.
 - `stop` adds a post-script RSS/traced-memory sample; `report` retains the endpoint while bounding the timeline to 300 points. During the run, `_record_timeline` keeps at most `TIMELINE_CAP` (600) evenly spaced samples, halving the keep rate each time it fills, so the profiler's own memory stays constant instead of growing with run length and being charged to user lines. RSS is read once per sample; `rss_max` tracks every sample, so `rss_peak_mb` and `native_untraced_mb` include spikes that thinning drops from the timeline. It also emits line/function data, stack samples, source metadata and verified hashes.
 - Normal exit, `SystemExit`, `KeyboardInterrupt` and script exceptions all attempt finalization. Non-daemon threads can defer it through `atexit`. Failure during setup or report writing can prevent output.
 - If the script stops `tracemalloc` (for example an interpreter probe or a memory test), `_precise` records `memory_tracing_lost_s` and precise collection ends: no further snapshots, traced-memory samples or exit leak/holder search, and `report` emits no `leak_runs`. Time sampling and RSS continue and the profile is still written. A `stop()` followed by `start()` between two samples is not detected.
 - `_run` wraps the sampling loop: an unexpected sampler exception is recorded as `sampler_error` and ends sampling instead of killing the thread silently; finalization still writes the profile.
 - Container task staging and path arguments are described under [Container execution](#container-execution).
 
-**Tests:** [profiler_test.py](../test-fixtures/profiler_test.py) and [profiler_regression_test.py](../test-fixtures/profiler_regression_test.py) cover measurements, retention, monitoring and output; [test_model.js](../test-fixtures/test_model.js) checks consumed line-event data; [test_report.js](../test-fixtures/test_report.js) checks diagnosis from precise evidence. `test_script_stopping_tracemalloc_keeps_profile` and `test_sampler_failure_is_reported` cover lost tracing and sampler failure; `test_timeline_memory_is_bounded_and_evenly_spaced` and `test_rss_peak_survives_timeline_thinning` cover the timeline bound; `test_monitoring_disables_library_lines_and_counts_user_lines` covers the line-event callback; `test_single_walk_attributes_line_and_stack` covers the single stack walk; `test_gil_holding_call_result_is_credited_once_to_its_line` checks, without real scheduling, that a GIL-holding C call's live result is credited once to its line and that small in-call buffers stay below the spike threshold; [test_model.js](../test-fixtures/test_model.js) checks the new fields' validation and notes.
+**Tests:** [profiler_test.py](../test-fixtures/profiler_test.py) and [profiler_regression_test.py](../test-fixtures/profiler_regression_test.py) cover measurements, retention, monitoring and output; [test_model.js](../test-fixtures/test_model.js) checks consumed line-event data; [test_report.js](../test-fixtures/test_report.js) checks diagnosis from precise evidence. `test_script_stopping_tracemalloc_keeps_profile` and `test_sampler_failure_is_reported` cover lost tracing and sampler failure; `test_timeline_memory_is_bounded_and_evenly_spaced` and `test_rss_peak_survives_timeline_thinning` cover the timeline bound; `test_monitoring_disables_library_lines_and_counts_user_lines` covers the line-event callback; `test_single_walk_attributes_line_and_stack` covers the single stack walk; `test_memory_stacks_attribute_bytes_to_call_paths` and `test_memory_frame_names_match_code_objects` cover memory stacks and frame naming (run on Python 3.9 and 3.13), `test_peak_capture_snapshots_on_doubling_and_plateau` and `test_peak_capture_respects_its_budget` cover peak capture, `test_largest_objects_at_exit_by_holder` and `test_container_sizes_are_extrapolated_past_the_sample` cover largest objects, `test_snapshot_pause_is_not_charged_to_user_lines` checks with a scripted clock that a 0.5 s snapshot adds nothing to line time, and `test_gil_holding_call_result_is_credited_once_to_its_line` checks, without real scheduling, that a GIL-holding C call's live result is credited once to its line and that small in-call buffers stay below the spike threshold; [test_model.js](../test-fixtures/test_model.js) checks the new fields' validation and notes.
 
 [Back to navigation](#start-here)
 
@@ -220,8 +226,8 @@ flowchart TD
 |---|---|
 | Discover/watch profiles and refresh on Python edits | [profileView.ts](../src/profileView.ts#L43): constructor, `PROFILE_GLOB` |
 | Select a saved JSON file or receive an editor URI | [profileView.ts](../src/profileView.ts#L139): `openSavedReport`, `visualizeReport`; [package.json](../package.json): `visualizeReport` command and editor/title menu |
-| Read, validate, replace index and update consumers | [profileView.ts](../src/profileView.ts#L155): `load`; [profileModel.ts](../src/profileModel.ts#L67): `parseProfile`, `ProfileIndex` |
-| Normalize paths and compare current text with recorded hashes | [profileModel.ts](../src/profileModel.ts#L57): `normPath`, `textHash`, `ProfileIndex.state` |
+| Read, validate, replace index and update consumers | [profileView.ts](../src/profileView.ts#L155): `load`; [profileModel.ts](../src/profileModel.ts#L79): `parseProfile`, `ProfileIndex` |
+| Normalize paths and compare current text with recorded hashes | [profileModel.ts](../src/profileModel.ts#L69): `normPath`, `textHash`, `ProfileIndex.state` |
 | Rewrite container paths before indexing | [containerPaths.ts](../src/containerPaths.ts#L72): `remapProfileKeys`, `toLocal` |
 | Clear loaded evidence and report state | [profileView.ts](../src/profileView.ts#L182): `clear` |
 
@@ -263,9 +269,9 @@ flowchart TD
 | Responsibility | Files and symbols |
 |---|---|
 | Store raw findings, check freshness and adjust severity | [profileView.ts](../src/profileView.ts#L193): `adjust`, `refreshDiagnostics` (all files, or only the edited one), `onEdit`, `docState`, `forget` |
-| Classify heat and format diagnostic evidence | [profileModel.ts](../src/profileModel.ts#L204): `heat`, `memoryMb`, `adjustSeverity`, `evidence`, `ProfileIndex.insideSampledFunction` |
+| Classify heat and format diagnostic evidence | [profileModel.ts](../src/profileModel.ts#L229): `heat`, `memoryMb`, `adjustSeverity`, `evidence`, `ProfileIndex.insideSampledFunction` |
 | Render decorations, runtime diagnostics and status | [profileView.ts](../src/profileView.ts#L270): `render`, `thresholds` |
-| Format line/function totals and leak advice | [profileModel.ts](../src/profileModel.ts#L231): `lineLabel`, `funcLabel`, `leakMessage`, `unattributedNote` |
+| Format line/function totals and leak advice | [profileModel.ts](../src/profileModel.ts#L256): `lineLabel`, `funcLabel`, `leakMessage`, `unattributedNote` |
 | Register overlay and clear controls | [profileView.ts](../src/profileView.ts#L43): constructor; `pythonMemoryGuardian.toggleProfileOverlay` and `pythonMemoryGuardian.clearProfile` |
 
 **Important branches and limits**
@@ -292,7 +298,7 @@ flowchart TD
 
 The webview presents an Overview, precise-memory diagnosis and a time-weighted Stack Explorer. It can display historical measurements when source is stale, but source navigation requires verified current text.
 
-**Trigger:** `pythonMemoryGuardian.showReport`, `pythonMemoryGuardian.openSavedReport`, `pythonMemoryGuardian.visualizeReport`, status click, or automatic opening after a profiling task's next valid load. **Result:** interactive charts, evidence cards, stack filters and verified source navigation.
+**Trigger:** `pythonMemoryGuardian.showReport`, `pythonMemoryGuardian.openSavedReport`, `pythonMemoryGuardian.visualizeReport`, status click, or automatic opening after a profiling task's next valid load; `pythonMemoryGuardian.saveBaseline` for baselines. **Result:** interactive charts, evidence cards, stack filters, run comparisons and verified source navigation.
 
 **Render and filter**
 
@@ -311,6 +317,28 @@ subgraph EXT[" "]
     Models -->|return view data| Bridge
     Bridge -->|post report| Panel
     Panel -->|filter metric / thread| Bridge
+```
+
+**Save a baseline and compare**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+subgraph WEB[" "]
+      Tab("Webview<br/>Compare tab")
+    end
+    subgraph EXT[" "]
+      Save("Extension host<br/>Save as baseline")
+      Report("Report controller<br/>Compare")
+      Model("compareProfiles")
+    end
+    Tab -->|saveBaseline| Save
+    Save -->|loaded JSON + git commit| File("Baseline JSON<br/>.pmg/baselines")
+    File -->|read, validate, remap| Report
+    Tab -->|compare / compareFile| Report
+    Report -->|baseline + current| Model
+    Model -->|deltas, warnings, notes| Report
+    Report -->|comparison or error| Tab
 ```
 
 **Navigate to source**
@@ -347,24 +375,84 @@ flowchart TD
 | Responsibility | Files and symbols |
 |---|---|
 | Register report commands and update after valid loads | [profileView.ts](../src/profileView.ts#L43): constructor, `openSavedReport`, `visualizeReport`, `load`, `showNextReport` |
-| Create/reveal panel and exchange messages | [reportView.ts](../src/reportView.ts#L23): `GuardianReport.show`, `update`, `refresh` |
+| Create/reveal panel and exchange messages | [reportView.ts](../src/reportView.ts#L37): `GuardianReport.show`, `update`, `refresh` |
 | Project bounded timeline and top sampled lines | [reportModel.ts](../src/reportModel.ts#L17): `overview` |
-| Classify retention and suggest checks | [reportModel.ts](../src/reportModel.ts#L51): `diagnose`, `recommendations` |
-| Aggregate sampled stacks by time metric and thread; label frame origins | [reportModel.ts](../src/reportModel.ts#L148): `callTree` (views `all`/`grouped`/`mine`), `frameOrigin` |
+| Classify retention and suggest checks, for the whole run or a time window | [reportModel.ts](../src/reportModel.ts#L59): `diagnose`, `diagnoseWindow`, `recommendations` |
+| Aggregate sampled stacks by time metric and thread; label frame origins | [reportModel.ts](../src/reportModel.ts#L210): `callTree` (views `all`/`grouped`/`mine`, `inverted`; node limit keeps the stack prefix and counts the rest as `omitted`), `frameOrigin` |
+| Rank functions across call paths; callers and callees of one function | [reportModel.ts](../src/reportModel.ts#L342): `topFunctions`, `neighbors`, `functionKey` |
 | Render charts, cards, filters and source controls | [reportWebview.ts](../src/reportWebview.ts#L2): `reportHtml`, `memoryChart`, `overview` |
-| Validate requested location and current source before opening | [reportView.ts](../src/reportView.ts#L23): `GuardianReport.show` message handler, `fresh` |
+| Save the loaded profile as a baseline | [profileView.ts](../src/profileView.ts#L208): `saveBaseline`, `baselineDir`, `parse`; [compareModel.ts](../src/compareModel.ts#L356): `baselineFileName` |
+| List baselines, load the selected one, compare and cache | [reportView.ts](../src/reportView.ts#L54): `baselinesChanged`, `listBaselines`, `compare`, `bounded` |
+| Match runs, compute deltas, variation, context and warnings | [compareModel.ts](../src/compareModel.ts#L187): `compareProfiles`, `timeNoise`, `memoryNoise`, `enclosingName`, `baselineMeta` |
+| Render the Compare tab | [reportWebview.ts](../src/reportWebview.ts#L200): `compareView`, `deltaTable` |
+| Validate requested location and current source before opening | [reportView.ts](../src/reportView.ts#L37): `GuardianReport.show` message handler, `fresh` |
 
 **Important branches and limits**
 
 - Overview shows run metrics, bounded RSS/traced-memory timeline and top sampled-line bars. Time-only mode hides the memory chart. `timeline` and `rss_kind` come from the profiler through schema validation.
 - Only precise profiles produce memory cards (`growing`, `retained`, `released`) and recommendations. Editor leak text and report recommendations are separate consumers of the same evidence.
 - Stack Explorer aggregates Python call stacks, including library frames, by elapsed/Python/native/system/unsplit time and thread. Missing stacks leave it empty. Sampled time across threads may exceed run duration; widths are aggregated time, not chronological order or allocation weights. `callTree` sends only the stack frames its nodes reference, renumbered in node order, and the webview skips drawing the explorer while its tab is hidden. `frameOrigin` classifies each sent frame from its path alone (so older reports work too) as your code, an installed package (`site-packages`/`dist-packages`), the standard library, or Python internals (frozen import machinery, `<string>`, generated code), with a plain label such as `Python import system` or `pandas (installed package)`. The webview colors boxes by that kind (one hue per package) with a legend, shows durations in ms below one second, and its details line gives origin, total, share of sampled time and whether the time was spent in the function or its callees; the raw `file:line` stays in the tooltip, and search also matches origin labels. A **Frames** control picks the `callTree` view: `grouped` (the report's default) merges each run of consecutive non-user frames with the same origin into one box such as `Python import system · 8 frames`, showing a run that holds one distinct function as that function; `all` keeps every frame (the function's default); `mine` keeps only user frames, so library and internal time becomes self time of the nearest calling user frame. Total and self time are the same in every view. The controller validates the view in `filter` messages.
-- `ready` requests a refresh; `filter` selects metric/thread; `open` requests navigation. The controller validates message shape, metric and report-listed locations. Producer/consumer payload changes must stay coordinated.
+- Stack Explorer stays legible at scale: the webview draws boxes in pixels and merges children narrower than 40 px into one striped `+N smaller calls` box per caller (its details list them, each zoomable); a box shows text only when at least 56 px wide; it draws 12 levels below the zoom point, marking deeper boxes with ▸; a breadcrumb shows the zoom path; **Hottest path** follows the biggest callee while it carries at least 5% of the starting time and the caller does not spend more in itself, then highlights the chain. At the 25,000-node limit `callTree` keeps the part of a stack already in the tree and counts the rest as `omitted` on the deepest node shown, drawn as a striped "beyond display limit" box, so upper levels keep their full time.
+- In precise mode the Measure list adds **Memory at peak snapshot** and **Memory held at exit** (`mem_peak`, `mem_exit`): `callTree`, `topFunctions` and `neighbors` read the memory-stack table instead of time samples (one internal stack source), values show in bytes, frames without a recoverable name show as `line N`, and the thread filter is disabled because memory stacks are not per thread. The notice states the traceback depth and truncation, the snapshot's time and total, and warns when the traced peak exceeds the snapshot total by 50%.
+- **Direction** sets `callTree`'s `inverted` option. Bottom-up first maps every frame to one representative per function (`functionKey`), so a function reached from several lines is one box pointing at its first line, then reverses each display path: the top level is where time was spent or memory allocated (it equals each function's self value in Top functions, for time and memory measures) and the boxes below are callers. Frames views apply before the reversal. The details line says how much of the top function's value was reached through each caller chain.
+- **Time windows:** in precise mode, dragging across the Overview memory chart posts `window` (`{from, to}` in elapsed seconds, or `{clear: true}`); the controller validates it, resets it when a new profile loads, and recomputes `diagnose(profile, window)`. A windowed diagnosis uses only each line's retention points inside the window: its highest point there, the value at its last point in the window, rises and releases within it (growing needs three trailing rises), and cites exit holders only when the window reaches the last snapshot. Lines without points in the window get no card. The Memory tab shows the window with a **Show whole run** button. Retention points are per line (at most 60 per line); memory stacks are not windowed.
+- **Native estimate (precise mode):** `nativeMb` is a line's or function's RSS growth beyond its traced growth, for any C extension. It appears as `native ≈` in line and function labels, counts toward heat, fills the Top functions **Native ≈** column (user functions) and the Overview's top-line memory, and the run-level `native_untraced_mb` shows as an Overview card. It inherits RSS's limits: charged where memory is first written, rarely falling.
+- The Memory diagnosis tab lists `largest_objects` (holder, type, size, items) in both memory modes and explains that libraries which do not report their memory appear under `native ≈` instead.
+- **Top functions** (`topFunctions`) ranks up to 200 functions, identified by file, first line and name, summed across call paths: self time (innermost frame), total time (counted once per stack, so recursion is not doubled), distinct calling functions, and function-level memory from `functions` for user functions only (precise: largest of held, spike and allocated; fast: RSS growth). It follows the measure, thread and `mine` view. Selecting a row highlights the function in the chart and posts `neighbors`; the controller answers with `neighbors` (callers and callees merged across call paths, each counted once per stack). Source opening also accepts a profiled user frame's first line.
+- **Baselines:** `saveBaseline` asks for a name (letters, digits, `.`, `-`, `_`; confirms before replacing), reads `git rev-parse HEAD` and `git status --porcelain --untracked-files=no` in the workspace folder (either may be null), adds a `baseline` block (`name`, `saved_at`, `git_commit`, `git_dirty`) to the loaded profile's JSON as written (container paths unmapped) and writes `<workspace folder>/.pmg/baselines/<name>.json` atomically. A baseline is still a valid profile, so it can also be opened as a report. The profile watcher (`**/.pmg/profile.json`) ignores the folder.
+- **Compare tab:** the controller lists `.pmg/baselines/*.json` (newest first) on each refresh, accepts `compare` only for a listed name (or `''` to stop) and `compareFile` through an open dialog, reads and validates the file once per modification time through the same `parseProfile` and container remapping as `load`, and recomputes `compareProfiles` once per loaded profile, so a new run compares against the selected baseline automatically. The payload keeps the 300 largest function and line changes and 100 sites, with totals. Unreadable files show `compareError`.
+- **Matching:** files are keyed relative to each profile's script folder (so another checkout matches); functions by file and qualified name, with generator expressions, lambdas and comprehensions merged into their enclosing function (`enclosingName`), because samples and allocations move between them from run to run (measured: 1.2 vs 25.4 MB on one of a pair of identical runs, the same 27.1 MB in total). A line belongs to the function its `func_line` names, or its source `scope` when never sampled. Lines match by number when both runs recorded the same file hash; otherwise by function plus assignments and calls when that signature is unique in the function in both runs, else by offset from the function's first line (from `functions`, time stacks or memory stacks). Module-level lines in a changed file stay unmatched and are counted. Memory-stack sites are the innermost user frame of each stack; a site missing from a table held 0 bytes there.
+- **Variation and verdicts:** each value gets `better`, `worse`, `same` (within variation), `new`, `gone` or `context`. Thresholds come from three identical runs each of `generators.py` in fast and precise mode: time uses the counting error of each value's samples, 2·√(t₁²/n₁ + t₂²/n₂), at least 10% (precise mode slows the sampler, so one line had 0.54 s from 6 samples and 0.61 s from 2); traced memory 1 MB or 15% (held at the peak snapshot moved 47.3–52.0 MB); RSS growth and the native estimate 10 MB or 20% (8.8 MB swings on small functions); run duration 10%. A line's change counts only when its function's total changed in the same measure (`shifted` otherwise; 24 MB moved between two lines of identical runs). On those runs no function, line, site or run value was marked better or worse; the thresholds were set on the same runs. A row is `significant` when a measure got better or worse, a leak appeared or went, or a new or removed row has a value beyond its variation.
+- **Context:** when the largest peak site differs between runs, held-at-peak changes become `context` with a note: the peak moved, so functions there rise without changing (measured: 0 → 27 MB on an unchanged function after the code that peaked was fixed). When peak RSS fell beyond variation, RSS and native increases become `context` (and decreases when it rose): memory freed earlier stays resident for reuse, so later code can show growth it did not show before (measured: 0 → 73 MB). Warnings cover different scripts, arguments, Python versions, platforms, memory modes (only common measures are compared), traceback depths and sampling intervals, and a GIL difference.
+- `ready` requests a refresh; `filter` selects metric/thread; `open` requests navigation; `compare`, `compareFile` and `saveBaseline` drive the Compare tab. The controller validates message shape, metric and report-listed locations. Producer/consumer payload changes must stay coordinated.
 - Navigation accepts a profiled line or user stack-frame location only if its source hash is fresh; freshness is checked again after opening the document. Stale, unavailable or unverified source warns. Historical measurements remain visible with freshness warnings.
 - Opening a report with no loaded profile shows an information message.
 - `runProfiler` sets `showNextReport` before task execution; a valid `load` clears it and opens the report. If the task fails or its JSON is invalid, a later valid watcher load can still auto-open the report. This is a specific lifecycle coupling.
 
-**Tests:** [test_report.js](../test-fixtures/test_report.js) covers report projection, diagnosis, call trees (including frame origins and the three frame views, with conserved totals), path remapping and webview script syntax; [test_report_entry.js](../test-fixtures/test_report_entry.js) checks the JSON editor URI and validation path; [profiler_test.py](../test-fixtures/profiler_test.py) checks produced report data. Navigation guards are supported by source inspection.
+**Tests:** [test_report.js](../test-fixtures/test_report.js) covers report projection, diagnosis, call trees (including frame origins, the three frame views, and the node limit, with conserved totals), top functions and callers/callees, the memory measures (table totals, nameless frames, thread filter, validation), the bottom-up view (top level equals self values; callers below; one box per function), and windowed diagnosis (window peak and end, holders only when the window reaches exit), path remapping and webview script syntax; [test_compare.js](../test-fixtures/test_compare.js) covers matching across a 5-line shift, a line inserted inside a function and a different checkout folder, exact deltas and thresholds, generator-expression merging, identical files matched by line, attribution moving between lines, comparability warnings, peak-moved context and baseline names; [test_report_entry.js](../test-fixtures/test_report_entry.js) checks the JSON editor URI and validation path; [profiler_test.py](../test-fixtures/profiler_test.py) checks produced report data. Navigation guards are supported by source inspection.
+
+[Back to navigation](#start-here)
+
+### Run summary
+
+After each profiling run, the extension writes a machine-readable summary, `.pmg/summary.json`, beside the run's `.pmg/profile.json`, so scripts and agents can use the results without reading the report. Format `pmg-summary/1`, described by [pmg-summary.schema.json](pmg-summary.schema.json).
+
+**Trigger:** a valid load of any `.pmg/profile.json` (the profiling task's output in fast, precise or time-only mode, or that file found at startup); rewritten when its inputs change. Opening another saved JSON or a baseline does not replace it. **Result:** `.pmg/summary.json`, written atomically; deleting the profile deletes it.
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+subgraph EXT[" "]
+      Load("Extension host<br/>Run profile loaded")
+      Wait("Wait 500 ms")
+      Build("buildSummary")
+    end
+    Load -->|.pmg/profile.json only| Wait
+    Inputs("Static findings,<br/>freshness, baseline") -->|change: restart wait| Wait
+    Wait -->|profile, freshness,<br/>findings, comparison| Build
+    Build -->|atomic write| Out("summary.json<br/>beside profile.json")
+    Build -->|write fails: warn once| Warn("Warning message")
+```
+
+**Implementation**
+
+| Responsibility | Files and symbols |
+|---|---|
+| Recognize a run profile, schedule and write the summary, delete it with the profile | [profileView.ts](../src/profileView.ts#L257): `load`, `scheduleSummary`, `writeSummary`, `profileDeleted`; rescheduled from `adjust`, `onEdit` and the report's `BaselineSource.changed` |
+| Build the summary from the profile and the report models | [summaryModel.ts](../src/summaryModel.ts): `buildSummary`, `methods`, `memoryStacks`, `nextSteps`; uses `diagnose` ([reportModel.ts](../src/reportModel.ts)) and `Comparison` ([compareModel.ts](../src/compareModel.ts)) |
+| Comparison for the summarized profile | [reportView.ts](../src/reportView.ts): `GuardianReport.comparisonFor` |
+| Contract | [pmg-summary.schema.json](pmg-summary.schema.json) |
+
+**Important branches and limits**
+
+- Sections: `run` (script, Python, platform, arguments, start time, mode, interval, samples, traceback depth, incomplete-evidence notes from `runNotes`), `methods` (time and, per mode, traced/process/native measurement method and limits), `totals` (each a value with unit, method and limits; values the mode does not measure are omitted), `functions` and `lines` (your code: the top 20 by sampled time plus the top 20 by memory, with samples and per-mode memory fields), `memory_stacks` (precise: the peak and exit tables by innermost user function and the 10 largest stacks), `retention` (precise: `diagnose` findings with evidence, holders and recommendations), `largest_objects`, `static_diagnostics`, `source` (hash and current freshness per file), `comparison` (when a baseline is selected in the Compare tab: run rows and significant functions with baseline, current, change, variation and verdict) and `next_steps`.
+- Traceability: profile values are copied unchanged (only values derived from bytes, shares and the native estimate are rounded to 0.001); `functions` and `lines` keep the profile's own names, so a generator expression is its own row (the comparison merges them). Paths are relative to the workspace folder (or the folder containing `.pmg`) when inside it.
+- Static findings come from the language client's diagnostic collection, so they carry the profile's severity adjustment and evidence prefix. Both language servers analyze only open documents, so only open profiled files have findings; the others are listed in `static_diagnostics.limits`. Each finding states whether its line was `hot`, `cold` or `unknown` in this run (`heat` with the configured thresholds), or `source changed` when the file is no longer fresh.
+- Freshness uses the per-version document hash for open files and reads closed files from disk (`unverified` when unreadable). `next_steps` puts a re-run first when any file is stale; it also covers a time-only or fast run (re-run in a memory mode), growing retention, static findings on hot lines, at least 1 MB never reaching user code within the traceback depth (not mere truncation, which nearly every stack has at the default depth), functions with fewer than 10 samples, and saving a baseline or checking comparison warnings.
+- Rewrites are debounced (500 ms) and triggered by static findings for profiled files, freshness transitions and a changed baseline selection. A write failure warns once until a write succeeds.
+- Not implemented: a summary from the standalone profiler (`pmg_profile.py --summary`); the interpretation (diagnosis, native estimate, comparison) exists only in TypeScript.
+
+**Tests:** [test_summary.js](../test-fixtures/test_summary.js) validates summaries built from the profiles the profiler tests write (precise, fast, and a leak with holders) against the schema with a small validator that rejects unknown keywords, checks that function, line and total values equal the profile's, that every section has a method and limits, static findings' measured heat and the stale case, the comparison section, and that the schema rejects extra sections and another format; [test_editor_events.js](../test-fixtures/test_editor_events.js) checks that loading a `.pmg/profile.json` writes the summary after the delay with the open file's static finding, and that deleting the profile removes it.
 
 [Back to navigation](#start-here)
 
@@ -497,7 +585,7 @@ subgraph CONT[" "]
 - Probe and profiler intentionally share mapping/prefix helpers. The language server remains launched from the extension host.
 - `toContainer` throws on an unmapped outbound path: the probe falls back to neutral facts, while profiler setup reports an error.
 - `toLocal` leaves unmapped inbound paths unchanged. If they differ from host paths, source lookup/freshness can miss.
-- `remapProfileKeys` rewrites script, file/function keys, source hashes and stack-frame paths. Changes to profile path fields must update this contract.
+- `remapProfileKeys` rewrites script, file/function keys, source hashes, time stack-frame paths and memory-stack frame paths ([test_container.js](../test-fixtures/test_container.js) checks both); baselines and compared files go through the same remapping. Changes to profile path fields must update this contract.
 
 **Tests:** [test_container.js](../test-fixtures/test_container.js) simulates an exec prefix with a path alias and mapped paths; it does not launch Docker.
 
@@ -586,11 +674,13 @@ Feature sections own their detailed code/test mappings. This table identifies th
 | Commands and settings | [package.json](../package.json) | [extension.ts](../src/extension.ts), [profileView.ts](../src/profileView.ts), build/install scripts |
 | Interpreter facts: `initializationOptions.profile` | [probe.py](../server/probe.py) via `probeInterpreter` | Python/Rust initialization and message renderers |
 | Diagnostic codes and text | [messages.json](../server/messages.json), Python/Rust analyzers | LSP handlers, `ProfileView.adjust` and editor diagnostics |
-| Profile schema 2/3, modes, timeline and measurements | [pmg_profile.py](../server/pmg_profile.py#L832): `Profiler.report` | [profileModel.ts](../src/profileModel.ts#L32): `Profile`/`parseProfile`; editor and report models |
-| Source identity: `file_hashes` and normalized text | [pmg_profile.py](../server/pmg_profile.py#L327): `_text_hash`, verified source | [profileModel.ts](../src/profileModel.ts#L63): `textHash`/`ProfileIndex.state`; report navigation |
+| Profile schema 2/3, modes, timeline, measurements, `memory_stacks`, `largest_objects` and `run` | [pmg_profile.py](../server/pmg_profile.py#L1084): `Profiler.report` | [profileModel.ts](../src/profileModel.ts#L32): `Profile`/`parseProfile`; editor, report and comparison models |
+| Run summary `pmg-summary/1`: `.pmg/summary.json` beside a run's `.pmg/profile.json` | [summaryModel.ts](../src/summaryModel.ts): `buildSummary`, written by `ProfileView.writeSummary`; [pmg-summary.schema.json](pmg-summary.schema.json) | Scripts and agents outside the extension; [test_summary.js](../test-fixtures/test_summary.js) validates it against the schema |
+| Baseline files: a profile plus a `baseline` block, in `.pmg/baselines/<name>.json` | [profileView.ts](../src/profileView.ts#L208): `saveBaseline` | [reportView.ts](../src/reportView.ts#L73): `compare`; [compareModel.ts](../src/compareModel.ts#L347): `baselineMeta` |
+| Source identity: `file_hashes` and normalized text | [pmg_profile.py](../server/pmg_profile.py#L365): `_text_hash`, verified source | [profileModel.ts](../src/profileModel.ts#L75): `textHash`/`ProfileIndex.state`; report navigation |
 | Host/container paths | [containerPaths.ts](../src/containerPaths.ts), container settings | Probe/task argv, profile loader, source identity |
-| Runtime retention: `leak_runs`, `held_by`, trends | [pmg_profile.py](../server/pmg_profile.py#L754): `_leaks`/`_find_holders`/`report` | `leakMessage` in [profileModel.ts](../src/profileModel.ts); `diagnose`/`recommendations` in [reportModel.ts](../src/reportModel.ts) |
-| Webview `report`/`clear` and `ready`/`filter`/`open` messages | [reportView.ts](../src/reportView.ts) ↔ [reportWebview.ts](../src/reportWebview.ts) | Report rendering, filters and validated navigation |
+| Runtime retention: `leak_runs`, `held_by`, trends | [pmg_profile.py](../server/pmg_profile.py#L926): `_leaks`/`_find_holders`/`report` | `leakMessage` in [profileModel.ts](../src/profileModel.ts); `diagnose`/`recommendations` in [reportModel.ts](../src/reportModel.ts) |
+| Webview `report` (including `baselines`, `compareWith`, `comparison`, `compareError`)/`clear`/`neighbors` and `ready`/`filter` (metric, thread, frames, inverted)/`open`/`neighbors`/`window`/`compare`/`compareFile`/`saveBaseline` messages | [reportView.ts](../src/reportView.ts) ↔ [reportWebview.ts](../src/reportWebview.ts) | Report rendering, filters and validated navigation |
 
 **When changing a contract**
 
@@ -601,6 +691,7 @@ Feature sections own their detailed code/test mappings. This table identifies th
 - **Source identity:** coordinate Python and TypeScript hash algorithms. A normalization mismatch suppresses editor evidence and report navigation.
 - **Paths:** update outbound mapping and every inbound profile path field. Missing outbound mappings error; unmatched inbound paths can prevent freshness matches.
 - **Webview payloads:** update both message producers/consumers and extension validation together.
+- **Run summary:** a field added to or renamed in the summary needs the same change in [pmg-summary.schema.json](pmg-summary.schema.json) (its top level rejects unknown sections). A profile field the summary copies keeps its value; consumers rely on that to trace numbers back to `profile.json`.
 - **Commands/settings or packaging:** keep manifest IDs, registrations, argv and resource lookup paths consistent. The local installer derives version/output path from the manifest. The language servers report their own version at initialization: Rust uses `CARGO_PKG_VERSION` from [Cargo.toml](../rust-server/Cargo.toml) and Python uses the `LanguageServer` constructor in [guardian_server.py](../server/guardian_server.py); neither reads `package.json`, so a release bumps all three.
 - **Task/report lifecycle:** review `showNextReport` set/clear paths; failed tasks or invalid loads can leave automatic opening pending for a later valid profile.
 
@@ -613,9 +704,11 @@ Local imports are acyclic in this checkout. Runtime refresh/message loops are di
 | Module | Local imports |
 |---|---|
 | [extension.ts](../src/extension.ts) | `profileView`, `containerPaths` |
-| [profileView.ts](../src/profileView.ts) | `profileModel`, `containerPaths`, `reportView` |
-| [reportView.ts](../src/reportView.ts) | `profileModel`, `reportModel`, `reportWebview` |
+| [profileView.ts](../src/profileView.ts) | `profileModel`, `containerPaths`, `compareModel`, `summaryModel`, `reportView` |
+| [reportView.ts](../src/reportView.ts) | `profileModel`, `reportModel`, `compareModel`, `reportWebview` |
 | [reportModel.ts](../src/reportModel.ts) | `profileModel` |
+| [compareModel.ts](../src/compareModel.ts) | `profileModel` |
+| [summaryModel.ts](../src/summaryModel.ts) | `profileModel`, `reportModel`, `compareModel` (type only) |
 | [guardian_server.py](../server/guardian_server.py) | `_vendor`, `probe`, `rules` |
 | [rules.py](../server/rules.py) | `_vendor` |
 | [pmg_profile.py](../server/pmg_profile.py) | No local server-module imports |
@@ -631,22 +724,28 @@ The extension uses `vscode-languageclient` to communicate with the selected lang
 | Automatic quick fixes or code actions | Diagnostic text recommends changes, but no code-action provider, `WorkspaceEdit`, or fix command is registered in `src`, `server`, or `rust-server/src/main.rs`. |
 | Automatic environment/interpreter discovery | `src/extension.ts` `interpreter` uses the explicit setting or `python3`/`python` fallback. It does not query the VS Code Python extension or scan virtual environments. `server/probe.py` measures whichever executable was selected. |
 | Allocation-stack graph and native stack/heap attribution | `server/pmg_profile.py` records line-level traced memory and Python call-stack **time** samples; `src/reportModel.ts` `callTree` weights time metrics only. The [planned completion criteria](#planned-completion-criteria) list memory-weighted allocation stacks and native visibility as planned. |
-| Cross-run comparison and agent telemetry contract | A single loaded `ProfileIndex` and one `.pmg/profile.json` path are used by `ProfileView`; no comparison view or telemetry export command exists. These are roadmap items. |
+| Memory budgets; summary from the standalone CLI | Runs can be compared in the report's Compare tab and each profiling run writes `.pmg/summary.json` (see [Run summary](#run-summary)), but no CLI budget option or `pmg_profile.py --summary` exists. These are roadmap items. |
 | General task provider | `package.json` declares the `pmg-profile` task type and `runProfiler` creates a task, but no `registerTaskProvider` implementation exists. |
 
 ### Planned completion criteria
 
 These criteria describe proposed work, not current app behavior. The current Stack Explorer weights sampled Python call stacks by time. Precise memory evidence is attributed to lines, and native timing is estimated at a Python call site; the app does not unwind C/C++ stacks or attribute native heap allocations.
 
-| Planned capability | Completion criterion |
-|---|---|
-| Memory-weighted stack graph | Precise-mode allocation tracebacks produce peak-held and end-held MB views. A diagnosis opens the relevant stack; displayed totals reconcile with captured snapshots, and missing or truncated attribution is visible. |
-| Native C-extension visibility | Show supported native call stacks and native allocation evidence with their platform and collection limits. Keep estimated Python-site timing distinct from measured native frames and memory. |
-| Cross-run diffing | Save and select a baseline, align source and stack identities, and show changes in held memory, growth, allocation sites, and time alongside workload and environment metadata. |
-| Agent-ready telemetry | Export a versioned, machine-readable report with evidence, source identity, measurement method, confidence and limits, and suggested verification steps, without requiring agents to scrape webview text. |
-| End-to-end verification | Move from a finding to a candidate fix and a repeat run in VS Code, with a comparison showing whether retention improved under the same workload. |
+| Planned capability | Completion criterion | Reference |
+|---|---|---|
+| Memory-weighted stack graph | **Implemented:** Memory at peak snapshot and Memory held at exit measures, with peak capture. Remaining: a Memory diagnosis card opens its allocation stacks in the Stack Explorer. | Memray's default flame graph shows memory alive at peak; `--leaks` shows memory never freed. |
+| Inverted (callers-first) view | **Implemented** as the Stack Explorer's Direction control (bottom-up), for time and memory measures; tests check that its top level equals Top functions' self values. | Memray `--inverted`. |
+| Time-window memory analysis | **Implemented** for line-level retention: dragging on the Overview memory chart narrows Memory diagnosis to the window. Remaining: windowed memory stacks, which would need allocation stacks from more than the peak and exit snapshots. | Memray `--temporal` flame graphs with time sliders. |
+| Allocator-aware RSS guidance | Where fast-mode RSS evidence is shown, explain that RSS grows where memory is first written and stays high while pymalloc arenas still hold any live object, and point to precise mode, which tracks Python objects directly. Do not offer `PYTHONMALLOC=malloc`: measured on macOS/CPython 3.13 it was about 33% slower on small objects and returned none of their memory after a full free, while pymalloc returned almost all of it. | Memray's notes on pymalloc and resident vs heap memory. Memray's `PYTHONMALLOC=malloc` advice is about what Memray's allocator hooks can observe, which does not apply to `tracemalloc`. |
+| Memory budgets for tests and CI | A test or CLI option fails a run whose peak or retained memory exceeds a stated budget, reporting the measurement method and the top allocation sites. It builds on the machine-readable report below. | `pytest-memray` with `@pytest.mark.limit_memory(...)`. |
+| Native C-extension visibility | **Implemented, library-agnostic:** a per-line native estimate (RSS growth beyond traced growth) and largest live objects sized by `sys.getsizeof`. **Not adopting Memray as a backend:** on `examples/profiling-workloads` it reported 1,073.8 MB for an 8 MB PyArrow array (mimalloc reserves a 1 GiB region and Memray counts the reservation), attributed 1,555.8 MB of Polars memory to no stack (native worker threads), peaked at 1.42 GB and 1.60 GB against 360 MB and 406 MB of RSS, and runs only on Linux and macOS. Per-library counters (such as `pyarrow.total_allocated_bytes()`) are exact but do not scale across libraries and were not added. Remaining: native call stacks. | Memray `run --native`. |
+| Cross-run diffing | **Implemented:** Save Profile as Baseline and the Compare tab: functions matched by file and name, lines by hash, signature or offset, per-function and per-line time and memory deltas, memory stacks by allocating function, run-to-run variation thresholds, context for a moved peak, and environment and argument warnings. Remaining: compare time stacks (call paths), and compare runs whose script moved to another file. | |
+| Agent-ready telemetry | **Implemented in the editor:** each profiling run writes `.pmg/summary.json` (`pmg-summary/1`, [schema](pmg-summary.schema.json)) with evidence, static findings for open files, source identity, measurement method and limits, a comparison when a baseline is selected, and next steps. Remaining: a summary from the standalone profiler for CI and terminals, which first needs a way to run the profiler outside VS Code. | |
+| End-to-end verification | Move from a finding to a candidate fix and a repeat run in VS Code, with a comparison showing whether retention improved under the same workload. The comparison exists (Compare tab); the step from a finding to a fix does not. | |
 
-The intended priority is memory-stack attribution and leak diagnosis, then interactive exploration, native visibility, cross-run diffing, and telemetry. New measurements should expose their source and limits so sampled or inferred data is not presented as proof of ownership or causality.
+[Memray](https://github.com/bloomberg/memray) is a reference for several of these items. It traces every allocation and measures memory only, on Linux and macOS; this extension samples time and memory, works in the editor alongside static analysis, and runs on Windows too. Ideas are adopted only where they fit that design, and their implementation here is independent.
+
+The intended priority is memory-stack attribution and leak diagnosis (memory-weighted stacks, allocator-aware guidance), then interactive exploration (inverted view, time windows), native visibility, cross-run diffing with memory budgets, and telemetry. New measurements should expose their source and limits so sampled or inferred data is not presented as proof of ownership or causality.
 
 ## Verification and limits
 
@@ -655,6 +754,6 @@ This map describes the current `package.json`, `src`, `server`, `rust-server/src
 - Rust startup requires `bin/guardian-server[.exe]`. The build output is under `rust-server/target/release` and requires placement at the installed lookup path. Parity tests can exercise the release binary directly.
 - Container tests simulate an exec prefix and mapped paths; they do not start Docker.
 - UI flows are supported by source inspection and model/entry/lifecycle tests, rather than an automated VS Code-host integration run.
-- Local file/heading links, Mermaid block structure, edge labels and styling JSON were checked. All 16 diagrams were rendered with Mermaid 11.17.2 and headless Chrome at 720 px and 480 px column widths. All fit a 720 px column at 18 px type except the system overview (727 px wide, about 17.8 px). In the 480 px check the smallest scaled type was about 12 px in the overview and at least 13.7 px elsewhere. Edge-label bounds were checked against each other and against nodes, with no overlaps detected; rounded corners, bordered arrow labels and the decision diamonds were inspected in rendered screenshots. The unspecified Markdown viewer may use a different Mermaid version or override styling.
+- Local file/heading links, Mermaid block structure, edge labels and styling JSON were checked. The 16 earlier diagrams were rendered with Mermaid 11.17.2 and headless Chrome at 720 px and 480 px column widths; the "Save a baseline and compare" and "Run summary" diagrams were rendered the same way at 720 px only (both fit, with no overlapping labels). All fit a 720 px column at 18 px type except the system overview (727 px wide, about 17.8 px). In the 480 px check the smallest scaled type was about 12 px in the overview and at least 13.7 px elsewhere. Edge-label bounds were checked against each other and against nodes, with no overlaps detected; rounded corners, bordered arrow labels and the decision diamonds were inspected in rendered screenshots. The unspecified Markdown viewer may use a different Mermaid version or override styling.
 
 [Back to navigation](#start-here)

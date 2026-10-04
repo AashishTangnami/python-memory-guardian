@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/AashishTangnami/python-memory-guardian/docs/pmg-summary.schema.json",
+  "title": "Python Memory Guardian profile summary (pmg-summary/1)",
+  "description": "Written to .pmg/summary.json after each profiling run. Every value comes from the profile in profile.path; each section states its measurement method and limits. Paths are relative to the project folder when inside it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "generated_at", "generator", "profile", "run", "methods", "totals", "functions", "lines",
+    "memory_stacks", "retention", "largest_objects", "static_diagnostics", "source", "comparison", "next_steps"],
+  "properties": {
+    "format": { "const": "pmg-summary/1" },
+    "generated_at": { "type": "string" },
+    "generator": { "type": "string" },
+    "profile": {
+      "type": "object", "required": ["path", "schema"],
+      "properties": { "path": { "type": "string" }, "schema": { "type": "integer" } }
+    },
+    "run": {
+      "type": "object",
+      "required": ["script", "python", "platform", "argv", "started_at", "memory_mode", "interval_s", "samples", "traceback_frames", "gil_split", "incomplete"],
+      "properties": {
+        "script": { "type": "string" },
+        "python": { "type": "string" },
+        "platform": { "type": ["string", "null"] },
+        "argv": { "type": ["array", "null"], "items": { "type": "string" } },
+        "started_at": { "type": ["string", "null"] },
+        "memory_mode": { "enum": ["fast", "precise", "off"] },
+        "interval_s": { "type": ["number", "null"] },
+        "samples": { "type": ["integer", "null"] },
+        "traceback_frames": { "type": ["integer", "null"] },
+        "gil_split": { "type": "boolean" },
+        "incomplete": { "type": "array", "items": { "type": "string" }, "description": "Conditions that make part of the evidence incomplete (tracing stopped, sampler failed)." }
+      }
+    },
+    "methods": {
+      "type": "object", "required": ["time", "memory"],
+      "properties": {
+        "time": { "$ref": "#/$defs/method" },
+        "memory": {
+          "type": ["object", "null"],
+          "properties": { "traced": { "$ref": "#/$defs/method" }, "process": { "$ref": "#/$defs/method" }, "native_estimate": { "$ref": "#/$defs/method" } }
+        }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "description": "Run-level values; a value the run's mode does not measure is omitted.",
+      "additionalProperties": { "$ref": "#/$defs/measured" },
+      "properties": {
+        "run_duration_s": { "$ref": "#/$defs/measured" }, "process_cpu_s": { "$ref": "#/$defs/measured" },
+        "peak_traced_mb": { "$ref": "#/$defs/measured" }, "held_at_exit_mb": { "$ref": "#/$defs/measured" },
+        "native_estimate_mb": { "$ref": "#/$defs/measured" }, "rss_peak_mb": { "$ref": "#/$defs/measured" },
+        "unattributed_peak_mb": { "$ref": "#/$defs/measured" }
+      }
+    },
+    "functions": {
+      "type": "array", "description": "Your functions: the top 20 by sampled time and the top 20 by memory, ordered by time.",
+      "items": {
+        "type": "object",
+        "required": ["name", "file", "line", "end_line", "samples", "time_s", "share", "python_s", "native_s", "system_s"],
+        "properties": {
+          "name": { "type": "string" }, "file": { "type": "string" }, "line": { "type": "integer" },
+          "end_line": { "type": ["integer", "null"] }, "samples": { "type": "integer", "minimum": 0 },
+          "time_s": { "type": "number" }, "share": { "type": "number" },
+          "python_s": { "type": "number" }, "native_s": { "type": "number" }, "system_s": { "type": "number" },
+          "allocated_mb": { "type": "number" }, "held_at_peak_mb": { "type": "number" }, "spike_mb": { "type": "number" },
+          "native_estimate_mb": { "type": "number" }, "rss_growth_mb": { "type": "number" }
+        }
+      }
+    },
+    "lines": {
+      "type": "array", "description": "Lines of your code: the top 20 by sampled time and the top 20 by memory, ordered by time.",
+      "items": {
+        "type": "object", "required": ["file", "line", "scope", "samples", "time_s", "share"],
+        "properties": {
+          "file": { "type": "string" }, "line": { "type": "integer" }, "scope": { "type": ["string", "null"] },
+          "samples": { "type": "integer", "minimum": 0 }, "time_s": { "type": "number" }, "share": { "type": "number" },
+          "allocated_mb": { "type": "number" }, "held_at_peak_mb": { "type": "number" }, "spike_mb": { "type": "number" },
+          "native_estimate_mb": { "type": "number" }, "rss_growth_mb": { "type": "number" },
+          "suspected_leak": { "const": true }, "held_at_exit_mb": { "type": "number" }, "line_events": { "type": "integer" }
+        }
+      }
+    },
+    "memory_stacks": {
+      "type": ["object", "null"], "description": "Precise mode only.",
+      "required": ["method", "limits", "peak", "exit"],
+      "properties": {
+        "method": { "type": "string" }, "limits": { "$ref": "#/$defs/limits" },
+        "peak": { "anyOf": [{ "$ref": "#/$defs/stackTable" }, { "type": "null" }] },
+        "exit": { "$ref": "#/$defs/stackTable" }
+      }
+    },
+    "retention": {
+      "type": ["object", "null"], "description": "Precise mode only.",
+      "required": ["method", "limits", "findings"],
+      "properties": {
+        "method": { "type": "string" }, "limits": { "$ref": "#/$defs/limits" },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["file", "line", "scope", "status", "held_at_exit_mb", "largest_snapshot_mb", "evidence", "holders", "recommendations"],
+            "properties": {
+              "file": { "type": "string" }, "line": { "type": "integer" }, "scope": { "type": "string" },
+              "status": { "enum": ["growing", "retained", "released"] },
+              "held_at_exit_mb": { "type": "number" }, "largest_snapshot_mb": { "type": "number" },
+              "evidence": { "$ref": "#/$defs/strings" }, "holders": { "$ref": "#/$defs/strings" }, "recommendations": { "$ref": "#/$defs/strings" }
+            }
+          }
+        }
+      }
+    },
+    "largest_objects": {
+      "type": ["object", "null"],
+      "required": ["method", "limits", "objects"],
+      "properties": {
+        "method": { "type": "string" }, "limits": { "$ref": "#/$defs/limits" },
+        "objects": {
+          "type": "array",
+          "items": {
+            "type": "object", "required": ["holder", "type", "mb", "items", "estimated"],
+            "properties": { "holder": { "type": "string" }, "type": { "type": "string" }, "mb": { "type": "number" },
+              "items": { "type": ["integer", "null"] }, "estimated": { "type": "boolean" } }
+          }
+        }
+      }
+    },
+    "static_diagnostics": {
+      "type": "object", "required": ["method", "limits", "findings"],
+      "properties": {
+        "method": { "type": "string" }, "limits": { "$ref": "#/$defs/limits" },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object", "required": ["file", "line", "code", "severity", "message", "measured"],
+            "properties": {
+              "file": { "type": "string" }, "line": { "type": "integer" }, "code": { "type": "string" },
+              "severity": { "enum": ["error", "warning", "information", "hint"] }, "message": { "type": "string" },
+              "measured": { "enum": ["hot", "cold", "unknown", "source changed"] }
+            }
+          }
+        }
+      }
+    },
+    "source": {
+      "type": "object", "required": ["method", "files"],
+      "properties": {
+        "method": { "type": "string" },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object", "required": ["file", "sha1", "freshness"],
+            "properties": { "file": { "type": "string" }, "sha1": { "type": ["string", "null"] },
+              "freshness": { "enum": ["fresh", "stale", "unverified"] } }
+          }
+        }
+      }
+    },
+    "comparison": {
+      "type": ["object", "null"], "description": "Present when a baseline is selected in the report's Compare tab.",
+      "required": ["baseline", "baseline_meta", "warnings", "notes", "method", "run", "functions"],
+      "properties": {
+        "baseline": { "type": "string" },
+        "baseline_meta": { "type": ["object", "null"] },
+        "warnings": { "$ref": "#/$defs/strings" }, "notes": { "$ref": "#/$defs/strings" }, "method": { "type": "string" },
+        "run": { "type": "array", "items": { "allOf": [{ "$ref": "#/$defs/delta" }, { "type": "object", "required": ["measure", "unit"],
+          "properties": { "measure": { "type": "string" }, "unit": { "enum": ["s", "MB"] } } }] } },
+        "functions": {
+          "type": "array",
+          "items": {
+            "type": "object", "required": ["name", "file", "line", "baseline_line", "time_s", "leak"],
+            "properties": {
+              "name": { "type": "string" }, "file": { "type": "string" },
+              "line": { "type": ["integer", "null"] }, "baseline_line": { "type": ["integer", "null"] },
+              "time_s": { "$ref": "#/$defs/delta" }, "allocated_mb": { "$ref": "#/$defs/delta" }, "held_at_peak_mb": { "$ref": "#/$defs/delta" },
+              "held_at_exit_mb": { "$ref": "#/$defs/delta" }, "native_estimate_mb": { "$ref": "#/$defs/delta" }, "rss_growth_mb": { "$ref": "#/$defs/delta" },
+              "leak": { "enum": ["new", "gone", "both", null] }
+            }
+          }
+        }
+      }
+    },
+    "next_steps": { "$ref": "#/$defs/strings" }
+  },
+  "$defs": {
+    "strings": { "type": "array", "items": { "type": "string" } },
+    "limits": { "type": "array", "items": { "type": "string" }, "description": "What this evidence cannot show. Always present; may be empty." },
+    "method": {
+      "type": "object", "required": ["method", "limits"],
+      "properties": { "method": { "type": "string" }, "limits": { "$ref": "#/$defs/limits" } }
+    },
+    "measured": {
+      "type": "object", "additionalProperties": false, "required": ["value", "unit", "method", "limits"],
+      "properties": { "value": { "type": "number" }, "unit": { "enum": ["s", "MB", "count"] },
+        "method": { "type": "string" }, "limits": { "$ref": "#/$defs/limits" } }
+    },
+    "delta": {
+      "type": "object", "required": ["baseline", "current", "change", "variation", "verdict"],
+      "properties": {
+        "baseline": { "type": ["number", "null"] }, "current": { "type": ["number", "null"] },
+        "change": { "type": "number" }, "variation": { "type": "number", "description": "Run-to-run variation; a change within it is \"same\"." },
+        "verdict": { "enum": ["better", "worse", "same", "new", "gone", "context"] }
+      }
+    },
+    "stackTable": {
+      "type": "object", "required": ["t_s", "total_mb", "other_mb", "truncated", "by_function", "top_stacks"],
+      "properties": {
+        "t_s": { "type": "number" }, "total_mb": { "type": "number" }, "other_mb": { "type": "number" }, "truncated": { "type": "boolean" },
+        "by_function": {
+          "type": "array",
+          "items": { "type": "object", "required": ["function", "file", "line", "mb"],
+            "properties": { "function": { "type": "string" }, "file": { "type": "string" }, "line": { "type": "integer" }, "mb": { "type": "number" } } }
+        },
+        "top_stacks": {
+          "type": "array",
+          "items": { "type": "object", "required": ["mb", "truncated", "frames"],
+            "properties": { "mb": { "type": "number" }, "truncated": { "type": "boolean" }, "frames": { "$ref": "#/$defs/strings" } } }
+        }
+      }
+    }
+  }
+}

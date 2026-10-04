@@ -1,5 +1,5 @@
 /** Native report data: profile overview, retention diagnosis and weighted Python call trees. */
-import { LineEntry, Profile, StackFrame } from './profileModel';
+import { LineEntry, nativeMb, Profile, StackFrame, StackSample } from './profileModel';
 
 export interface OverviewLine {
   file: string; line: number; timeS: number; share: number; memory: string;
@@ -7,6 +7,8 @@ export interface OverviewLine {
 
 export interface ReportOverview {
   cpuS: number | null; samples: number | null;
+  /** precise mode: process memory the Python allocator never saw (C extensions), run-level estimate. */
+  nativeUntracedMb: number | null;
   rssKind: 'current' | 'peak' | null;
   rssStartMb: number | null; rssEndMb: number | null; rssPeakMb: number | null;
   tracedPeakMb: number | null; timeline: [number, number, number][];
@@ -23,7 +25,8 @@ export function overview(profile: Profile): ReportOverview {
       if (profile.memory_mode === 'precise') {
         if (e.leak_runs) memory = `${(e.end_mb ?? 0).toFixed(1)} MB held`;
         else if ((e.peak_mb ?? 0) >= 1) memory = `${e.peak_mb!.toFixed(1)} MB at peak`;
-        else if ((e.alloc_mb ?? 0) >= 1) memory = `${e.alloc_mb!.toFixed(1)} MB allocated`;
+        else if ((e.alloc_mb ?? 0) >= nativeMb(e) && (e.alloc_mb ?? 0) >= 1) memory = `${e.alloc_mb!.toFixed(1)} MB allocated`;
+        else if (nativeMb(e) >= 1) memory = `native ≈ +${nativeMb(e).toFixed(1)} MB`;
       } else if (profile.memory_mode === 'fast' && e.rss_growth_mb >= 1) {
         memory = `RSS +${e.rss_growth_mb.toFixed(1)} MB`;
       }
@@ -35,6 +38,7 @@ export function overview(profile: Profile): ReportOverview {
   const stride = Math.max(1, Math.ceil(points.length / 299));
   return {
     cpuS: profile.cpu_s ?? null, samples: profile.samples ?? null, rssKind: profile.rss_kind ?? null,
+    nativeUntracedMb: profile.memory_mode === 'precise' ? profile.native_untraced_mb ?? null : null,
     rssStartMb: profile.rss_start_mb ?? null, rssEndMb: profile.rss_end_mb ?? null,
     rssPeakMb: profile.rss_peak_mb ?? null, tracedPeakMb: profile.peak_traced_mb ?? null,
     timeline: points.filter((_, i) => i % stride === 0 || i === points.length - 1),
@@ -48,8 +52,17 @@ export interface Diagnosis {
   points: [number, number][]; holders: string[];
 }
 
-export function diagnose(profile: Profile): Diagnosis[] {
+/** A time range on the run, in elapsed seconds. */
+export interface TimeWindow { from: number; to: number; }
+
+/**
+ * Memory diagnosis, for the whole run or one time window. A window uses only each line's retention
+ * snapshots inside it: the peak there, what was held at its end, and rises and releases within it.
+ * Holders are only collected at exit, so they are cited only when the window reaches the last snapshot.
+ */
+export function diagnose(profile: Profile, window?: TimeWindow): Diagnosis[] {
   if (profile.memory_mode !== 'precise') return [];
+  if (window) return diagnoseWindow(profile, window);
   const out: Diagnosis[] = [];
   for (const [file, lines] of Object.entries(profile.files)) {
     for (const [line, e] of Object.entries(lines)) {
@@ -73,6 +86,39 @@ export function diagnose(profile: Profile): Diagnosis[] {
   }
   const order = { growing: 0, retained: 1, released: 2 };
   return out.sort((a, b) => order[a.status] - order[b.status] || b.endMb - a.endMb || b.peakMb - a.peakMb);
+}
+
+function diagnoseWindow(profile: Profile, w: TimeWindow): Diagnosis[] {
+  const out: Diagnosis[] = [];
+  const s = (t: number) => `${t.toFixed(2)} s`;
+  for (const [file, lines] of Object.entries(profile.files)) {
+    for (const [line, e] of Object.entries(lines)) {
+      const all = e.retention?.points ?? [];
+      const inside = all.filter(([t]) => t >= w.from && t <= w.to);
+      if (!inside.length) continue;
+      const peakMb = Math.max(...inside.map(([, mb]) => mb));
+      const endMb = inside[inside.length - 1][1];
+      if (Math.max(peakMb, endMb) < 1) continue;
+      let rises = 0, releases = 0, trailing = 0;
+      for (let i = 1; i < inside.length; i++) {
+        if (inside[i][1] > inside[i - 1][1]) { rises++; trailing++; }
+        else if (inside[i][1] < inside[i - 1][1]) { releases++; trailing = 0; }
+      }
+      const status: Diagnosis['status'] = trailing >= 3 && endMb >= 1 ? 'growing' : endMb >= 1 ? 'retained' : 'released';
+      const reachesEnd = inside[inside.length - 1][0] >= all[all.length - 1][0];
+      const evidence = [
+        `Between ${s(w.from)} and ${s(w.to)}: ${peakMb.toFixed(1)} MB at the highest snapshot, ${endMb.toFixed(1)} MB held at the last one (${s(inside[inside.length - 1][0])}).`,
+        `${inside.length} snapshots in this window: ${rises} increases, ${releases} decreases.`];
+      if (status === 'growing') evidence.push(`${trailing} increases at the end of the window without a decrease.`);
+      const holders = reachesEnd ? (e.held_by ?? []).map(h => `${h.holder} (${h.type}, ${h.items} items; ${h.matching} sampled matches)`) : [];
+      if (holders.length) evidence.push('Holders below were found at exit, which this window includes. The scan is bounded and is not a complete ownership graph.');
+      else if (!reachesEnd && status !== 'released') evidence.push('Holders are only searched at exit, which is outside this window.');
+      out.push({ file, line: Number(line), scope: e.scope ?? 'Module', status, endMb, peakMb, evidence, holders,
+        recommendations: recommendations(e, status), points: inside });
+    }
+  }
+  const order = { growing: 0, retained: 1, released: 2 };
+  return out.sort((a, b) => order[a.status] - order[b.status] || b.peakMb - a.peakMb || b.endMb - a.endMb);
 }
 
 function recommendations(e: LineEntry, status: Diagnosis['status']): string[] {
@@ -140,14 +186,42 @@ export function frameOrigin(f: StackFrame): FrameOrigin {
   return { kind: 'library', label: `${base} (outside your project)`, detail: '' };
 }
 
-export type CallMetric = 'elapsed' | 'python' | 'native' | 'system' | 'unsplit';
-export interface CallNode { id: number; parent: number; frame: number; value: number; self: number; children: number[]; }
+export type CallMetric = 'elapsed' | 'python' | 'native' | 'system' | 'unsplit' | 'mem_peak' | 'mem_exit';
+export const isMemoryMetric = (metric: CallMetric) => metric === 'mem_peak' || metric === 'mem_exit';
+
+/** The stacks a measure weighs: time samples, or a memory-stack table (bytes, no thread). */
+function stackSource(profile: Profile, metric: CallMetric, thread: string): { frames: StackFrame[]; samples: { frames: number[]; weight: number }[] } {
+  if (isMemoryMetric(metric)) {
+    const ms = profile.memory_stacks, table = metric === 'mem_peak' ? ms?.peak : ms?.exit;
+    return { frames: ms?.frames ?? [], samples: (table?.stacks ?? []).map(s => ({ frames: s.frames, weight: s.bytes })) };
+  }
+  return { frames: profile.stacks?.frames ?? [], samples: (profile.stacks?.samples ?? [])
+    .filter(s => !thread || s.thread === thread).map(s => ({ frames: s.frames, weight: sampleWeight(s, metric) })) };
+}
+
+/** Frames without a recoverable function name (frozen or compiled code) are shown by line. */
+const shownName = (f: StackFrame) => f.name || `line ${f.line}`;
+
+function sampleWeight(sample: StackSample, metric: CallMetric): number {
+  if (metric === 'elapsed') return sample.python_s + sample.native_s + sample.system_s + sample.unsplit_s;
+  return metric === 'mem_peak' || metric === 'mem_exit' ? 0 : sample[`${metric}_s`];
+}
+/** value = self + omitted + children's values. omitted: deeper calls cut off by the node limit, still counted here. */
+export interface CallNode { id: number; parent: number; frame: number; value: number; self: number; omitted: number; children: number[]; }
 export interface CallTree { nodes: CallNode[]; frames: ReportFrame[]; omitted: number; }
 
 /** Add each sampled stack once; parent time includes descendants, self time does not. */
 export function callTree(profile: Profile, metric: CallMetric, thread = '', limit = 25000,
-                         view: FrameView = 'all'): CallTree {
-  const all = profile.stacks?.frames ?? [];
+                         view: FrameView = 'all', inverted = false): CallTree {
+  const source = stackSource(profile, metric, thread), all = source.frames;
+  // Inverted (bottom-up): each function where time or memory is spent sits at the top, its callers below.
+  // Frames are merged by function first, so a function reached from several lines is one box and the top
+  // level equals each function's self value in topFunctions.
+  const canon: number[] = [];
+  if (inverted) {
+    const first = new Map<string, number>();
+    all.forEach((f, id) => { const k = functionKey(f); if (!first.has(k)) first.set(k, id); canon[id] = first.get(k)!; });
+  }
   const origins = new Map<number, FrameOrigin>();
   const originOf = (id: number) => {
     let o = origins.get(id);
@@ -157,6 +231,10 @@ export function callTree(profile: Profile, metric: CallMetric, thread = '', limi
   // A sample's display path. Steps that share a key under the same parent merge into one node;
   // a group step carries the frames it stands for.
   const path = (ids: number[]): { key: string; ids: number[] }[] => {
+    const steps = pathOf(inverted ? ids.map(id => canon[id]) : ids);
+    return inverted ? steps.reverse() : steps;
+  };
+  const pathOf = (ids: number[]): { key: string; ids: number[] }[] => {
     if (view === 'mine') ids = ids.filter(id => all[id].user);   // callee time stays in the nearest user frame
     if (view !== 'grouped') return ids.map(id => ({ key: `f${id}`, ids: [id] }));
     const steps: { key: string; ids: number[] }[] = [];
@@ -169,33 +247,26 @@ export function callTree(profile: Profile, metric: CallMetric, thread = '', limi
     }
     return steps;
   };
-  const nodes: CallNode[] = [{ id: 0, parent: -1, frame: -1, value: 0, self: 0, children: [] }];
+  const nodes: CallNode[] = [{ id: 0, parent: -1, frame: -1, value: 0, self: 0, omitted: 0, children: [] }];
   const members: Set<number>[] = [new Set()];          // profile frame ids each node stands for
   const edges = new Map<string, number>();
   let omitted = 0;
-  for (const sample of profile.stacks?.samples ?? []) {
-    if (thread && sample.thread !== thread) continue;
-    const weight = metric === 'elapsed' ? sample.python_s + sample.native_s + sample.system_s + sample.unsplit_s
-      : sample[`${metric}_s`];
+  for (const sample of source.samples) {
+    const weight = sample.weight;
     if (weight <= 0 || !sample.frames.length) continue;
     const steps = path(sample.frames);
-    // Refuse the complete sample if its missing suffix would exceed the limit.
-    let probe = 0, missing = 0;
-    for (const step of steps) {
-      const child = edges.get(`${probe}:${step.key}`);
-      if (missing || child == null) missing++;
-      else probe = child;
-    }
-    if (nodes.length + missing > limit) { omitted += weight; continue; }
-    let parent = 0;
+    // At the node limit, keep the part of the stack already in the tree and count the rest as omitted
+    // on the deepest node shown, so upper levels never lose time.
+    let parent = 0, cut = false;
     nodes[0].value += weight;
     for (const step of steps) {
       const key = `${parent}:${step.key}`;
       let child = edges.get(key);
       if (child == null) {
+        if (nodes.length >= limit) { cut = true; break; }
         child = nodes.length;
         edges.set(key, child);
-        nodes.push({ id: child, parent, frame: step.ids[0], value: 0, self: 0, children: [] });
+        nodes.push({ id: child, parent, frame: step.ids[0], value: 0, self: 0, omitted: 0, children: [] });
         members.push(new Set());
         nodes[parent].children.push(child);
       }
@@ -203,7 +274,8 @@ export function callTree(profile: Profile, metric: CallMetric, thread = '', limi
       nodes[child].value += weight;
       parent = child;
     }
-    nodes[parent].self += weight;                     // includes 'mine' samples whose leaf was library code
+    if (cut) { nodes[parent].omitted += weight; omitted += weight; }
+    else nodes[parent].self += weight;                // includes 'mine' samples whose leaf was library code
   }
   for (const n of nodes) n.children.sort((a, b) => nodes[b].value - nodes[a].value);
   // Send only frames the tree references: a thread/metric filter or the node cap can leave most unused.
@@ -213,15 +285,117 @@ export function callTree(profile: Profile, metric: CallMetric, thread = '', limi
     if (n.frame < 0) continue;
     const ids = members[n.id];
     if (ids.size > 1) {
-      const origin = originOf(n.frame), names = [...new Set([...ids].map(id => all[id].name))];
+      const origin = originOf(n.frame), names = [...new Set([...ids].map(id => shownName(all[id])))];
       n.frame = frames.length;
       frames.push({ name: origin.label, file: '', line: 0, first_line: 0, user: false, origin,
         group: { count: ids.size, names: names.slice(0, 8) } });
       continue;
     }
     let id = remap.get(n.frame);
-    if (id == null) { id = frames.length; remap.set(n.frame, id); frames.push({ ...all[n.frame], origin: originOf(n.frame) }); }
+    if (id == null) {
+      id = frames.length; remap.set(n.frame, id);
+      const f = all[n.frame];   // inverted boxes stand for the whole function, so they point at its first line
+      frames.push({ ...f, name: shownName(f), origin: originOf(n.frame), ...(inverted ? { line: f.first_line } : {}) });
+    }
     n.frame = id;
   }
   return { nodes, frames, omitted };
+}
+
+/** One function, summed across every call path it appears in. */
+export interface FunctionRow {
+  key: string; name: string; file: string; line: number; user: boolean; origin: FrameOrigin;
+  /** Time with this function as the innermost frame. */
+  self: number;
+  /** Time with this function anywhere in the stack, counted once per stack so recursion is not doubled. */
+  total: number;
+  /** Distinct functions that call it. */
+  callers: number;
+  /** Function-level memory from the profile, for your own functions only; null when not measured. */
+  memoryMb: number | null;
+  /** precise mode: native estimate (process growth beyond traced growth), your functions only. */
+  nativeMb: number | null;
+}
+export interface Neighbor { key: string; name: string; origin: FrameOrigin; value: number; }
+export interface Neighbors { key: string; value: number; self: number; callers: Neighbor[]; callees: Neighbor[]; }
+
+/** A function's identity across call sites: the same code object reached from different lines. */
+export function functionKey(f: StackFrame): string {
+  return JSON.stringify([f.file, f.first_line, f.name]);
+}
+
+/** Weighted samples as function keys, outermost first; the 'mine' view keeps only user frames. */
+function weightedStacks(profile: Profile, metric: CallMetric, thread: string, view: FrameView) {
+  const { frames, samples } = stackSource(profile, metric, thread);
+  const keys = frames.map(functionKey), out: { keys: string[]; ids: number[]; weight: number }[] = [];
+  for (const sample of samples) {
+    const ids = view === 'mine' ? sample.frames.filter(id => frames[id].user) : sample.frames;
+    if (sample.weight > 0 && ids.length) out.push({ keys: ids.map(id => keys[id]), ids, weight: sample.weight });
+  }
+  return { frames, out };
+}
+
+function functionMemory(profile: Profile, f: StackFrame): number | null {
+  if (!f.user || profile.memory_mode === 'off') return null;
+  const entry = profile.functions?.[f.file]?.[String(f.first_line)];
+  if (!entry) return null;
+  return profile.memory_mode === 'precise'
+    ? Math.max(entry.peak_mb, entry.transient_peak_mb, entry.alloc_mb ?? 0)
+    : entry.rss_growth_mb ?? 0;
+}
+
+function functionNative(profile: Profile, f: StackFrame): number | null {
+  if (!f.user || profile.memory_mode !== 'precise' || !profile.rss_kind) return null;
+  const entry = profile.functions?.[f.file]?.[String(f.first_line)];
+  return entry ? nativeMb(entry) : null;
+}
+
+/** Functions ranked by self time: the answer to "where is the time spent" that a chart splits across paths. */
+export function topFunctions(profile: Profile, metric: CallMetric, thread = '', view: FrameView = 'all', limit = 200): FunctionRow[] {
+  const { frames, out: stacks } = weightedStacks(profile, metric, thread, view);
+  const rows = new Map<string, FunctionRow>(), callers = new Map<string, Set<string>>();
+  for (const { keys, ids, weight } of stacks) {
+    const counted = new Set<string>();
+    keys.forEach((key, i) => {
+      let row = rows.get(key);
+      if (!row) {
+        const f = frames[ids[i]];
+        row = { key, name: shownName(f), file: f.file, line: f.first_line, user: f.user, origin: frameOrigin(f),
+          self: 0, total: 0, callers: 0, memoryMb: functionMemory(profile, f), nativeMb: functionNative(profile, f) };
+        rows.set(key, row);
+        callers.set(key, new Set());
+      }
+      if (!counted.has(key)) { counted.add(key); row.total += weight; }
+      if (i > 0 && keys[i - 1] !== key) callers.get(key)!.add(keys[i - 1]);
+    });
+    rows.get(keys[keys.length - 1])!.self += weight;
+  }
+  for (const row of rows.values()) row.callers = callers.get(row.key)!.size;
+  return [...rows.values()].sort((a, b) => b.self - a.self || b.total - a.total).slice(0, limit);
+}
+
+/** Who calls a function and what it calls, merged across all its call paths. */
+export function neighbors(profile: Profile, metric: CallMetric, key: string, thread = '', view: FrameView = 'all', limit = 20): Neighbors {
+  const { frames, out: stacks } = weightedStacks(profile, metric, thread, view);
+  const byKey = new Map(frames.map(f => [functionKey(f), f] as const));
+  const callerTime = new Map<string, number>(), calleeTime = new Map<string, number>();
+  let value = 0, self = 0;
+  for (const { keys, weight } of stacks) {
+    if (!keys.includes(key)) continue;
+    value += weight;
+    if (keys[keys.length - 1] === key) self += weight;
+    const up = new Set<string>(), down = new Set<string>();
+    keys.forEach((k, i) => {
+      if (k !== key) return;
+      if (i > 0 && keys[i - 1] !== key) up.add(keys[i - 1]);
+      if (i + 1 < keys.length && keys[i + 1] !== key) down.add(keys[i + 1]);
+    });
+    for (const k of up) callerTime.set(k, (callerTime.get(k) ?? 0) + weight);
+    for (const k of down) calleeTime.set(k, (calleeTime.get(k) ?? 0) + weight);
+  }
+  const list = (m: Map<string, number>) => [...m].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([k, v]) => {
+    const f = byKey.get(k)!;
+    return { key: k, name: shownName(f), origin: frameOrigin(f), value: v };
+  });
+  return { key, value, self, callers: list(callerTime), callees: list(calleeTime) };
 }

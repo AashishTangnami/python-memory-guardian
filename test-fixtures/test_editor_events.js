@@ -21,7 +21,7 @@ const vscode = {
   ThemeColor: class {},
   DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
   Diagnostic: class { constructor(range, message, severity) { Object.assign(this, { range, message, severity }); } },
-  Uri: { parse: key => uris.get(key) },
+  Uri: { parse: key => uris.get(key), file: path => uris.get(`file://${path}`) ?? uri(path) },
   languages: { createDiagnosticCollection: () => ({ clear() {}, delete() {}, set() {}, dispose() {} }) },
   window: {
     activeTextEditor: undefined, visibleTextEditors: [],
@@ -37,20 +37,22 @@ const vscode = {
     onDidCloseTextDocument: h => { handlers.close = h; return disposable(); },
     findFiles: async () => [],
     getConfiguration: () => ({ get: (_key, fallback) => fallback }),
+    getWorkspaceFolder: () => undefined,
   },
   commands: { registerCommand: disposable },
 };
-class GuardianReport { update() {} show() {} refresh() { refreshes++; } dispose() {} }
+class GuardianReport { update() {} show() {} refresh() { refreshes++; } comparisonFor() { return null; } dispose() {} }
 Module._load = function(name, ...args) {
   if (name === 'vscode') return vscode;
   if (name === './reportView') return { GuardianReport };
   return originalLoad.call(this, name, ...args);
 };
 
-try {
+(async () => { try {
   const { textHash } = require('../out/profileModel');
   const { ProfileView } = require('../out/profileView');
-  const collection = { set: (u, d) => sets.push([u.toString(), d]) };
+  const published = new Map();
+  const collection = { set: (u, d) => { sets.push([u.toString(), d]); published.set(u.toString(), d); }, get: u => published.get(u.toString()) };
   const view = new ProfileView({}, () => collection, () => 'python3');
   const edit = (d, text) => { if (text != null) { d.text = text; d.version++; } handlers.change({ document: d }); };
   const staticFinding = () => ({ range: { start: { line: 0 } }, message: 'static', severity: 1, code: 'x' });
@@ -103,8 +105,30 @@ try {
   view.settingsChanged();
   assert.strictEqual(sets.length, 0, 'closing a document forgets its stored findings and cached hash');
   console.log('PASS keystrokes only re-adjust, refresh and hash when a profiled file changes freshness');
+
+  // A profiling run's .pmg/profile.json gets .pmg/summary.json beside it, written shortly after loading.
+  const fs = require('fs'), os = require('os'), path = require('path');
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'pmg-summary-'));
+  const runJson = path.join(project, '.pmg', 'profile.json'), summaryJson = path.join(project, '.pmg', 'summary.json');
+  fs.mkdirSync(path.dirname(runJson));
+  fs.writeFileSync(runJson, json.text);
+  vscode.workspace.textDocuments.push(work);                         // work.py stays open: analyzed, fresh
+  view.adjust(work.uri, [staticFinding()]);
+  view['load'](uri(runJson));
+  assert(!fs.existsSync(summaryJson), 'written after a short delay, so findings published right after loading are included');
+  await new Promise(r => setTimeout(r, 700));
+  const summary = JSON.parse(fs.readFileSync(summaryJson, 'utf8'));
+  assert.strictEqual(summary.format, 'pmg-summary/1');
+  assert.strictEqual(summary.profile.path, '.pmg/profile.json', 'paths relative to the project folder');
+  assert.deepStrictEqual(summary.source.files.map(f => f.freshness), ['fresh']);
+  assert.strictEqual(summary.static_diagnostics.findings[0].code, 'x', 'open file: its static finding is included');
+  assert.strictEqual(summary.static_diagnostics.findings[0].measured, 'hot');
+  view['profileDeleted'](uri(runJson));
+  assert(!fs.existsSync(summaryJson), 'deleting the profile removes its summary');
+  fs.rmSync(project, { recursive: true, force: true });
+  console.log('PASS a profiling run writes .pmg/summary.json with static findings for open files; deleting the profile removes it');
 } catch (e) {
   console.error(e); process.exitCode = 1;
 } finally {
   Module._load = originalLoad;
-}
+} })();

@@ -37,6 +37,23 @@ assert.strictEqual(m.heat({ samples: 0, line_events: 0, rss_growth_mb: 0 }, "off
   p.files[file][Object.keys(p.files[file])[0]].line_events = -1;
   assert.strictEqual(m.parseProfile(JSON.stringify(p)), undefined, "negative line-event count is rejected"); }
 { const p = m.parseProfile(fs.readFileSync(require("path").join(__dirname, "profiler/out/workload_fast.json"), "utf8"));
+  const lo = { objects: [{ holder: "global BIG", type: "bytearray", mb: 20, items: null, estimated: false }], complete: true };
+  assert(m.parseProfile(JSON.stringify({ ...p, largest_objects: lo })), "largest objects are accepted");
+  assert.strictEqual(m.parseProfile(JSON.stringify({ ...p, largest_objects: { ...lo, objects: [{ ...lo.objects[0], mb: -1 }] } })), undefined, "negative size rejected");
+  assert.strictEqual(m.parseProfile(JSON.stringify({ ...p, largest_objects: { objects: [], complete: "yes" } })), undefined, "complete must be boolean"); }
+// Native estimate: process growth beyond traced Python growth, for any library, in precise mode.
+{ const pp = { memory_mode: "precise", gil_split: true };
+  const line = (rss, alloc) => ({ time_s: 0, share: 0, python_s: 0, native_s: 0, system_s: 0, cpu_unsplit_s: 0, samples: 1,
+    rss_growth_mb: rss, rss_release_mb: 0, alloc_mb: alloc, peak_mb: 0, transient_peak_mb: 0 });
+  assert.strictEqual(m.nativeMb(line(127, 0)), 127);
+  assert.strictEqual(m.nativeMb(line(10, 13)), 0, "never negative");
+  assert(m.lineLabel(line(127, 0), pp).includes("native ≈ +127 MB"), m.lineLabel(line(127, 0), pp));
+  assert(!m.lineLabel(line(0.5, 0), pp).includes("native"), "under 1 MB: no native label");
+  assert.strictEqual(m.heat(line(127, 0), "precise", { hotShare: 0.05, hotMb: 50 }), "hot", "native-heavy lines are memory-hot");
+  assert(m.funcLabel({ name: "load", time_s: 1, python_s: 1, native_s: 0, system_s: 0, peak_mb: 0, transient_peak_mb: 0, alloc_mb: 2, rss_growth_mb: 60 }, pp)
+    .includes("native ≈ +58.0 MB"));
+  assert(!m.lineLabel(line(127, 0), { ...pp, memory_mode: "fast" }).includes("native"), "fast mode shows RSS, not the estimate"); }
+{ const p = m.parseProfile(fs.readFileSync(require("path").join(__dirname, "profiler/out/workload_fast.json"), "utf8"));
   assert.deepStrictEqual(m.runNotes(p), [], "a complete run has no notes");
   const lost = m.parseProfile(JSON.stringify({ ...p, memory_tracing_lost_s: 1.25, sampler_error: "ValueError: boom" }));
   assert(lost, "tracing-lost and sampler-error fields are accepted");
