@@ -86,7 +86,7 @@ function fileKey(file: string, script: string, platform: NodeJS.Platform): strin
 
 interface Agg {
   name: string; file: string; line: number | null; samples: number; time: number;
-  alloc: number; held: number; exit: number; rss: number; native: number; leak: boolean;
+  alloc: number; held: number; exit: number; rss: number; prof: number; native: number; leak: boolean;
 }
 
 /** Each line's enclosing function name, and each function's first line (from any record that names it). */
@@ -123,18 +123,18 @@ function aggregate(p: Profile, platform: NodeJS.Platform) {
       let f = fns.get(key);
       if (!f) {
         f = { name, file, line: name === '<module>' ? null : anchor(file, name), samples: 0, time: 0,
-          alloc: 0, held: 0, exit: 0, rss: 0, native: 0, leak: false };
+          alloc: 0, held: 0, exit: 0, rss: 0, prof: 0, native: 0, leak: false };
         fns.set(key, f);
       }
       const one: Agg = { name, file, line: Number(ln), samples: e.samples, time: e.time_s, alloc: e.alloc_mb ?? 0,
-        held: e.peak_mb ?? 0, exit: e.end_mb ?? 0, rss: e.rss_growth_mb, native: nativeMb(e), leak: !!e.leak_runs };
-      for (const k of ['samples', 'time', 'alloc', 'held', 'exit', 'rss'] as const) f[k] += one[k];
+        held: e.peak_mb ?? 0, exit: e.end_mb ?? 0, rss: e.rss_growth_mb, prof: e.profiler_mb ?? 0, native: nativeMb(e, p), leak: !!e.leak_runs };
+      for (const k of ['samples', 'time', 'alloc', 'held', 'exit', 'rss', 'prof'] as const) f[k] += one[k];
       f.leak ||= one.leak;
       lines.set(`${fk}\0${ln}`, { ...one, sig: JSON.stringify([e.assigns ?? [], e.calls ?? []]), fn: key });
     }
   }
   // Native is estimated per function from its summed growth, as funcLabel does, not summed per line.
-  for (const f of fns.values()) f.native = Math.max(0, f.rss - f.alloc);
+  for (const f of fns.values()) f.native = nativeMb({ rss_growth_mb: f.rss, alloc_mb: f.alloc, profiler_mb: f.prof }, p);
   return { fns, lines, anchor };
 }
 
@@ -171,6 +171,9 @@ function warnings(b: Profile, c: Profile, platform: NodeJS.Platform): string[] {
   else if (eb.frames !== ec.frames) out.push(`Different traceback depths (${eb.frames} vs ${ec.frames} frames): allocation sites can move to other functions.`);
   if (eb.interval !== ec.interval) out.push(`Different sampling intervals (${eb.interval} vs ${ec.interval} s): sampled times have different precision.`);
   if (eb.gil !== ec.gil) out.push('One run had a GIL and the other did not: the Python/native time split is not comparable.');
+  const tb = b.trace_function?.name ?? null, tc = c.trace_function?.name ?? null;
+  if (eb.mode === 'precise' && ec.mode === 'precise' && tb !== tc)
+    out.push(`Memory was traced over different parts of the runs (${tb ? `only ${tb}()` : 'the whole run'} vs ${tc ? `only ${tc}()` : 'the whole run'}): code traced in one run and not the other shows memory in one only, and untraced code runs faster. Changes are marked as context.`);
   return out;
 }
 
@@ -291,6 +294,13 @@ export function compareProfiles(base: Profile, cur: Profile, meta: BaselineMeta 
     }
   };
   const moved = (d: Delta) => d.verdict === 'worse' || d.verdict === 'better';
+  // Different tracing scopes (--trace-function): neither memory nor time is measured the same way in the two runs.
+  const scopes = [base, cur].map(p => p.memory_mode === 'precise' ? p.trace_function?.name ?? null : undefined);
+  const scopeDiffers = scopes[0] !== undefined && scopes[1] !== undefined && scopes[0] !== scopes[1];
+  if (scopeDiffers) {
+    for (const r of [...functions, ...lines]) for (const d of [r.time, ...Object.values(r.values)]) if (moved(d)) d.verdict = 'context';
+    for (const r of siteRows) for (const d of [r.peak, r.exit]) if (d && moved(d)) d.verdict = 'context';
+  }
   if (pa && pb && pa.name !== pb.name) {
     notes.push(`The memory peak moved from ${pa.name} to ${pb.name}. "Held at peak" is what each function held at that moment, so it changes wherever the peak moved; judge memory by the run's peak and by Allocated.`);
     contextual(['held'], moved);
@@ -315,6 +325,7 @@ export function compareProfiles(base: Profile, cur: Profile, meta: BaselineMeta 
   // Run duration is measured, not sampled.
   run.push({ label: 'Run duration', unit: 's', value: delta(base.wall_s, cur.wall_s,
     Math.max(2 * interval, 0.1 * Math.max(base.wall_s, cur.wall_s))) });
+  const contextIfScoped = () => { if (scopeDiffers) for (const r of run) if (moved(r.value)) r.value.verdict = 'context'; };
   const mem = (label: string, a: number | null | undefined, b: number | null | undefined, rss = false) => {
     if (a != null && b != null) run.push({ label, unit: 'MB', value: delta(a, b, memoryNoise(a, b, rss)) });
   };
@@ -327,6 +338,7 @@ export function compareProfiles(base: Profile, cur: Profile, meta: BaselineMeta 
   if (base.memory_mode !== 'off' && cur.memory_mode !== 'off' && base.rss_kind && cur.rss_kind)
     mem('Peak process RSS', base.rss_peak_mb, cur.rss_peak_mb, true);
 
+  contextIfScoped();
   const weight = (r: { time: Delta; values: Record<string, Delta> }) => Math.max(
     Math.abs(r.time.delta) / Math.max(r.time.noise, 1e-9), ...Object.values(r.values).map(v => Math.abs(v.delta) / Math.max(v.noise, 1e-9)));
   functions.sort((x, y) => weight(y) - weight(x) || x.name.localeCompare(y.name));

@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import { Profile, ProfileIndex, runNotes } from './profileModel';
 import { baselineMeta, BaselineMeta, compareProfiles, Comparison } from './compareModel';
-import { diagnose, callTree, overview, neighbors, topFunctions, isMemoryMetric, CallMetric, FrameView, TimeWindow } from './reportModel';
+import { diagnose, callTree, overview, neighbors, topFunctions, isMemoryMetric, hasMetric, phases, functionKey, CallMetric, FrameView, TimeWindow } from './reportModel';
 import { reportHtml } from './reportWebview';
 
 /** What the webview needs to explain the memory-stack measures, without sending the tables twice. */
@@ -41,6 +41,10 @@ export class GuardianReport implements vscode.Disposable {
   private frames: FrameView = 'grouped';
   private inverted = false;
   private window: TimeWindow | undefined;
+  /** Stack depth for phases; undefined picks it automatically. */
+  private phaseDepth: number | undefined;
+  /** Only stacks through this function (a functionKey), so a shared helper can be seen under one caller. */
+  private focus: { key: string; name: string } | undefined;
 
   /** The profile the Compare tab compares against: a saved baseline, or any profile file the user picked. */
   private compareWith: { file: string; label: string } | undefined;
@@ -106,7 +110,9 @@ export class GuardianReport implements vscode.Disposable {
     this.index = index;
     this.thread = '';
     this.window = undefined;
-    if (isMemoryMetric(this.metric) && !index?.profile.memory_stacks) this.metric = 'elapsed';
+    this.phaseDepth = undefined;
+    this.focus = undefined;
+    if (!index || !hasMetric(index.profile, this.metric)) this.metric = 'elapsed';
     this.refresh();
   }
 
@@ -140,12 +146,26 @@ export class GuardianReport implements vscode.Disposable {
         }
       }
       if (m.type === 'saveBaseline') void this.baselines?.save();
-      if (m.type === 'filter' && ['elapsed', 'python', 'native', 'system', 'unsplit', 'mem_peak', 'mem_exit'].includes(m.metric)
+      if (m.type === 'filter' && ['elapsed', 'python', 'native', 'system', 'unsplit', 'mem_peak', 'mem_exit', 'mem_alloc'].includes(m.metric)
+        && this.index && hasMetric(this.index.profile, m.metric)
         && typeof m.thread === 'string' && ['grouped', 'all', 'mine'].includes(m.frames) && typeof m.inverted === 'boolean') {
         this.metric = m.metric;
         this.thread = m.thread;
         this.frames = m.frames;
         this.inverted = m.inverted;
+        this.refresh();
+      }
+      // Phases: a stack depth chosen in the Overview, or null for automatic.
+      if (m.type === 'phaseDepth' && (m.depth === null || (Number.isInteger(m.depth) && m.depth >= 0 && m.depth <= 128))) {
+        this.phaseDepth = m.depth ?? undefined;
+        this.refresh();
+      }
+      // Focus: only stacks through one function the profile recorded, or '' to clear.
+      if (m.type === 'focus' && typeof m.key === 'string' && m.key.length < 8192 && this.index) {
+        const p = this.index.profile;
+        const frame = [...(p.stacks?.frames ?? []), ...(p.memory_stacks?.frames ?? [])].find(f => functionKey(f) === m.key);
+        if (m.key && !frame) return;
+        this.focus = frame ? { key: m.key, name: frame.name || `line ${frame.line}` } : undefined;
         this.refresh();
       }
       // A time range dragged on the Overview memory chart narrows the memory diagnosis to it.
@@ -159,7 +179,7 @@ export class GuardianReport implements vscode.Disposable {
       // Callers and callees of one function, computed on request so the report payload stays small.
       if (m.type === 'neighbors' && typeof m.key === 'string' && m.key.length < 8192 && this.index?.profile) {
         void this.panel?.webview.postMessage({ type: 'neighbors',
-          ...neighbors(this.index.profile, this.metric, m.key, this.thread, this.frames) });
+          ...neighbors(this.index.profile, this.metric, m.key, this.thread, this.frames, 20, this.focus?.key) });
       }
       if (m.type === 'open' && typeof m.file === 'string' && Number.isInteger(m.line) && m.line >= 1) {
         const p = this.index?.profile;
@@ -203,9 +223,11 @@ export class GuardianReport implements vscode.Disposable {
     void this.panel.webview.postMessage({ type: 'report', script: p.script, wall: p.wall_s,
       mode: p.memory_mode, overview: overview(p), diagnoses: diagnoses.slice(0, 200),
       diagnosisCount: diagnoses.length, growingCount: diagnoses.filter(d => d.status === 'growing').length,
-      freshness, tree: callTree(p, this.metric, this.thread, 25000, this.frames, this.inverted), metric: this.metric, thread: this.thread,
+      freshness, tree: callTree(p, this.metric, this.thread, 25000, this.frames, this.inverted, this.focus?.key), metric: this.metric, thread: this.thread,
       inverted: this.inverted, window: this.window ?? null, largest: p.largest_objects ?? null,
-      frames: this.frames, functions: topFunctions(p, this.metric, this.thread, this.frames),
+      frames: this.frames, functions: topFunctions(p, this.metric, this.thread, this.frames, 200, this.focus?.key),
+      focus: this.focus ?? null, phases: (() => { const ph = phases(p, this.phaseDepth); return { ...ph, phases: ph.phases.slice(0, 200) }; })(),
+      allocAvailable: hasMetric(p, 'mem_alloc'), traceFunction: p.trace_function ?? null, tracemallocPeakMb: p.tracemalloc_peak_mb ?? null,
       unit: isMemoryMetric(this.metric) ? 'bytes' : 'seconds', memoryStacks: memorySummary(p),
       threads, stacksAvailable: !!p.stacks, dropped: p.stacks?.dropped_s ?? 0,
       depthLimited: p.stacks?.depth_limited ?? false, monitoring: p.monitoring,

@@ -6,7 +6,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["format", "generated_at", "generator", "profile", "run", "methods", "totals", "functions", "lines",
-    "memory_stacks", "retention", "largest_objects", "static_diagnostics", "source", "comparison", "next_steps"],
+    "memory_stacks", "phases", "retention", "largest_objects", "static_diagnostics", "source", "comparison", "next_steps"],
   "properties": {
     "format": { "const": "pmg-summary/1" },
     "generated_at": { "type": "string" },
@@ -17,7 +17,7 @@
     },
     "run": {
       "type": "object",
-      "required": ["script", "python", "platform", "argv", "started_at", "memory_mode", "interval_s", "samples", "traceback_frames", "gil_split", "incomplete"],
+      "required": ["script", "python", "platform", "argv", "started_at", "memory_mode", "interval_s", "samples", "traceback_frames", "gil_split", "incomplete", "traced_function"],
       "properties": {
         "script": { "type": "string" },
         "python": { "type": "string" },
@@ -29,7 +29,12 @@
         "samples": { "type": ["integer", "null"] },
         "traceback_frames": { "type": ["integer", "null"] },
         "gil_split": { "type": "boolean" },
-        "incomplete": { "type": "array", "items": { "type": "string" }, "description": "Conditions that make part of the evidence incomplete (tracing stopped, sampler failed)." }
+        "incomplete": { "type": "array", "items": { "type": "string" }, "description": "Conditions that make part of the evidence incomplete (tracing stopped, sampler failed)." },
+        "traced_function": {
+          "type": ["object", "null"], "description": "Precise mode traced only while this function ran (--trace-function).",
+          "required": ["name", "calls", "traced_s"],
+          "properties": { "name": { "type": "string" }, "calls": { "type": "integer" }, "traced_s": { "type": "number" } }
+        }
       }
     },
     "methods": {
@@ -50,7 +55,7 @@
         "run_duration_s": { "$ref": "#/$defs/measured" }, "process_cpu_s": { "$ref": "#/$defs/measured" },
         "peak_traced_mb": { "$ref": "#/$defs/measured" }, "held_at_exit_mb": { "$ref": "#/$defs/measured" },
         "native_estimate_mb": { "$ref": "#/$defs/measured" }, "rss_peak_mb": { "$ref": "#/$defs/measured" },
-        "unattributed_peak_mb": { "$ref": "#/$defs/measured" }
+        "unattributed_peak_mb": { "$ref": "#/$defs/measured" }, "tracemalloc_peak_mb": { "$ref": "#/$defs/measured" }
       }
     },
     "functions": {
@@ -88,6 +93,24 @@
         "method": { "type": "string" }, "limits": { "$ref": "#/$defs/limits" },
         "peak": { "anyOf": [{ "$ref": "#/$defs/stackTable" }, { "type": "null" }] },
         "exit": { "$ref": "#/$defs/stackTable" }
+      }
+    },
+    "phases": {
+      "type": ["object", "null"], "description": "What the main thread was doing over time; null when the profile has no timeline stacks.",
+      "required": ["depth", "method", "limits", "phases"],
+      "properties": {
+        "depth": { "type": "integer" }, "method": { "type": "string" }, "limits": { "$ref": "#/$defs/limits" },
+        "phases": {
+          "type": "array",
+          "items": {
+            "type": "object", "required": ["function", "file", "line", "from_s", "to_s", "peak_traced_mb", "peak_rss_mb", "new_rss_mb"],
+            "properties": {
+              "function": { "type": "string" }, "file": { "type": "string" }, "line": { "type": "integer" },
+              "from_s": { "type": "number" }, "to_s": { "type": "number" }, "peak_traced_mb": { "type": ["number", "null"] },
+              "peak_rss_mb": { "type": ["number", "null"] }, "new_rss_mb": { "type": ["number", "null"] }
+            }
+          }
+        }
       }
     },
     "retention": {

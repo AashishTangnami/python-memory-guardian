@@ -101,6 +101,13 @@ assert(deeper.includes('traceback depths'));
 const mixed = c.compareProfiles(base, other, null, 'linux');
 assert.deepStrictEqual(mixed.columns.map(x => x.key), ['rss'], 'precise vs fast: only RSS growth is common');
 
+// Different tracing scopes (--trace-function in one run): warned, and every change is context.
+const scoped = c.compareProfiles(base, { ...cur, trace_function: { name: 'work', calls: 1, traced_s: 1 } }, null, 'linux');
+assert(scoped.warnings.some(w => w.includes('different parts of the runs') && w.includes('only work()')), 'scope warning');
+assert.strictEqual(scoped.functions.find(f => f.name === 'work').values.alloc.verdict, 'context', 'no better/worse across scopes');
+assert(scoped.run.every(r => r.value.verdict !== 'better' && r.value.verdict !== 'worse'));
+assert(!c.compareProfiles(base, cur, null, 'linux').warnings.some(w => w.includes('different parts')), 'same scope: no warning');
+
 // Peak moved: held-at-peak changes are context, not regressions.
 const ms = (name, mb, first) => ({ depth: 2, frames: [{ file: '/ci/checkout/app.py', line: first + 1, name, first_line: first, user: true }],
   peak: { t: 1, total_bytes: mb * 1e6, other_bytes: 0, stacks: [{ frames: [0], bytes: mb * 1e6, truncated: false }] },

@@ -17,6 +17,7 @@ import {
 import { ContainerConfig, containerCommand, remapProfileKeys, toContainer, toLocal } from "./containerPaths";
 import { baselineFileName } from "./compareModel";
 import { buildSummary, Freshness as SummaryFreshness, StaticFinding } from "./summaryModel";
+import { enclosingFunction, splitArgs } from "./runOptions";
 import { GuardianReport } from "./reportView";
 
 const PROFILE_GLOB = "**/.pmg/profile.json";
@@ -105,14 +106,32 @@ export class ProfileView implements vscode.Disposable {
     }
     if (editor.document.isDirty && !await editor.document.save()) return;
     const cfg = vscode.workspace.getConfiguration("pythonMemoryGuardian.profile");
+    // With the cursor in a function, precise mode can trace only that function: the rest of the program runs
+    // at full speed (tracemalloc slowed one allocation-heavy function 7.7x; scoping cannot avoid that part).
+    const fn = enclosingFunction(editor.document.getText().split(/\r?\n/), editor.selection.active.line);
     const picked = await vscode.window.showQuickPick([
       { label: "fast", description: "time split + RSS memory, ~5% overhead", mode: "fast" },
-      { label: "precise", description: "tracemalloc: per-line memory, leaks; ~2-5x slower", mode: "precise" },
+      { label: "precise", description: "tracemalloc: per-line memory, leaks; 3-10x+ slower on allocation-heavy code", mode: "precise" },
+      ...(fn ? [{ label: `precise, only while ${fn}() runs`, mode: "precise", traceFunction: fn,
+        description: "Python 3.12+; everything else at full speed" }] : []),
       { label: "time only", description: "no memory measurement", mode: "off" },
     ], { placeHolder: `Memory mode (default: ${cfg.get("memoryMode", "fast")})` });
     if (!picked) return;
 
+    // Script arguments, remembered per file; Escape cancels the run.
     const file = editor.document.uri.fsPath;
+    const argsKey = `pmg.args:${file}`;
+    const typed = await vscode.window.showInputBox({
+      prompt: `Arguments for ${path.basename(file)} (optional)`,
+      placeHolder: "e.g. --records 20000 --mode both", value: this.ctx.workspaceState.get<string>(argsKey, ""),
+      validateInput: (v) => { const r = splitArgs(v); return Array.isArray(r) ? undefined : r.error; },
+    });
+    if (typed === undefined) return;
+    const scriptArgs = splitArgs(typed);
+    if (!Array.isArray(scriptArgs)) return;
+    await this.ctx.workspaceState.update(argsKey, typed);
+    const scope = "traceFunction" in picked && picked.traceFunction ? ["--trace-function", picked.traceFunction] : [];
+
     const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
     const root = folder?.uri.fsPath ?? path.dirname(file);
     const out = path.join(root, ".pmg", "profile.json");
@@ -129,8 +148,8 @@ export class ProfileView implements vscode.Disposable {
         fs.copyFileSync(this.ctx.asAbsolutePath(path.join("server", "pmg_profile.py")), staged);
         const c = (p: string) => toContainer(p, cc.mappings);
         const cmd = containerCommand(cc, c(staged),
-          ["--memory", picked.mode, "--frames", String(frames), "--monitoring", monitoring,
-            "--root", c(root), "--out", c(out), c(file)]);
+          ["--memory", picked.mode, "--frames", String(frames), "--monitoring", monitoring, ...scope,
+            "--root", c(root), "--out", c(out), c(file), ...scriptArgs]);
         exec = new vscode.ProcessExecution(cmd.command, cmd.args, { cwd: root });
       } catch (e) {
         vscode.window.showErrorMessage(`Python Memory Guardian (container mode): ${e}`);
@@ -138,8 +157,8 @@ export class ProfileView implements vscode.Disposable {
       }
     } else {
       const args = [this.ctx.asAbsolutePath(path.join("server", "pmg_profile.py")),
-        "--memory", picked.mode, "--frames", String(frames), "--monitoring", monitoring,
-        "--root", root, "--out", out, file];
+        "--memory", picked.mode, "--frames", String(frames), "--monitoring", monitoring, ...scope,
+        "--root", root, "--out", out, file, ...scriptArgs];
       // ProcessExecution: no shell, so paths with spaces need no quoting on any OS.
       exec = new vscode.ProcessExecution(this.interpreter(), args, { cwd: path.dirname(file) });
     }
@@ -298,14 +317,17 @@ export class ProfileView implements vscode.Disposable {
     }
   }
 
-  /** The profile was deleted: its summary would describe a profile that no longer exists. */
+  /**
+   * A watched profile was deleted: its summary would describe a profile that no longer exists. The report is
+   * cleared only when it shows that profile; another folder's profile.json (multi-root workspace) leaves it.
+   */
   private profileDeleted(uri: vscode.Uri): void {
     if (this.run && this.run.profilePath === uri.fsPath) {
       if (this.summaryTimer) clearTimeout(this.summaryTimer);
       try { fs.rmSync(this.run.summaryPath, { force: true }); } catch { /* already gone */ }
       this.run = undefined;
     }
-    this.clear();
+    if (this.loaded?.uri.fsPath === uri.fsPath) this.clear();
   }
 
   private clear(): void {
@@ -333,7 +355,7 @@ export class ProfileView implements vscode.Disposable {
     return diags.map((d) => {
       const ln = d.range.start.line + 1;
       const e = idx.line(uri.fsPath, ln);
-      const h = heat(e, idx.profile.memory_mode, th, idx.insideSampledFunction(uri.fsPath, ln));
+      const h = heat(e, idx.profile.memory_mode, th, idx.insideSampledFunction(uri.fsPath, ln), idx.profile);
       const out = new vscode.Diagnostic(d.range, evidence(e, h, idx.profile) + d.message,
         adjustSeverity(d.severity, h) as vscode.DiagnosticSeverity);
       out.code = d.code;
@@ -434,7 +456,7 @@ export class ProfileView implements vscode.Disposable {
           if (!this.overlay) continue;
           const label = lineLabel(e, p);
           if (!label || (e.share < 0.01 && !label.includes("▲") && !e.leak_runs)) continue;
-          (heat(e, p.memory_mode, th) === "hot" ? hot : normal)
+          (heat(e, p.memory_mode, th, false, p) === "hot" ? hot : normal)
             .push({ range: new vscode.Range(range.end, range.end), renderOptions: { after: { contentText: label } } });
         }
         if (this.overlay) {

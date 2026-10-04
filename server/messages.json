@@ -35,6 +35,9 @@
   "memory-swell.list-copy": {
     "neutral": "⚠️ Memory Swell: iterating {call} builds a full in-memory copy before the loop starts. Iterate the original iterable or a generator directly, unless you need a snapshot (e.g. you mutate the source inside the loop)."
   },
+  "memory-swell.list-once": {
+    "neutral": "⚠️ Memory Swell: `{name}` holds every item of {call} at once, but it is used only once, by {use}. Pass a generator instead (a generator expression, or the iterable itself without list()) so items are processed one at a time; keep the list if you need len(), indexing or a second pass."
+  },
   "memory-swell.method-cache": {
     "neutral": "⚠️ Memory Swell: an unbounded cache (@cache / lru_cache(maxsize=None)) on a method stores `self` in its keys, so every instance it ever sees stays alive until cache_clear(). Per the Python FAQ (\"How do I cache method calls?\"), use functools.cached_property for per-instance results or a bounded lru_cache(maxsize=N)."
   },

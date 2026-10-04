@@ -1,47 +1,58 @@
 # Profiling workloads
 
-Small scripts to try Python Memory Guardian on. Each one does the same job two ways, a memory-heavy way and a better way, and checks that both give the same answer. Open a script, run **Python Memory Guardian: Profile Current File**, and compare the labels on the two versions.
+Three realistic pipelines to try Python Memory Guardian on. Each fetches records from a fake paginated JSON API (no network), stores the raw pages, normalizes them to a fixed schema and writes compressed output, in a memory-heavy variant and a lighter one, and checks that both produce the same output. Each script's docstring describes its variants and options.
 
-| Script | Needs | Compares |
+| Script | Needs | Variants (`--mode`) |
 |---|---|---|
-| [generators.py](generators.py) | standard library | lists vs `yield` generator pipelines; `readlines()` vs streaming a file; `+=` vs `"".join()` |
-| [pyarrow_example.py](pyarrow_example.py) | `pyarrow` | one dict per row vs Arrow columns; Python vs Arrow aggregation; reading Parquet back as Python objects vs selected columns |
-| [polars_example.py](polars_example.py) | `polars` | eager `read_csv` vs lazy `scan_csv`; a Python row loop vs Polars expressions |
+| [generators.py](generators.py) | standard library | `eager` (whole-dataset lists) vs `streaming` (generator pipeline); `--basics` adds lists vs generators, `readlines()` vs streaming a file, `+=` vs `"".join()` |
+| [pyarrow_example.py](pyarrow_example.py) | `pyarrow` | `python` (row dicts) vs `eager` (whole Arrow tables) vs `streaming` (Arrow batches) |
+| [polars_example.py](polars_example.py) | `polars` | `python` (row loops) vs `eager` (`read_json`) vs `lazy` (`scan` + streaming sink) |
 
 ```bash
 pip install -r examples/profiling-workloads/requirements.txt   # for the pyarrow and polars scripts
 ```
 
-Install the packages into the interpreter the extension profiles with (`pythonMemoryGuardian.interpreter`). Each script creates its data in a temporary folder and runs in a few seconds; precise mode takes several times longer.
+Install the packages into the interpreter the extension profiles with (`pythonMemoryGuardian.interpreter`). Each run writes its output under a new folder in `--output` (default `pipeline_output/` in the working directory) and keeps earlier runs. Folders named `*_output/` here are ignored by git.
 
-## Which mode to use
+## Profiling them from the editor
 
-- **Precise** shows Python allocations per line: the net traced growth while a line ran (`alloc`), what was still referenced at the peak snapshot (`held`), and short-lived peaks (`spike`). In the Stack Explorer, set **Measure** to *Memory at peak snapshot* to see which call paths held the memory. Use it for `generators.py` and `pyarrow_example.py`.
-- **Fast** shows growth in process memory (RSS) per line. Use it for `polars_example.py`: Polars and Arrow allocate their buffers outside Python, so precise mode cannot see them on your lines. Precise mode reports that memory only as a run-level "native untraced" estimate.
+Open a script and run **Python Memory Guardian: Profile Current File**. After choosing a memory mode, enter the script's arguments; they are remembered for that file. Without arguments every script processes 2,000,000 records with one variant, which takes minutes in precise mode and compares nothing. Start with:
+
+| Script | Arguments | Mode |
+|---|---|---|
+| `generators.py` | `--records 200000 --mode both --basics` | fast first, then precise |
+| `pyarrow_example.py` | `--records 100000 --mode all --in-process` | fast (Arrow buffers are native memory) |
+| `polars_example.py` | `--records 100000 --mode all --in-process` | fast (Polars allocates in native threads) |
+
+- **`--in-process`** (PyArrow and Polars): by default these scripts run each variant in a separate process, which the profiler does not follow, so its lines would show no time or memory. With `--in-process` everything runs in the profiled process; the scripts' own printed RSS numbers then become cumulative, so read the profile instead.
+- **`--trace-memory`** starts and stops `tracemalloc` inside the script. Do not combine it with precise mode: when the script stops tracing, the profiler's precise evidence ends there (the report says when).
+- **Precise mode for one function**: with the cursor inside a function (for example `process_eager`), the mode list offers *precise, only while `process_eager()` runs* (Python 3.12+). Everything else runs at full speed.
 
 ## What to look for
 
-Measured on one machine (macOS, Python 3.13, pyarrow 25, polars 1.44). Your numbers will differ; the contrasts should not.
+Measured on one machine (macOS, Python 3.13) for `generators.py --records 200000 --mode both`; your numbers will differ, the contrasts should not.
 
-**generators.py, precise mode**
+**Time.** Eager and streaming take the same time per phase (ingest 1.9 vs 1.8 s, process 3.1 vs 3.0 s in fast mode). The difference is memory.
 
-The streaming versions are generator functions: `squares()` and `evens()` each `yield` one value and pause, and `sum()` pulls values through both stages, so only one value exists at a time. `read_amounts()` does the same for the file, line by line.
+**Phases** (Overview, below the memory chart). The run splits into ingest / process / verify for each variant:
 
-- `eager_total` allocates about 81 MB for `squares` and 8 MB for `evens`. `streaming_total`'s stages have no memory label at all, and each stage appears as its own function in the timings and the Stack Explorer.
-- `eager_log_sum` adds about 20 MB in fast mode and about 27 MB in precise mode, mostly the line strings `readlines()` creates. Static analysis warns about `readlines()` (`text-inflation.whole-file`) before you run. Precise mode can charge part of that memory to the next line, because it credits memory where a sample lands. `read_amounts()` has no memory label.
-- `+=` is flagged by static analysis (`text-inflation.concat`), but here it used *less* memory than `"".join()` (about 2 MB vs 11 MB): CPython can often extend a string in place, while `join()` first collects every part into a list. `join()` was still faster (about 0.35 s vs 0.9 s). This is why the profile matters: it shows which warnings cost something in your actual code.
+| Phase | Peak traced (precise) | New RSS (fast) |
+|---|---|---|
+| `ingest_eager` | 130 MB | +147 MB |
+| `process_eager` | 403 MB | +262 MB |
+| `ingest_streaming` | 15 MB | 0 |
+| `process_streaming` | 3 MB | 0 |
 
-**pyarrow_example.py, precise mode**
+Total RSS stays high through the streaming phases, because memory freed after the eager variant stays resident for reuse. *New RSS*, the memory a phase needed beyond what earlier phases had made resident, shows that streaming needed none.
 
-- Building one dict per row grows traced memory by about 290 MB (`rows_as_dicts`), and static analysis flags the per-row append (`ram-fragmentation.append`). With **Measure** set to *Memory at peak snapshot*, `rows_as_dicts` holds about 292 MB of a 296 MB snapshot.
-- Building the same table as Arrow columns allocates far less, mostly short-lived Python values while converting; the columns themselves live in Arrow's native buffers.
-- `group_by(...).aggregate(...)` shows mostly native time: the work runs in Arrow's C++ code.
-- `to_pylist()` turns the table back into a dict per row: a spike of about 320 MB. Reading only the needed columns stays columnar and costs almost nothing in Python memory.
+**Who keeps the memory.** Select **Focus stacks** on `process_eager` and set the Stack Explorer's **Measure** to *Allocated (sampled, full call paths)*. The 403 MB splits by line of `process_eager`: about 197 MB under `list(iter_raw_records(...))` (line 321), 147 MB under `normalize`, and 46 MB under `json_line`. Focused on `process_streaming`, `normalize` shows no net allocation growth: each record is released before the next. The plain per-line `alloc` labels point into the generators instead (`for number, line in enumerate(f, 1)`), because allocation is charged to the line running when it happens; the measure above also shows the consumer.
 
-**polars_example.py, fast mode**
+**Deeper tracebacks.** With the default 2-frame tracebacks, 195 MB held at the peak was allocated inside `json.loads` and never reached your code. The run summary (`.pmg/summary.json`) and the status tooltip say so. With `pythonMemoryGuardian.profile.frames` at 6 it lands on line 224, `yield json.loads(line)`, at about twice the run time.
 
-- `pl.read_csv(path)` loads every column, including `note`, which the summary never uses; together with the filter, RSS grows by about 195 MB. `scan_csv(...).collect()` reads only `region` and `amount`: about 107 MB.
-- Polars work shows as native time, because it runs in Polars' own threads. The `iter_rows()` loop in `python_loop_summary` takes about 10× longer than the expressions and shows mostly as Python time on that line.
-- Static analysis has no Polars-specific rules, so this script has no warnings: the profile is the only evidence here.
+**Cost.** 11.4 s without the profiler, 11.9 s in fast mode, 122 s in precise mode (tracing millions of small dicts), and 48.6 s in precise mode traced only while `process_eager` runs.
 
-Use the Stack Explorer's **Frames** control to switch between your functions only and the library frames underneath them.
+**Native memory.** `generators.py` uses no C-extension memory to speak of, and precise mode reports "none detected" beyond `tracemalloc`'s own bookkeeping (about 300 MB here).
+
+**Static warnings**, before running anything: `memory-swell.list-once` on lines 49-50 (`eager_total`) and 321-323 (`process_eager`), where each list is built and then only iterated once; `text-inflation.whole-file` on `readlines()` (line 71); `text-inflation.concat` on `+=` (line 88). `ingest_eager` (line 204) is not flagged: its list is sliced and measured with `len()`, so it really is needed. In the `--basics` section, `+=` used *less* memory than `"".join()` here, because CPython can often extend a string in place while `join()` first collects every part. The profile shows which warnings cost something in your actual code.
+
+**PyArrow and Polars.** Use fast mode: their buffers are native memory, which RSS sees and `tracemalloc` does not. In precise mode they appear as `native ≈` on the lines that create them. These two scripts were not re-measured for this README.

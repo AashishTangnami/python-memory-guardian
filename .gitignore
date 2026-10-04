@@ -10,3 +10,4 @@
 .mypy_cache
 .pmg
 __pycache__/
+/examples/profiling-workloads/**/*_output/

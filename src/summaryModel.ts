@@ -5,7 +5,7 @@
  * No `vscode` import, so it is unit-testable with plain Node. Schema: docs/pmg-summary.schema.json.
  */
 import { FuncEntry, heat, LineEntry, nativeMb, normPath, Profile, runNotes, Thresholds } from './profileModel';
-import { diagnose } from './reportModel';
+import { diagnose, phases } from './reportModel';
 import { Comparison } from './compareModel';
 
 export const SUMMARY_FORMAT = 'pmg-summary/1';
@@ -79,14 +79,15 @@ function measured(value: number | null | undefined, unit: Measured['unit'], m: {
   return value == null ? null : { value, unit, method: m.method, limits: m.limits };
 }
 
-function memoryFields(e: LineEntry | FuncEntry, mode: Profile['memory_mode']) {
+function memoryFields(e: LineEntry | FuncEntry, p: Profile) {
+  const mode = p.memory_mode;
   if (mode === 'precise') return { allocated_mb: e.alloc_mb ?? 0, held_at_peak_mb: e.peak_mb ?? 0,
-    spike_mb: e.transient_peak_mb ?? 0, native_estimate_mb: r3(nativeMb(e)) };
+    spike_mb: e.transient_peak_mb ?? 0, native_estimate_mb: r3(nativeMb(e, p)) };
   if (mode === 'fast') return { rss_growth_mb: e.rss_growth_mb ?? 0 };
   return {};
 }
-const memoryOf = (e: LineEntry | FuncEntry, mode: Profile['memory_mode']) => mode === 'precise'
-  ? Math.max(e.alloc_mb ?? 0, e.peak_mb ?? 0, e.transient_peak_mb ?? 0, nativeMb(e)) : mode === 'fast' ? e.rss_growth_mb ?? 0 : 0;
+const memoryOf = (e: LineEntry | FuncEntry, p: Profile, mode = p.memory_mode) => mode === 'precise'
+  ? Math.max(e.alloc_mb ?? 0, e.peak_mb ?? 0, e.transient_peak_mb ?? 0, nativeMb(e, p)) : mode === 'fast' ? e.rss_growth_mb ?? 0 : 0;
 
 /** The union of the top `n` by time and the top `n` by memory, ordered by time. */
 function topBoth<T>(rows: T[], time: (r: T) => number, mem: (r: T) => number, n: number): T[] {
@@ -152,15 +153,15 @@ export function buildSummary(inp: SummaryInputs) {
   for (const [file, ls] of Object.entries(p.files)) for (const e of Object.values(ls)) {
     if (e.func_line != null) samplesByFn.set(`${file}\0${e.func_line}`, (samplesByFn.get(`${file}\0${e.func_line}`) ?? 0) + e.samples);
   }
-  const functions = topBoth(fnRows, r => r.f.time_s, r => memoryOf(r.f, mode), 20).map(({ file, first, f }) => ({
+  const functions = topBoth(fnRows, r => r.f.time_s, r => memoryOf(r.f, p), 20).map(({ file, first, f }) => ({
     name: f.name, file: rel(file), line: first, end_line: f.end_line ?? null, samples: samplesByFn.get(`${file}\0${first}`) ?? 0,
     time_s: f.time_s, share: r3(f.time_s / attributed), python_s: f.python_s, native_s: f.native_s, system_s: f.system_s,
-    ...memoryFields(f, mode) }));
+    ...memoryFields(f, p) }));
 
   const lineRows = Object.entries(p.files).flatMap(([file, ls]) => Object.entries(ls).map(([ln, e]) => ({ file, line: Number(ln), e })));
-  const lines = topBoth(lineRows, r => r.e.time_s, r => memoryOf(r.e, mode), 20).map(({ file, line, e }) => ({
+  const lines = topBoth(lineRows, r => r.e.time_s, r => memoryOf(r.e, p), 20).map(({ file, line, e }) => ({
     file: rel(file), line, scope: e.scope ?? null, samples: e.samples, time_s: e.time_s, share: e.share,
-    ...memoryFields(e, mode), ...(e.leak_runs ? { suspected_leak: true, held_at_exit_mb: e.end_mb ?? 0 } : {}),
+    ...memoryFields(e, p), ...(e.leak_runs ? { suspected_leak: true, held_at_exit_mb: e.end_mb ?? 0 } : {}),
     ...(e.line_events != null ? { line_events: e.line_events } : {}) }));
 
   const retention = diagnose(p).slice(0, 20).map(d => ({ file: rel(d.file), line: d.line, scope: d.scope, status: d.status,
@@ -173,7 +174,7 @@ export function buildSummary(inp: SummaryInputs) {
   const analyzed = Object.keys(inp.staticDiagnostics).filter(f => f in p.files);
   const findings = analyzed.flatMap(file => inp.staticDiagnostics[file].map(d => {
     const e = p.files[file]?.[String(d.line)];
-    return { file: rel(file), ...d, measured: inp.freshness[file] === 'fresh' ? heat(e, mode, inp.thresholds) : 'source changed' };
+    return { file: rel(file), ...d, measured: inp.freshness[file] === 'fresh' ? heat(e, mode, inp.thresholds, false, p) : 'source changed' };
   }));
 
   const totals = {
@@ -182,9 +183,10 @@ export function buildSummary(inp: SummaryInputs) {
     peak_traced_mb: mode === 'precise' ? measured(p.peak_traced_mb, 'MB', { method: 'Highest traced Python memory (tracemalloc peak, read at every sample).', limits: m.traced.limits.slice(0, 1) }) : null,
     held_at_exit_mb: mode === 'precise' && p.memory_stacks ? measured(r3(p.memory_stacks.exit.total_bytes / 1e6), 'MB',
       { method: 'Traced Python memory still allocated at the exit snapshot, excluding the profiler\'s own.', limits: m.traced.limits.slice(0, 1) }) : null,
-    native_estimate_mb: mode === 'precise' ? measured(p.native_untraced_mb, 'MB', { method: 'Estimate: peak RSS minus RSS at start minus peak traced memory.', limits: m.native.limits }) : null,
+    native_estimate_mb: mode === 'precise' && !p.trace_function ? measured(p.native_untraced_mb, 'MB', { method: 'Estimate: peak RSS minus RSS at start minus peak traced memory.', limits: m.native.limits }) : null,
     rss_peak_mb: mode !== 'off' && p.rss_kind ? measured(p.rss_peak_mb, 'MB', { method: 'Highest process RSS read at any sample or at exit.', limits: m.rss.limits.slice(1) }) : null,
     unattributed_peak_mb: mode === 'precise' ? measured(p.unattributed_peak_mb, 'MB', { method: 'Memory held at the peak snapshot whose traceback never reached your code.', limits: m.traced.limits.slice(3) }) : null,
+    tracemalloc_peak_mb: mode === 'precise' ? measured(p.tracemalloc_peak_mb, 'MB', { method: 'Largest tracemalloc bookkeeping seen: memory the profiler itself added, not the program\'s.', limits: ['the reported bookkeeping can differ from its real RSS cost by more than its own size'] }) : null,
   };
 
   const comparison = inp.comparison && (() => {
@@ -207,10 +209,19 @@ export function buildSummary(inp: SummaryInputs) {
     profile: { path: rel(inp.profilePath), schema: p.schema },
     run: { script: rel(p.script), python: p.python, platform: p.run?.platform ?? null, argv: p.run?.argv ?? null,
       started_at: p.run?.started_at ?? null, memory_mode: mode, interval_s: p.interval_s ?? null, samples: p.samples ?? null,
-      traceback_frames: mode === 'precise' ? p.frames ?? null : null, gil_split: p.gil_split, incomplete: runNotes(p) },
+      traceback_frames: mode === 'precise' ? p.frames ?? null : null, gil_split: p.gil_split, incomplete: runNotes(p),
+      traced_function: p.trace_function ?? null },
     methods: { time: m.time, memory: mode === 'precise' ? { traced: m.traced, process: m.rss, native_estimate: m.native } : mode === 'fast' ? { process: m.rss } : null },
     totals: Object.fromEntries(Object.entries(totals).filter(([, v]) => v != null)),
     functions, lines, memory_stacks: memoryStacks(p, rel),
+    phases: (() => {
+      const ph = phases(p);
+      if (!ph.phases.length) return null;
+      return { depth: ph.depth, method: 'Contiguous stretches of the run in which the main thread was in the same function at this depth of its call stack (chosen automatically: the deepest level whose phases of at least 1% cover 90% of the run). new_rss_mb is process memory a phase needed beyond what earlier phases had already made resident.',
+        limits: ['resolution is the memory timeline: at most 300 points', 'only the main thread', 'phases shorter than 1% of the run are left out'],
+        phases: ph.phases.filter(x => x.seconds >= 0.01 * p.wall_s).map(x => ({ function: x.name, file: rel(x.file), line: x.line,
+          from_s: r3(x.from), to_s: r3(x.to), peak_traced_mb: x.peakTracedMb, peak_rss_mb: x.peakRssMb, new_rss_mb: x.newRssMb == null ? null : r3(x.newRssMb) })) };
+    })(),
     retention: mode === 'precise' ? { method: 'Each line\'s held memory across snapshots: growing = held memory rose in at least 3 trailing snapshots without a decrease and at least 1 MB was held at exit; retained = held at exit; released = freed during the run. Holders come from a bounded search of globals, your instances\' attributes and garbage-collector-tracked containers at exit.',
       limits: ['growth alone does not prove an unintended leak', 'the holder search is bounded and is not a complete ownership graph', 'needs at least four snapshots; very short runs report no growing lines'],
       findings: retention } : null,

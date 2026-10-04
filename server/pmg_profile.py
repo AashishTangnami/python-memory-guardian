@@ -2,7 +2,8 @@
 Python Memory Guardian - runtime profiler (standard library only).
 
     python server/pmg_profile.py [--out .pmg/profile.json] [--root DIR] [--interval 0.01]
-                          [--memory fast|precise|off] [--monitoring off|lines] script.py [args...]
+                          [--memory fast|precise|off] [--frames N] [--monitoring off|lines]
+                          [--trace-function NAME] script.py [args...]
 
 Per line of *your* code (files under --root) it reports:
 
@@ -32,8 +33,13 @@ MEMORY
            samples is not counted), bytes still held per line at the peak and at exit,
            allocation stacks at those two snapshots, untraced ("native") growth, and
            leak detection (held memory grew across >= 3 consecutive snapshots and was
-           still held at exit). Costs ~2-5x runtime (measured: 2.9x at the default
-           2-frame depth), because tracemalloc hooks every allocation. Routine snapshots
+           still held at exit). tracemalloc hooks every allocation, so the cost follows the
+           allocation rate: 2.9x measured on a light workload, 7.7x on an allocation-heavy
+           function (millions of small dicts), at the default 2-frame depth; snapshots add
+           more when much memory is traced (about 1.6 s each at 400 MB). --trace-function NAME
+           (Python 3.12+) traces only while that function runs, so the rest of the program
+           runs at full speed; leak detection is then off, because each call starts tracing
+           afresh. The native estimate excludes tracemalloc's own bookkeeping. Routine snapshots
            are capped at 10% of elapsed time; peak-capture snapshots (plateau, doubling)
            have their own budgets. Snapshot cost is predicted from tracemalloc's
            bookkeeping size.
@@ -73,6 +79,9 @@ MEMORY_STACK_CAP = 20_000
 LARGEST_OBJECTS = 20
 LARGEST_MIN_BYTES = 1 << 20
 CONTAINER_SAMPLE = 10_000
+# Peak-capture snapshot budgets, as shares of the traced time (see _precise_sample).
+PLATEAU_BUDGET = 1.0
+DOUBLING_BUDGET = 0.5
 # Total time report() may spend parsing source files to name memory-stack frames.
 NAME_PARSE_BUDGET_S = 2.0
 THIS_FILE = os.path.normcase(os.path.abspath(__file__))
@@ -188,7 +197,7 @@ def _sleep_overhead(interval: float) -> float:
 
 class LineStats:
     __slots__ = ("python_s", "native_s", "system_s", "cpu_s", "samples", "rss_up", "rss_down",
-                 "transient", "traced_up", "func")
+                 "transient", "traced_up", "book_up", "func")
 
     def __init__(self):
         self.python_s = self.native_s = self.system_s = self.cpu_s = 0.0
@@ -196,12 +205,13 @@ class LineStats:
         self.rss_up = self.rss_down = 0
         self.transient = 0      # largest short-lived peak seen between two samples
         self.traced_up = 0      # Python-allocator growth observed while this line ran
+        self.book_up = 0        # growth of tracemalloc's own bookkeeping while this line ran (profiler memory)
         self.func = None        # (name, first line) of the enclosing function
 
 
 class Profiler:
     def __init__(self, root: str, interval: float, memory: str, frames: int = 2,
-                 monitoring: str = 'off'):
+                 monitoring: str = 'off', trace_function: str | None = None):
         self.root = os.path.normcase(os.path.abspath(root)).rstrip(os.sep) + os.sep
         self.interval = interval
         self.memory = memory
@@ -234,6 +244,24 @@ class Profiler:
         self._plateau_cost = 0.0     # plateau and doubling snapshots have their own budgets, so doubling
         self._doubling_cost = 0.0    # snapshots on the way up cannot use up the plateau's
         self.timeline: list[tuple[float, float, float]] = []
+        # The main thread's stack key at each kept timeline point (None: no user frame), thinned with the
+        # timeline, so the report can split the run into phases by what the program was doing.
+        self.timeline_keys: list[tuple | None] = []
+        # Traced growth per stack key (the busiest thread's stack at the sample that saw it): allocation
+        # weighted by the full call path, as deep as time stacks, independent of the traceback depth.
+        self.alloc_stacks: dict[tuple, int] = {}
+        self.book_max = 0            # largest tracemalloc bookkeeping seen (profiler memory, not the program's)
+        self._last_rate = 0.0        # measured cost per bookkeeping byte of the last large snapshot, unclamped
+        self._trace_lock = threading.Lock()   # sampler memory work vs. a traced-function window opening/closing
+        # Precise mode scoped to one function: tracemalloc runs only while it does (--trace-function).
+        self.trace_function = trace_function if memory == 'precise' else None
+        self._tf_tool = None
+        self._tf_codes: set = set()       # code objects matching the name; their PY_START stays enabled
+        self._tf_depth = 0                # calls in progress (recursion, several threads)
+        self._tf_calls = 0                # traced windows opened
+        self._tf_traced_s = 0.0
+        self._tf_open_t = 0.0
+        self._snapped = False
         self._timeline_every = 1    # keep one sample in this many; doubles each time the cap is hit
         self._timeline_tick = 0
         self.rss_max = 0            # every sample's RSS, so thinning the timeline never hides the peak
@@ -465,6 +493,8 @@ class Profiler:
         """
         if self.memory != "precise" or self.memory_tracing_lost_s is not None:
             return False
+        if self.trace_function:
+            return tracemalloc.is_tracing()    # off between calls of the traced function, by design
         if tracemalloc.is_tracing():
             return True
         self.memory_tracing_lost_s = t
@@ -486,7 +516,7 @@ class Profiler:
         last_cpu: dict[int, float] = {}
         last_rss = self.rss()
         t0 = last_wall
-        last_snap_t, last_snap_traced, prev_traced = 0.0, 0, 0
+        last_snap_t, last_snap_traced, prev_traced, prev_book = 0.0, 0, 0, 0
         while not self._stop.is_set():
             sleep_started = time.perf_counter()
             time.sleep(self.interval)
@@ -568,106 +598,142 @@ class Profiler:
                             st.rss_up += d
                         else:
                             st.rss_down -= d
-            traced = 0
-            precise = self._precise(now - t0)
-            if precise:
-                traced, interval_peak = tracemalloc.get_traced_memory()
-                self.peak_traced = max(self.peak_traced, interval_peak)
-                if hasattr(tracemalloc, "reset_peak"):          # 3.9+
-                    tracemalloc.reset_peak()
-                    # A peak that rose and fell between samples (e.g. inside a C call that
-                    # held the GIL) - charge it to the line where the thread resumed.
-                    transient = interval_peak - max(traced, prev_traced)
-                else:
-                    transient = 0
-                busiest = max(per_thread, key=lambda t: (t[1] is not None, t[2] or 0)) if per_thread else None
-                if busiest is not None and busiest[1] is not None:
-                    st = self._stats(busiest[1])
-                    if traced > prev_traced:
-                        st.traced_up += traced - prev_traced     # cheap, no snapshot needed
-                    if transient > max(10 << 20, 0.25 * traced):
-                        st.transient = max(st.transient, transient)
-            self._record_timeline((now - t0, traced / 1e6, rss / 1e6))
+            with self._trace_lock:                   # a traced-function window cannot open or close meanwhile
+                prev_traced, prev_book, last_snap_t, last_snap_traced = self._precise_sample(
+                    now, t0, per_thread, stacks, names, main, rss,
+                    prev_traced, prev_book, last_snap_t, last_snap_traced)
+            if self._snapped:
+                # The snapshot held the GIL, so user threads only waited for it. Restart the interval
+                # here, or the next sample charges that pause to whichever user line runs next
+                # (measured: 0.5 s of "waiting" on a 0.04 s generator, from 2.1 s of snapshots).
+                last_wall, last_proc = time.perf_counter(), time.process_time()
 
-            if precise:
-                self.peak_traced = max(self.peak_traced, traced)
-                elapsed = now - t0
-                # spike: sudden jump since the previous *sample* -> snapshot now, so
-                # short-lived peaks (temporary copies) are attributed to their line.
-                spike = traced - prev_traced > max(prev_traced * 0.5, 10 << 20)
-                # periodic snapshots scale with runtime (~10 per run, 0.25-2 s apart) so even
-                # short programs get enough points for a leak trend
-                period = min(2.0, max(0.25, elapsed / 10))
-                due = spike or (traced > max(last_snap_traced * 1.25, 1 << 20)
-                                and elapsed - last_snap_t > 0.25) or elapsed - last_snap_t > period
-                # Peak capture: the snapshot holding the most memory feeds the peak memory stacks and the
-                # "held" labels, but routine snapshots are rationed and cost grows with traced memory, so
-                # allocation-heavy runs rarely got one near the peak. Memory that grows until exit is
-                # captured by the exit snapshot. Two triggers cover the rest, for memory 25% and 5 MB above
-                # anything a snapshot has captured:
-                #   plateau: the running maximum stopped rising (under 1% for 5 samples) and traced is still
-                #            within 10% of it, so memory that rises, stays, then falls is caught where it stays;
-                #   doubling: traced is twice the captured high, so a peak too brief for the sampler to see
-                #            (one C call holding the GIL) is still captured at half or more of its size.
-                # Doubling bounds their total cost at about twice the last snapshot.
-                if traced > self._run_high * 1.01:
-                    self._run_high, self._stalled = traced, 0
+    def _precise_sample(self, now, t0, per_thread, stacks, names, main, rss,
+                        prev_traced, prev_book, last_snap_t, last_snap_traced):
+        """Memory work for one sample: traced memory and its attribution, the timeline point, and
+        snapshots. Returns the carried state: previous traced and bookkeeping bytes, last snapshot."""
+        self._snapped = False
+        traced = book = 0
+        precise = self._precise(now - t0)
+        if precise:
+            traced, interval_peak = tracemalloc.get_traced_memory()
+            # tracemalloc's own bookkeeping (one record per live allocation) is process memory the
+            # profiler adds; it is subtracted from the native estimate (measured: 294 MB for 1M dicts).
+            book = tracemalloc.get_tracemalloc_memory()
+            self.book_max = max(self.book_max, book)
+            self.peak_traced = max(self.peak_traced, interval_peak, traced)
+            if hasattr(tracemalloc, "reset_peak"):          # 3.9+
+                tracemalloc.reset_peak()
+                # A peak that rose and fell between samples (e.g. inside a C call that
+                # held the GIL) - charge it to the line where the thread resumed.
+                transient = interval_peak - max(traced, prev_traced)
+            else:
+                transient = 0
+            busiest = max(per_thread, key=lambda t: (t[1] is not None, t[2] or 0)) if per_thread else None
+            if busiest is not None and busiest[1] is not None:
+                st = self._stats(busiest[1])
+                if traced > prev_traced:
+                    st.traced_up += traced - prev_traced     # cheap, no snapshot needed
+                    # Also by the busiest thread's whole stack (same key as its time stack), so allocation can
+                    # be weighed by call path as deep as time stacks, independent of the traceback depth.
+                    stack = stacks.get(busiest[0])
+                    key = (str(busiest[0]), names.get(busiest[0], 'Thread'), stack)
+                    if stack and key in self.stack_totals:
+                        self.alloc_stacks[key] = self.alloc_stacks.get(key, 0) + traced - prev_traced
+                if book > prev_book:
+                    st.book_up += book - prev_book
+                if transient > max(10 << 20, 0.25 * traced):
+                    st.transient = max(st.transient, transient)
+        main_stack = stacks.get(main)
+        self._record_timeline((now - t0, traced / 1e6, rss / 1e6),
+                              (str(main), names.get(main, 'Thread'), main_stack) if main_stack else None)
+        if not precise:
+            # Tracing is off (a traced-function window is closed): the next window starts from zero.
+            return 0, 0, last_snap_t, last_snap_traced
+        elapsed = now - t0
+        # spike: sudden jump since the previous *sample* -> snapshot now, so
+        # short-lived peaks (temporary copies) are attributed to their line.
+        spike = traced - prev_traced > max(prev_traced * 0.5, 10 << 20)
+        # periodic snapshots scale with runtime (~10 per run, 0.25-2 s apart) so even
+        # short programs get enough points for a leak trend
+        period = min(2.0, max(0.25, elapsed / 10))
+        due = spike or (traced > max(last_snap_traced * 1.25, 1 << 20)
+                        and elapsed - last_snap_t > 0.25) or elapsed - last_snap_t > period
+        # Peak capture: the snapshot holding the most memory feeds the peak memory stacks and the
+        # "held" labels, but routine snapshots are rationed and cost grows with traced memory, so
+        # allocation-heavy runs rarely got one near the peak. Memory that grows until exit is
+        # captured by the exit snapshot. Two triggers cover the rest, for memory 25% and 5 MB above
+        # anything a snapshot has captured:
+        #   plateau: the running maximum stopped rising (under 1% for 5 samples) and traced is still
+        #            within 10% of it, so memory that rises, stays, then falls is caught where it stays;
+        #   doubling: traced is twice the captured high, so a peak too brief for the sampler to see
+        #            (one C call holding the GIL) is still captured at half or more of its size.
+        # Doubling bounds their total cost at about twice the last snapshot.
+        if traced > self._run_high * 1.01:
+            self._run_high, self._stalled = traced, 0
+        else:
+            self._stalled += 1
+        above = self._run_high > 1.25 * self._snap_high and self._run_high - self._snap_high > (5 << 20)
+        plateau_due = above and self._stalled >= 5 and traced >= 0.9 * self._run_high
+        doubling_due = above and traced >= 2 * self._snap_high
+        # Predict the snapshot's cost from tracemalloc's bookkeeping size. Routine snapshots stay
+        # within 10% of elapsed runtime (at least 0.5 s in total, so short programs still get a few).
+        # Their prediction also uses the last large snapshot's measured rate, unclamped, so the cap
+        # holds against actual cost (at 6 frames the clamped rate under-predicted and routine
+        # snapshots reached 11.3%). Peak-capture snapshots keep the clamped rate, so one slow snapshot
+        # cannot block them, and have their own budgets: plateau up to the elapsed runtime (at least
+        # 2 s), doubling up to half of it (at least 1 s). The report states their count and cost.
+        one = book * self.snap_rate
+        # Budgets are shares of the time memory has been traced: the whole run, or with --trace-function
+        # only the traced calls (based on the whole run, one 45 s-in call spent 17.8 s on peak snapshots).
+        base = elapsed if not self.trace_function else self._tf_traced_s + (now - self._tf_open_t)
+        routine_ok = due and (self.snap_cost - self.peak_snap_cost
+                              + book * max(self.snap_rate, self._last_rate) <= max(0.10 * base, 0.5))
+        plateau_ok = plateau_due and self._plateau_cost + one <= max(PLATEAU_BUDGET * base, 2.0)
+        doubling_ok = not plateau_ok and doubling_due and self._doubling_cost + one <= max(DOUBLING_BUDGET * base, 1.0)
+        peak_ok = plateau_ok or doubling_ok
+        if routine_ok or peak_ok:
+            s = time.perf_counter()
+            self._snapshot(elapsed)
+            cost = time.perf_counter() - s
+            # The snapshot's own temporary objects are traced; without a reset they would raise the
+            # next interval's peak, inflating peak_traced and charging a "spike" to a user line.
+            # This interval's real peak was already read above.
+            if hasattr(tracemalloc, "reset_peak"):
+                tracemalloc.reset_peak()
+            self.snap_cost += cost
+            if peak_ok and not routine_ok:
+                self.peak_snap_cost += cost
+                self.peak_snapshots += 1
+                if plateau_ok:
+                    self._plateau_cost += cost
                 else:
-                    self._stalled += 1
-                above = self._run_high > 1.25 * self._snap_high and self._run_high - self._snap_high > (5 << 20)
-                plateau_due = above and self._stalled >= 5 and traced >= 0.9 * self._run_high
-                doubling_due = above and traced >= 2 * self._snap_high
-                prev_traced = traced
-                # Predict the snapshot's cost from tracemalloc's bookkeeping size. Routine snapshots stay
-                # within 10% of elapsed runtime (at least 0.5 s in total, so short programs still get a few).
-                # Peak-capture snapshots have their own budgets: plateau up to the elapsed runtime (at least
-                # 2 s), doubling up to half of it (at least 1 s). The report states their count and cost.
-                book = tracemalloc.get_tracemalloc_memory()
-                one = book * self.snap_rate
-                routine_ok = due and self.snap_cost - self.peak_snap_cost + one <= max(0.10 * elapsed, 0.5)
-                plateau_ok = plateau_due and self._plateau_cost + one <= max(elapsed, 2.0)
-                doubling_ok = not plateau_ok and doubling_due and self._doubling_cost + one <= max(0.5 * elapsed, 1.0)
-                peak_ok = plateau_ok or doubling_ok
-                if routine_ok or peak_ok:
-                    s = time.perf_counter()
-                    self._snapshot(elapsed)
-                    cost = time.perf_counter() - s
-                    # The snapshot's own temporary objects are traced; without a reset they would raise the
-                    # next interval's peak, inflating peak_traced and charging a "spike" to a user line.
-                    # This interval's real peak was already read above.
-                    if hasattr(tracemalloc, "reset_peak"):
-                        tracemalloc.reset_peak()
-                    self.snap_cost += cost
-                    if peak_ok and not routine_ok:
-                        self.peak_snap_cost += cost
-                        self.peak_snapshots += 1
-                        if plateau_ok:
-                            self._plateau_cost += cost
-                        else:
-                            self._doubling_cost += cost
-                    if book >= 8 << 20:
-                        # A slow average clamped to 2-3x the measured range: one snapshot slowed by GC or
-                        # first-time path resolution must not block the next (plateau) snapshot.
-                        self.snap_rate = min(20e-9, max(4e-9, 0.8 * self.snap_rate + 0.2 * (cost / book)))
-                    last_snap_t, last_snap_traced = elapsed, traced
-                    self._snap_high = max(self._snap_high, traced)
-                    # The snapshot held the GIL, so user threads only waited for it. Restart the interval
-                    # here, or the next sample charges that pause to whichever user line runs next
-                    # (measured: 0.5 s of "waiting" on a 0.04 s generator, from 2.1 s of snapshots).
-                    last_wall, last_proc = time.perf_counter(), time.process_time()
+                    self._doubling_cost += cost
+            if book >= 8 << 20:
+                self._last_rate = cost / book
+                # A slow average clamped to 2-3x the measured range: one snapshot slowed by GC or
+                # first-time path resolution must not block the next (plateau) snapshot.
+                self.snap_rate = min(20e-9, max(4e-9, 0.8 * self.snap_rate + 0.2 * (cost / book)))
+            last_snap_t, last_snap_traced = elapsed, traced
+            self._snap_high = max(self._snap_high, traced)
+            self._snapped = True
+        return traced, book, last_snap_t, last_snap_traced
 
-    def _record_timeline(self, point):
+    def _record_timeline(self, point, key=None):
         """Keep at most TIMELINE_CAP evenly spaced samples: when full, drop every other point
-        and halve the keep rate, so memory stays constant for any run length."""
+        and halve the keep rate, so memory stays constant for any run length. key: the main
+        thread's stack key at this point, kept in a parallel list."""
         self._timeline_tick += 1
         if self._timeline_tick < self._timeline_every:
             return
         self._timeline_tick = 0
         self.timeline.append(point)
+        self.timeline_keys.append(key)
         if len(self.timeline) >= TIMELINE_CAP:
             # The dropped last point was one old stride after the new last point, so the next
             # kept sample is one old stride away: that keeps the spacing exactly even.
             del self.timeline[1::2]
+            del self.timeline_keys[1::2]
             self._timeline_tick = self._timeline_every
             self._timeline_every *= 2
 
@@ -743,7 +809,7 @@ class Profiler:
     def start(self):
         self._remember_sources()
         self.sleep_overhead = _sleep_overhead(self.interval) if self.split else 0.0
-        if self.memory == "precise":
+        if self.memory == "precise" and not self.trace_function:
             tracemalloc.start(self.frames)
         self.rss0 = self.rss() if self.rss_kind else None
         self.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -751,11 +817,92 @@ class Profiler:
         self.cpu0 = time.process_time()
         self._thread.start()
         self._enable_monitoring()
+        if self.trace_function:
+            self._enable_trace_function()
+
+    # ------------------------------------------------------------ precise mode for one function
+    def _enable_trace_function(self):
+        """PY_START for every function once: a non-matching one returns DISABLE, which turns the event
+        off at that code location, so other code runs at full speed after its first call. Matching code
+        keeps PY_START and gets a local PY_RETURN; PY_UNWIND (global only) is on while a window is open."""
+        mon = sys.monitoring
+        tool = next((t for t in (4, 3) if mon.get_tool(t) is None), None)
+        if tool is None:
+            raise RuntimeError('no free sys.monitoring tool ID for --trace-function')
+        mon.use_tool_id(tool, 'python-memory-guardian-trace')
+        self._tf_tool, self._tf_disable = tool, mon.DISABLE
+        mon.register_callback(tool, mon.events.PY_START, self._tf_on_start)
+        mon.register_callback(tool, mon.events.PY_RETURN, self._tf_on_return)
+        mon.register_callback(tool, mon.events.PY_UNWIND, self._tf_on_unwind)
+        mon.set_events(tool, mon.events.PY_START)
+
+    def _tf_matches(self, code) -> bool:
+        name = self.trace_function
+        return (code.co_name == name or getattr(code, 'co_qualname', '').replace('.<locals>', '') == name) \
+            and self._is_user(code.co_filename)
+
+    def _tf_on_start(self, code, _offset):
+        if code not in self._tf_codes:
+            if not self._tf_matches(code):
+                return self._tf_disable
+            self._tf_codes.add(code)
+            sys.monitoring.set_local_events(self._tf_tool, code, sys.monitoring.events.PY_RETURN)
+        with self._trace_lock:
+            self._tf_depth += 1
+            if self._tf_depth == 1:
+                self._tf_calls += 1
+                tracemalloc.start(self.frames)
+                self._tf_open_t = time.perf_counter()
+                mon = sys.monitoring
+                mon.set_events(self._tf_tool, mon.events.PY_START | mon.events.PY_UNWIND)
+        return None
+
+    def _tf_on_return(self, code, _offset, _retval):
+        if code in self._tf_codes:
+            self._tf_exit()
+
+    def _tf_on_unwind(self, code, _offset, _exc):
+        if code in self._tf_codes:
+            self._tf_exit()
+
+    def _tf_exit(self):
+        """The outermost traced call ended: snapshot what it still holds, then stop tracing (which
+        clears every trace, so the snapshot has to come first)."""
+        with self._trace_lock:
+            self._tf_depth = max(0, self._tf_depth - 1)
+            if self._tf_depth or not tracemalloc.is_tracing():
+                return
+            now = time.perf_counter()
+            traced, peak = tracemalloc.get_traced_memory()
+            self.peak_traced = max(self.peak_traced, traced, peak)
+            self._snapshot(now - self.t0)
+            self.snap_cost += time.perf_counter() - now
+            tracemalloc.stop()
+            self._tf_traced_s += now - self._tf_open_t
+            sys.monitoring.set_events(self._tf_tool, sys.monitoring.events.PY_START)
+
+    def _disable_trace_function(self):
+        tool, self._tf_tool = self._tf_tool, None
+        if tool is None:
+            return
+        mon = sys.monitoring
+        try:
+            mon.set_events(tool, 0)
+            for code in self._tf_codes:
+                mon.set_local_events(tool, code, 0)
+        finally:
+            for event in (mon.events.PY_START, mon.events.PY_RETURN, mon.events.PY_UNWIND):
+                mon.register_callback(tool, event, None)
+            mon.free_tool_id(tool)
 
     def stop(self, main_globals: dict | None = None):
         self._stop.set()
         self._thread.join()
         self._disable_monitoring()
+        self._disable_trace_function()
+        if self.trace_function and self._tf_depth and tracemalloc.is_tracing():
+            # A traced call still running at exit (a background thread): count its time so far.
+            self._tf_traced_s += time.perf_counter() - self._tf_open_t
         self.wall = time.perf_counter() - self.t0
         self.cpu = time.process_time() - self.cpu0
         self.holders: dict = {}
@@ -769,9 +916,10 @@ class Profiler:
         # Capture the process after user code exits; a short-lived allocation can
         # otherwise be the timeline's last point even though the exit snapshot frees it.
         self.timeline.append((self.wall, traced_now / 1e6, (self.rss1 or 0) / 1e6))
+        self.timeline_keys.append(None)
         if precise:
             self._snapshot(self.wall)          # what is still held at exit
-            leaks = self._leaks()
+            leaks = self._leaks() if not self.trace_function else {}
             if leaks:                          # needs tracemalloc still running
                 self.holders = self._find_holders(set(leaks), main_globals)
             tracemalloc.stop()
@@ -1088,13 +1236,28 @@ class Profiler:
         peak = table(self._peak_stacks) if self._peak_stacks else None
         return {'depth': self.frames, 'frames': frames, 'peak': peak, 'exit': table(self._last_stacks)}
 
+    def _native_estimate(self) -> float:
+        """Process memory beyond the traced peak and tracemalloc's largest bookkeeping, in bytes.
+        get_tracemalloc_memory() misstates tracing's real RSS cost in both directions (measured with 2
+        frames: +52 MB unreported on 300k dicts with 72 MB of bookkeeping; -125 MB on 1M dicts), and in a
+        profiled 300k-dict run 102 MB remained. So an estimate within twice the bookkeeping cannot be told
+        apart from tracing overhead and is reported as 0; native buffers (PyArrow, Polars) clear it."""
+        # The largest bookkeeping, like the largest traced memory: RSS rarely falls, so its peak reflects the
+        # highest of both even when it is reached later (with the bookkeeping at the RSS peak instead, a
+        # pure-Python run kept 492 MB of "native" memory).
+        book = self.book_max
+        native = self.rss_max - self.peak_traced - book - (self.rss0 or 0)
+        return native if native > 2 * book else 0.0
+
     def report(self, script: str) -> dict:
         peak_idx = max(range(len(self.snapshots)), key=lambda i: sum(self.snapshots[i][1].values()),
                        default=None)
         peak = self.snapshots[peak_idx][1] if peak_idx is not None else {}
         end = self.snapshots[-1][1] if self.snapshots else {}
         # Leak claims need an exit snapshot; after tracing was lost the last one is not at exit.
-        leaks = self._leaks() if self.memory_tracing_lost_s is None else {}
+        # Leak claims need an exit snapshot of the whole run: not after tracing was lost, and not when only
+        # one function was traced (each call starts tracing afresh, so held memory cannot be followed).
+        leaks = self._leaks() if self.memory_tracing_lost_s is None and not self.trace_function else {}
         total = sum(s.python_s + s.native_s + s.system_s + s.cpu_s for s in self.lines.values()) or 1.0
         files: dict[str, dict] = {}
         funcs: dict[str, dict] = {}
@@ -1133,6 +1296,8 @@ class Profiler:
             if self.memory == "precise":
                 e["transient_peak_mb"] = round(st.transient / 1e6, 3)
                 e["alloc_mb"] = round(st.traced_up / 1e6, 3)
+                # tracemalloc's own bookkeeping growth while this line ran: profiler memory inside rss_growth_mb
+                e["profiler_mb"] = round(st.book_up / 1e6, 3)
                 e["peak_mb"] = round(peak.get(loc, 0) / 1e6, 3)
                 e["end_mb"] = round(end.get(loc, 0) / 1e6, 3)
                 if loc in leaks:
@@ -1171,7 +1336,7 @@ class Profiler:
                 fn = funcs.setdefault(loc[0], {}).setdefault(str(st.func[1]), {
                     "name": fname, "time_s": 0.0, "python_s": 0.0, "native_s": 0.0,
                     "system_s": 0.0, "peak_mb": 0.0, "transient_peak_mb": 0.0, "alloc_mb": 0.0,
-                    "rss_growth_mb": 0.0})
+                    "rss_growth_mb": 0.0, "profiler_mb": 0.0})
                 fn['end_line'] = symbols[loc[0]].get(st.func[1], {}).get('end_line')
                 for k in ("time_s", "python_s", "native_s", "system_s"):
                     fn[k] = round(fn[k] + e[k], 4)
@@ -1179,15 +1344,20 @@ class Profiler:
                 fn["transient_peak_mb"] = max(fn["transient_peak_mb"], e.get("transient_peak_mb", 0))
                 fn["alloc_mb"] = round(fn["alloc_mb"] + e.get("alloc_mb", 0), 3)
                 fn["rss_growth_mb"] = round(fn["rss_growth_mb"] + e["rss_growth_mb"], 3)
+                fn["profiler_mb"] = round(fn["profiler_mb"] + e.get("profiler_mb", 0), 3)
         hashes = {path: digest for path, digest in hashes.items() if path in files}
         step = max(1, (len(self.timeline) + 298) // 299)
         timeline = self.timeline[::step]
+        timeline_keys = self.timeline_keys[::step]
         if timeline and timeline[-1] != self.timeline[-1]:
             timeline.append(self.timeline[-1])
+            timeline_keys.append(self.timeline_keys[-1])
         stack_frames: list[dict] = []
         frame_ids: dict[tuple, int] = {}
         stack_samples: list[dict] = []
+        sample_index: dict[tuple, int] = {}
         for (ident, name, stack), values in self.stack_totals.items():
+            sample_index[(ident, name, stack)] = len(stack_samples)
             ids = []
             for i in range(0, len(stack), 2):
                 file, func, first_line, user = self._codes[stack[i]][:4]   # not `name`: the thread's
@@ -1200,7 +1370,9 @@ class Profiler:
             stack_samples.append({'thread': ident, 'thread_name': name, 'frames': ids,
                                   'python_s': round(values[0], 6), 'native_s': round(values[1], 6),
                                   'system_s': round(values[2], 6), 'unsplit_s': round(values[3], 6),
-                                  'samples': values[4]})
+                                  'samples': values[4],
+                                  **({'alloc_bytes': self.alloc_stacks.get((ident, name, stack), 0)}
+                                     if self.memory == 'precise' else {})})
         # Caller-only files still need a verified hash for source navigation.
         for frame in stack_frames:
             path = frame['file']
@@ -1232,17 +1404,23 @@ class Profiler:
             "memory_tracing_lost_s": (round(self.memory_tracing_lost_s, 4)
                                       if self.memory_tracing_lost_s is not None else None),
             "sampler_error": self.sampler_error,
+            "trace_function": ({"name": self.trace_function, "calls": self._tf_calls,
+                                "traced_s": round(self._tf_traced_s, 4)} if self.trace_function else None),
             "peak_traced_mb": round(self.peak_traced / 1e6, 3) if self.memory == "precise" else None,
             "rss_start_mb": round(self.rss0 / 1e6, 3) if self.rss0 else None,
             "rss_end_mb": round(self.rss1 / 1e6, 3) if self.rss1 else None,
             "rss_peak_mb": round(max(self.rss_max, self.rss1 or 0) / 1e6, 3),
             # Process-level native estimate: memory the Python allocator never saw
             # (C extensions, NumPy/Arrow buffers, interpreter). Not attributed per line.
-            "native_untraced_mb": (round(max(0.0, self.rss_max / 1e6
-                                             - self.peak_traced / 1e6
-                                             - (self.rss0 or 0) / 1e6), 3)
-                                   if self.memory == "precise" and self.rss_kind == "current" else None),
+            # Not with --trace-function: Python memory allocated outside the traced calls is untraced,
+            # so RSS minus traced memory would count it as native (measured: 219 MB of plain str).
+            "native_untraced_mb": (round(self._native_estimate() / 1e6, 3)
+                                   if self.memory == "precise" and self.rss_kind == "current"
+                                   and not self.trace_function else None),
             "timeline": [[round(a, 3), round(b, 3), round(c, 3)] for a, b, c in timeline],
+            # Per timeline point: index into stacks.samples of the main thread's stack then (-1: none).
+            "timeline_stacks": [sample_index.get(k, -1) if k else -1 for k in timeline_keys],
+            "tracemalloc_peak_mb": round(self.book_max / 1e6, 3) if self.memory == "precise" else None,
             "file_hashes": hashes, "files": files, "functions": funcs,
             'memory_stacks': self._memory_stacks(),
             'largest_objects': self.largest,
@@ -1261,6 +1439,8 @@ def main(argv=None) -> int:
     ap.add_argument("--frames", type=int, default=2, help="precise mode traceback depth (cost grows with depth)")
     ap.add_argument("--monitoring", choices=("off", "lines"), default="off",
                     help="optional Python 3.12+ line-event coverage; timing still uses sampling")
+    ap.add_argument("--trace-function", default=None, metavar="NAME",
+                    help="precise mode only while functions with this name (or qualified name) run; Python 3.12+")
     # One REMAINDER positional preserves a target's own '--' separator.
     ap.add_argument("script_args", nargs=argparse.REMAINDER, metavar="script [args...]")
     ns = ap.parse_args(argv)
@@ -1271,11 +1451,18 @@ def main(argv=None) -> int:
         ap.error('--interval must be finite and positive')
     if not 1 <= ns.frames <= 64:
         ap.error('--frames must be between 1 and 64')
+    if ns.trace_function is not None:
+        if ns.memory != 'precise':
+            ap.error('--trace-function needs --memory precise')
+        if not hasattr(sys, 'monitoring'):
+            ap.error('--trace-function needs Python 3.12+ (sys.monitoring)')
+        if not ns.trace_function.strip():
+            ap.error('--trace-function needs a function name')
 
     script = os.path.abspath(script_args[0])
     out = os.path.abspath(ns.out)  # Target code may change the working directory.
     prof = Profiler(ns.root or os.path.dirname(script), ns.interval, ns.memory, ns.frames,
-                    ns.monitoring)
+                    ns.monitoring, ns.trace_function.strip() if ns.trace_function else None)
     prof.argv = list(script_args[1:])
     sys.argv = [script] + script_args[1:]
     sys.path.insert(0, os.path.dirname(script))

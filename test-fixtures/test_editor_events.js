@@ -41,7 +41,8 @@ const vscode = {
   },
   commands: { registerCommand: disposable },
 };
-class GuardianReport { update() {} show() {} refresh() { refreshes++; } comparisonFor() { return null; } dispose() {} }
+let reportCleared = 0;
+class GuardianReport { update(index) { if (!index) reportCleared++; } show() {} refresh() { refreshes++; } comparisonFor() { return null; } dispose() {} }
 Module._load = function(name, ...args) {
   if (name === 'vscode') return vscode;
   if (name === './reportView') return { GuardianReport };
@@ -123,8 +124,13 @@ Module._load = function(name, ...args) {
   assert.deepStrictEqual(summary.source.files.map(f => f.freshness), ['fresh']);
   assert.strictEqual(summary.static_diagnostics.findings[0].code, 'x', 'open file: its static finding is included');
   assert.strictEqual(summary.static_diagnostics.findings[0].measured, 'hot');
+  const before = reportCleared;
+  view['profileDeleted'](uri(path.join(os.tmpdir(), 'other-project', '.pmg', 'profile.json')));
+  assert.strictEqual(reportCleared, before, "another folder's profile.json being deleted leaves the report");
+  assert(fs.existsSync(summaryJson), 'and keeps this run\'s summary');
   view['profileDeleted'](uri(runJson));
   assert(!fs.existsSync(summaryJson), 'deleting the profile removes its summary');
+  assert.strictEqual(reportCleared, before + 1, 'and clears the report that showed it');
   fs.rmSync(project, { recursive: true, force: true });
   console.log('PASS a profiling run writes .pmg/summary.json with static findings for open files; deleting the profile removes it');
 } catch (e) {

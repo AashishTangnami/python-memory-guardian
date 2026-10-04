@@ -1,6 +1,6 @@
 const assert = require('assert');
 const m = require('../out/profileModel');
-const { diagnose, callTree, overview, frameOrigin, topFunctions, neighbors, functionKey } = require('../out/reportModel');
+const { diagnose, callTree, overview, frameOrigin, topFunctions, neighbors, functionKey, phases, hasMetric } = require('../out/reportModel');
 const { remapProfileKeys, toLocal } = require('../out/containerPaths');
 const { reportHtml } = require('../out/reportWebview');
 const file = '/app/work.py';
@@ -239,7 +239,46 @@ const natTop = topFunctions(nat, 'python');
 assert.strictEqual(natTop.find(r => r.name === 'main').nativeMb, 127);
 assert.strictEqual(natTop.find(r => r.name === 'read_csv').nativeMb, null, 'no estimate for library code');
 assert(topFunctions({ ...nat, memory_mode: 'fast' }, 'python').every(r => r.nativeMb === null), 'precise mode only');
+// Phases: contiguous stretches by the main thread's function at a depth; new RSS is beyond earlier phases.
+const ph = { schema: 3, script: '/app/main.py', python: '3.13', gil_split: true, memory_mode: 'precise', wall_s: 5,
+  peak_traced_mb: 40, rss_peak_mb: 70, rss_start_mb: 10, rss_kind: 'current', tracemalloc_peak_mb: 1, native_untraced_mb: 0,
+  file_hashes: {}, files: {}, functions: {},
+  timeline: [[0, 5, 20], [1, 40, 50], [2, 2, 50], [3, 3, 60], [4, 30, 70], [5, 0, 70]],
+  timeline_stacks: [0, 2, 1, 1, 2, -1],
+  stacks: { frames: ['<module>', 'run', 'a', 'b', 'helper'].map((name, i) => ({ name, file: '/app/main.py', line: i + 1, first_line: i + 1, user: true })),
+    samples: [
+      { thread: '1', thread_name: 'MainThread', frames: [0, 1, 2, 4], python_s: 1, native_s: 0, system_s: 0, unsplit_s: 0, samples: 1, alloc_bytes: 10e6 },
+      { thread: '1', thread_name: 'MainThread', frames: [0, 1, 3, 4], python_s: 2, native_s: 0, system_s: 0, unsplit_s: 0, samples: 2, alloc_bytes: 0 },
+      { thread: '1', thread_name: 'MainThread', frames: [0, 1, 2], python_s: 2, native_s: 0, system_s: 0, unsplit_s: 0, samples: 2, alloc_bytes: 4e6 },
+    ], dropped_s: 0, depth_limited: false } };
+assert(m.parseProfile(JSON.stringify(ph)), 'phase test profile is valid');
+const auto = phases(ph);
+assert.strictEqual(auto.depth, 2, 'auto: the shallowest level with 3+ phases covering 90%, none over half the run');
+assert.deepStrictEqual(auto.phases.map(x => [x.name, x.from, x.to, x.peakTracedMb, x.peakRssMb, x.newRssMb]),
+  [['a', 0, 2, 40, 50, 40], ['b', 2, 4, 3, 60, 10], ['a', 4, 5, 30, 70, 10]], 'a, then b, then a again: three phases');
+assert.strictEqual(phases(ph, 3).phases.length, 2, 'helper level: only the points that reached it');
+// One sample in the caller between two calls does not split a phase.
+const gap = { ...ph, timeline: [[0, 1, 20], [1, 1, 20], [2, 1, 20], [3, 1, 20], [4, 1, 20], [5, 1, 20]],
+  timeline_stacks: [1, 1, -1, 1, 1, -1] };
+assert.deepStrictEqual(phases(gap, 2).phases.map(x => [x.name, x.from, x.to]), [['b', 0, 5]], 'a one-point gap is bridged');
+assert.deepStrictEqual(phases({ ...ph, timeline_stacks: undefined }).phases, [], 'older profiles have no phases');
+// Allocation by call path, and focus on one caller of a shared helper.
+assert.strictEqual(callTree(ph, 'mem_alloc').nodes[0].value, 14e6, 'sampled allocation over every stack');
+const keyOf = name => functionKey(ph.stacks.frames.find(f => f.name === name));
+const helperUnder = name => topFunctions(ph, 'mem_alloc', '', 'all', 200, keyOf(name)).find(f => f.name === 'helper');
+assert.strictEqual(helperUnder('a').total, 10e6, 'helper allocated 10 MB when called from a');
+assert.strictEqual(helperUnder('b'), undefined, 'and nothing from b');
+assert.strictEqual(callTree(ph, 'elapsed', '', 25000, 'all', false, keyOf('b')).nodes[0].value, 2, 'focus keeps only stacks through b');
+assert(hasMetric(ph, 'mem_alloc') && !hasMetric(ph, 'mem_peak'), 'measures follow what the profile recorded');
+// Native estimate gated by the run: no native memory beyond tracing overhead for the run means none per line.
+assert.strictEqual(m.nativeMb({ rss_growth_mb: 400, alloc_mb: 40, profiler_mb: 50 }, ph), 0, 'run found none: line reads 0');
+assert.strictEqual(m.nativeMb({ rss_growth_mb: 400, alloc_mb: 40, profiler_mb: 50 }, { ...ph, native_untraced_mb: 300 }), 310);
+assert.strictEqual(m.nativeMb({ rss_growth_mb: 400, alloc_mb: 0 }, { ...ph, native_untraced_mb: null, trace_function: { name: 'f' } }), 0,
+  'one function traced: growth elsewhere is untraced Python memory, not native');
+assert.strictEqual(overview({ ...ph, native_untraced_mb: 219, trace_function: { name: 'f', calls: 1, traced_s: 1 } }).nativeUntracedMb, null,
+  'a scoped profile written before the fix still shows no run-level estimate');
 const html = reportHtml('abcdef');
+assert(html.includes("metric('Leak detection','off')") && html.includes("'not measured'"), 'scoped runs say leak detection is off and native is not measured');
 assert(html.includes("default-src 'none'"));
 assert(html.includes('id="overviewTab"') && html.includes('id="memoryTimeline"') && html.includes('id="hotspots"'));
 assert(!html.includes('innerHTML'), 'profile strings must not be interpreted as HTML');

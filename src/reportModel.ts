@@ -25,8 +25,8 @@ export function overview(profile: Profile): ReportOverview {
       if (profile.memory_mode === 'precise') {
         if (e.leak_runs) memory = `${(e.end_mb ?? 0).toFixed(1)} MB held`;
         else if ((e.peak_mb ?? 0) >= 1) memory = `${e.peak_mb!.toFixed(1)} MB at peak`;
-        else if ((e.alloc_mb ?? 0) >= nativeMb(e) && (e.alloc_mb ?? 0) >= 1) memory = `${e.alloc_mb!.toFixed(1)} MB allocated`;
-        else if (nativeMb(e) >= 1) memory = `native ≈ +${nativeMb(e).toFixed(1)} MB`;
+        else if ((e.alloc_mb ?? 0) >= nativeMb(e, profile) && (e.alloc_mb ?? 0) >= 1) memory = `${e.alloc_mb!.toFixed(1)} MB allocated`;
+        else if (nativeMb(e, profile) >= 1) memory = `native ≈ +${nativeMb(e, profile).toFixed(1)} MB`;
       } else if (profile.memory_mode === 'fast' && e.rss_growth_mb >= 1) {
         memory = `RSS +${e.rss_growth_mb.toFixed(1)} MB`;
       }
@@ -38,7 +38,8 @@ export function overview(profile: Profile): ReportOverview {
   const stride = Math.max(1, Math.ceil(points.length / 299));
   return {
     cpuS: profile.cpu_s ?? null, samples: profile.samples ?? null, rssKind: profile.rss_kind ?? null,
-    nativeUntracedMb: profile.memory_mode === 'precise' ? profile.native_untraced_mb ?? null : null,
+    // Not when only one function was traced: untraced Python memory would read as native.
+    nativeUntracedMb: profile.memory_mode === 'precise' && !profile.trace_function ? profile.native_untraced_mb ?? null : null,
     rssStartMb: profile.rss_start_mb ?? null, rssEndMb: profile.rss_end_mb ?? null,
     rssPeakMb: profile.rss_peak_mb ?? null, tracedPeakMb: profile.peak_traced_mb ?? null,
     timeline: points.filter((_, i) => i % stride === 0 || i === points.length - 1),
@@ -186,17 +187,33 @@ export function frameOrigin(f: StackFrame): FrameOrigin {
   return { kind: 'library', label: `${base} (outside your project)`, detail: '' };
 }
 
-export type CallMetric = 'elapsed' | 'python' | 'native' | 'system' | 'unsplit' | 'mem_peak' | 'mem_exit';
-export const isMemoryMetric = (metric: CallMetric) => metric === 'mem_peak' || metric === 'mem_exit';
+export type CallMetric = 'elapsed' | 'python' | 'native' | 'system' | 'unsplit' | 'mem_peak' | 'mem_exit' | 'mem_alloc';
+/** Measures in bytes. mem_peak/mem_exit come from snapshot tracebacks; mem_alloc from sampled time stacks. */
+export const isMemoryMetric = (metric: CallMetric) => metric === 'mem_peak' || metric === 'mem_exit' || metric === 'mem_alloc';
+/** Whether a profile can show a measure: memory-stack tables, or allocation recorded on time stacks. */
+export function hasMetric(profile: Profile, metric: CallMetric): boolean {
+  if (metric === 'mem_peak' || metric === 'mem_exit') return !!profile.memory_stacks;
+  if (metric === 'mem_alloc') return (profile.stacks?.samples ?? []).some(s => s.alloc_bytes != null);
+  return true;
+}
 
-/** The stacks a measure weighs: time samples, or a memory-stack table (bytes, no thread). */
-function stackSource(profile: Profile, metric: CallMetric, thread: string): { frames: StackFrame[]; samples: { frames: number[]; weight: number }[] } {
-  if (isMemoryMetric(metric)) {
+/**
+ * The stacks a measure weighs: time samples (optionally one thread), allocation on time samples, or a
+ * memory-stack table (bytes, no thread). focus: a functionKey; only stacks passing through it are kept, so a
+ * helper shared by several callers can be seen under one of them.
+ */
+function stackSource(profile: Profile, metric: CallMetric, thread: string, focus = ''): { frames: StackFrame[]; samples: { frames: number[]; weight: number }[] } {
+  let out: { frames: StackFrame[]; samples: { frames: number[]; weight: number }[] };
+  if (metric === 'mem_peak' || metric === 'mem_exit') {
     const ms = profile.memory_stacks, table = metric === 'mem_peak' ? ms?.peak : ms?.exit;
-    return { frames: ms?.frames ?? [], samples: (table?.stacks ?? []).map(s => ({ frames: s.frames, weight: s.bytes })) };
+    out = { frames: ms?.frames ?? [], samples: (table?.stacks ?? []).map(s => ({ frames: s.frames, weight: s.bytes })) };
+  } else {
+    out = { frames: profile.stacks?.frames ?? [], samples: (profile.stacks?.samples ?? [])
+      .filter(s => !thread || s.thread === thread).map(s => ({ frames: s.frames, weight: sampleWeight(s, metric) })) };
   }
-  return { frames: profile.stacks?.frames ?? [], samples: (profile.stacks?.samples ?? [])
-    .filter(s => !thread || s.thread === thread).map(s => ({ frames: s.frames, weight: sampleWeight(s, metric) })) };
+  if (!focus) return out;
+  const through = new Set(out.frames.flatMap((f, id) => functionKey(f) === focus ? [id] : []));
+  return { frames: out.frames, samples: out.samples.filter(s => s.frames.some(id => through.has(id))) };
 }
 
 /** Frames without a recoverable function name (frozen or compiled code) are shown by line. */
@@ -204,6 +221,7 @@ const shownName = (f: StackFrame) => f.name || `line ${f.line}`;
 
 function sampleWeight(sample: StackSample, metric: CallMetric): number {
   if (metric === 'elapsed') return sample.python_s + sample.native_s + sample.system_s + sample.unsplit_s;
+  if (metric === 'mem_alloc') return sample.alloc_bytes ?? 0;
   return metric === 'mem_peak' || metric === 'mem_exit' ? 0 : sample[`${metric}_s`];
 }
 /** value = self + omitted + children's values. omitted: deeper calls cut off by the node limit, still counted here. */
@@ -212,8 +230,8 @@ export interface CallTree { nodes: CallNode[]; frames: ReportFrame[]; omitted: n
 
 /** Add each sampled stack once; parent time includes descendants, self time does not. */
 export function callTree(profile: Profile, metric: CallMetric, thread = '', limit = 25000,
-                         view: FrameView = 'all', inverted = false): CallTree {
-  const source = stackSource(profile, metric, thread), all = source.frames;
+                         view: FrameView = 'all', inverted = false, focus = ''): CallTree {
+  const source = stackSource(profile, metric, thread, focus), all = source.frames;
   // Inverted (bottom-up): each function where time or memory is spent sits at the top, its callers below.
   // Frames are merged by function first, so a function reached from several lines is one box and the top
   // level equals each function's self value in topFunctions.
@@ -325,8 +343,8 @@ export function functionKey(f: StackFrame): string {
 }
 
 /** Weighted samples as function keys, outermost first; the 'mine' view keeps only user frames. */
-function weightedStacks(profile: Profile, metric: CallMetric, thread: string, view: FrameView) {
-  const { frames, samples } = stackSource(profile, metric, thread);
+function weightedStacks(profile: Profile, metric: CallMetric, thread: string, view: FrameView, focus = '') {
+  const { frames, samples } = stackSource(profile, metric, thread, focus);
   const keys = frames.map(functionKey), out: { keys: string[]; ids: number[]; weight: number }[] = [];
   for (const sample of samples) {
     const ids = view === 'mine' ? sample.frames.filter(id => frames[id].user) : sample.frames;
@@ -347,12 +365,12 @@ function functionMemory(profile: Profile, f: StackFrame): number | null {
 function functionNative(profile: Profile, f: StackFrame): number | null {
   if (!f.user || profile.memory_mode !== 'precise' || !profile.rss_kind) return null;
   const entry = profile.functions?.[f.file]?.[String(f.first_line)];
-  return entry ? nativeMb(entry) : null;
+  return entry ? nativeMb(entry, profile) : null;
 }
 
 /** Functions ranked by self time: the answer to "where is the time spent" that a chart splits across paths. */
-export function topFunctions(profile: Profile, metric: CallMetric, thread = '', view: FrameView = 'all', limit = 200): FunctionRow[] {
-  const { frames, out: stacks } = weightedStacks(profile, metric, thread, view);
+export function topFunctions(profile: Profile, metric: CallMetric, thread = '', view: FrameView = 'all', limit = 200, focus = ''): FunctionRow[] {
+  const { frames, out: stacks } = weightedStacks(profile, metric, thread, view, focus);
   const rows = new Map<string, FunctionRow>(), callers = new Map<string, Set<string>>();
   for (const { keys, ids, weight } of stacks) {
     const counted = new Set<string>();
@@ -375,8 +393,8 @@ export function topFunctions(profile: Profile, metric: CallMetric, thread = '', 
 }
 
 /** Who calls a function and what it calls, merged across all its call paths. */
-export function neighbors(profile: Profile, metric: CallMetric, key: string, thread = '', view: FrameView = 'all', limit = 20): Neighbors {
-  const { frames, out: stacks } = weightedStacks(profile, metric, thread, view);
+export function neighbors(profile: Profile, metric: CallMetric, key: string, thread = '', view: FrameView = 'all', limit = 20, focus = ''): Neighbors {
+  const { frames, out: stacks } = weightedStacks(profile, metric, thread, view, focus);
   const byKey = new Map(frames.map(f => [functionKey(f), f] as const));
   const callerTime = new Map<string, number>(), calleeTime = new Map<string, number>();
   let value = 0, self = 0;
@@ -398,4 +416,80 @@ export function neighbors(profile: Profile, metric: CallMetric, key: string, thr
     return { key: k, name: shownName(f), origin: frameOrigin(f), value: v };
   });
   return { key, value, self, callers: list(callerTime), callees: list(calleeTime) };
+}
+
+/** A stretch of the run spent in one function at a chosen depth of the main thread's stack. */
+export interface Phase {
+  /** functionKey of the function at this depth, and of the functions above it, outermost first. */
+  key: string; path: string[]; name: string; file: string; line: number;
+  from: number; to: number; seconds: number;
+  /** Highest values at timeline points inside the phase; null when the run did not measure them. */
+  peakTracedMb: number | null; peakRssMb: number | null;
+  /** RSS above anything earlier phases reached: memory this phase needed that was not already resident. */
+  newRssMb: number | null;
+}
+export interface Phases { depth: number; auto: boolean; maxDepth: number; phases: Phase[]; }
+
+/**
+ * Split the run into phases: contiguous timeline stretches where the main thread was in the same function at
+ * `depth` user frames below its outermost one (0 = the script itself). Stretches are by time, so a function
+ * called once per pipeline (verify after eager, then after streaming) stays two phases when something else ran
+ * between. Points whose stack is shallower than the depth (or that had no user frame) belong to no phase.
+ * Resolution is the timeline's: at most 300 points.
+ */
+export function phases(profile: Profile, depth?: number): Phases {
+  const tl = profile.timeline ?? [], ts = profile.timeline_stacks ?? [], st = profile.stacks;
+  if (!st || ts.length !== tl.length || tl.length < 2) return { depth: 0, auto: depth == null, maxDepth: 0, phases: [] };
+  const paths = ts.map(i => i < 0 ? [] : st.samples[i].frames.filter(id => st.frames[id].user));
+  const maxDepth = Math.max(0, ...paths.map(p => p.length - 1));
+  const wall = Math.max(tl[tl.length - 1][0], profile.wall_s, 1e-9);
+  const precise = profile.memory_mode === 'precise', rss = !!profile.rss_kind && profile.memory_mode !== 'off';
+  const build = (d: number): Phase[] => {
+    const out: Phase[] = [];
+    let runningRss = profile.rss_start_mb ?? tl[0][2];   // RSS already resident before the first phase
+    for (let i = 0; i < tl.length;) {
+      const ids = paths[i].slice(0, d + 1);
+      if (ids.length <= d) { runningRss = Math.max(runningRss, tl[i][2]); i++; continue; }
+      const keys = ids.map(id => functionKey(st.frames[id])), key = keys.join('>');
+      const keyAt = (k: number) => paths[k].length > d ? paths[k].slice(0, d + 1).map(id => functionKey(st.frames[id])).join('>') : null;
+      // A stretch continues across up to two points with a shallower stack (a sample that landed in the caller
+      // between two calls), so one phase is not split in two.
+      let j = i;
+      for (;;) {
+        if (j + 1 < tl.length && keyAt(j + 1) === key) { j++; continue; }
+        const resume = [2, 3].find(k => j + k < tl.length && keyAt(j + k) === key
+          && Array.from({ length: k - 1 }, (_, g) => keyAt(j + 1 + g) === null).every(Boolean));
+        if (resume) { j += resume; continue; }
+        break;
+      }
+      const pts = tl.slice(i, j + 1), f = st.frames[ids[d]];
+      const peakRss = Math.max(...pts.map(p => p[2]));
+      const to = j + 1 < tl.length ? tl[j + 1][0] : tl[j][0];
+      out.push({ key: keys[d], path: keys, name: f.name || `line ${f.line}`, file: f.file, line: f.first_line,
+        from: tl[i][0], to, seconds: to - tl[i][0],
+        peakTracedMb: precise ? Math.max(...pts.map(p => p[1])) : null,
+        peakRssMb: rss ? peakRss : null, newRssMb: rss ? Math.max(0, peakRss - runningRss) : null });
+      runningRss = Math.max(runningRss, peakRss);
+      i = j + 1;
+    }
+    return out;
+  };
+  if (depth != null) {
+    const d = Math.max(0, Math.min(maxDepth, Math.floor(depth)));
+    return { depth: d, auto: false, maxDepth, phases: build(d) };
+  }
+  let best = 0;
+  // The shallowest level that splits the run into 3 to 12 phases of at least 1%, covering at least 90% of it,
+  // with none taking more than half; otherwise the deepest level still covering 90%. Measured on generators.py:
+  // the ingest/process/verify level qualifies (largest phase 26-30%); the level above is one `measure` phase
+  // (93%), and the levels below are helper calls covering 80% or less.
+  let found = -1;
+  for (let d = 0; d <= maxDepth; d++) {
+    const long = build(d).filter(p => p.seconds >= 0.01 * wall), covered = long.reduce((t, p) => t + p.seconds, 0);
+    if (covered < 0.9 * wall) continue;
+    best = d;
+    if (long.length >= 3 && long.length <= 12 && long.every(p => p.seconds <= 0.5 * wall)) { found = d; break; }
+  }
+  if (found >= 0) best = found;
+  return { depth: best, auto: true, maxDepth, phases: build(best) };
 }

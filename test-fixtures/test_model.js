@@ -96,4 +96,18 @@ console.log("leak msg:", m.leakMessage(new m.ProfileIndex(pp).line(WL, 24)).slic
   assert(m.unattributedNote({ ...base, unattributed_peak_mb: 31.7 }).includes("2-frame"), "note shows depth");
   assert.strictEqual(m.unattributedNote({ ...base, unattributed_peak_mb: 0.4 }), "", "no note under 1 MB");
   assert.strictEqual(m.unattributedNote({ memory_mode: "fast", unattributed_peak_mb: 50 }), "", "precise only"); }
+{ // Native estimate: tracemalloc's bookkeeping (profiler_mb) is subtracted, and anything within twice it reads 0.
+  assert.strictEqual(m.nativeMb({ rss_growth_mb: 100, alloc_mb: 40 }), 60, "older profiles: plain difference");
+  assert.strictEqual(m.nativeMb({ rss_growth_mb: 100, alloc_mb: 40, profiler_mb: 50 }), 0, "10 MB left is within tracing overhead");
+  assert.strictEqual(m.nativeMb({ rss_growth_mb: 400, alloc_mb: 40, profiler_mb: 50 }), 310, "native buffers clear the margin");
+  const base = JSON.parse(fs.readFileSync(require("path").join(__dirname, "profiler/out/workload_precise.json"), "utf8"));
+  assert(m.parseProfile(JSON.stringify(base)), "a fresh precise profile validates with the new fields");
+  assert(Array.isArray(base.timeline_stacks) && base.timeline_stacks.length === base.timeline.length, "timeline stacks recorded");
+  assert.strictEqual(m.parseProfile(JSON.stringify({ ...base, timeline_stacks: [0] })), undefined, "timeline stacks must match the timeline");
+  assert.strictEqual(m.parseProfile(JSON.stringify({ ...base, trace_function: { name: "f", calls: -1, traced_s: 0 } })), undefined);
+  const f = Object.keys(base.functions)[0], k = Object.keys(base.functions[f])[0];
+  for (const field of ["alloc_mb", "rss_growth_mb", "profiler_mb"]) {
+    const bad = structuredClone(base); bad.functions[f][k][field] = "12";
+    assert.strictEqual(m.parseProfile(JSON.stringify(bad)), undefined, `function ${field} must be a number`);
+  } }
 console.log("ALL MODEL TESTS PASSED");

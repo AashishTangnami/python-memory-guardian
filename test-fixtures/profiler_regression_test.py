@@ -196,6 +196,182 @@ class ProfileRegressions(unittest.TestCase):
             self.assertEqual(st.samples, 3)
             self.assertAlmostEqual(st.python_s + st.native_s + st.system_s + st.cpu_s, .03, places=6)
 
+    def test_tracemalloc_bookkeeping_is_not_counted_as_native_memory(self):
+        # Scripted: each sample, traced memory +40 MB, tracemalloc bookkeeping +50 MB, RSS +100 MB, all on one
+        # line. Bookkeeping is the profiler's memory, so the line's native estimate is 100 - 40 - 50 = 10 MB.
+        MB = 1_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'precise')
+            rss = iter([0, 100 * MB, 200 * MB, 300 * MB])
+            p.rss, p.rss_kind = lambda: next(rss), 'current'
+            traced = iter([(40 * MB, 40 * MB), (80 * MB, 80 * MB), (120 * MB, 120 * MB)])
+            book = iter([50 * MB, 100 * MB, 150 * MB])
+            loc, sleeps = (str(Path(tmp) / 'work.py'), 3), []
+
+            def sleep(_):
+                sleeps.append(True)
+                if len(sleeps) == 3:
+                    p._stop.set()
+            with patch.object(profiler.time, 'sleep', side_effect=sleep), \
+                    patch.object(profiler.sys, '_current_frames', return_value={profiler.threading.get_ident() + 1: None}), \
+                    patch.object(p, '_walk', return_value=(loc, ('work', 1), (0, 3))), \
+                    patch.object(profiler.tracemalloc, 'get_traced_memory', side_effect=lambda: next(traced)), \
+                    patch.object(profiler.tracemalloc, 'get_tracemalloc_memory', side_effect=lambda: next(book)), \
+                    patch.object(profiler.tracemalloc, 'reset_peak'), \
+                    patch.object(profiler.tracemalloc, 'is_tracing', return_value=True), \
+                    patch.object(p, '_snapshot'):
+                p._run()
+            self.assertIsNone(p.sampler_error)
+            st = p.lines[loc]
+            self.assertEqual((st.rss_up, st.traced_up, st.book_up), (300 * MB, 120 * MB, 150 * MB))
+            self.assertEqual(p.book_max, 150 * MB)
+            # The same sample also credits the growth to the thread's whole stack.
+            key = (str(profiler.threading.get_ident() + 1), 'Thread', (0, 3))
+            self.assertEqual(p.alloc_stacks, {key: 120 * MB}, 'allocation by call path, same key as the time stack')
+
+    def test_native_estimate_excludes_tracemalloc_bookkeeping_in_a_real_run(self):
+        # 300k small dicts and no C extension: before, RSS growth minus traced growth was reported as
+        # ~100 MB of "native" memory, which was tracemalloc's own bookkeeping.
+        source = ('def build(n):\n'
+                  '    return [{"id": str(i), "n": i} for i in range(n)]\n'
+                  'DATA = build(300_000)\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self.run_script(Path(tmp), source, memory='precise')
+            self.assertGreater(report['tracemalloc_peak_mb'], 20, 'bookkeeping is measured')
+            self.assertEqual(report['native_untraced_mb'], 0.0,
+                             'no C extension: nothing beyond tracing overhead is reported as native')
+            line = report['files'][next(iter(report['files']))]['2']
+            self.assertGreater(line['profiler_mb'], 0, 'per-line bookkeeping growth is reported')
+
+    def test_timeline_points_carry_the_main_thread_stack(self):
+        source = ('import time\n'
+                  'def phase_one():\n'
+                  '    time.sleep(0.4)\n'
+                  'def phase_two():\n'
+                  '    time.sleep(0.4)\n'
+                  'phase_one()\n'
+                  'phase_two()\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self.run_script(Path(tmp), source, memory='fast')
+            self.assertEqual(len(report['timeline_stacks']), len(report['timeline']))
+            frames, samples = report['stacks']['frames'], report['stacks']['samples']
+            names = [frames[samples[i]['frames'][-1]]['name'] if i >= 0 else None for i in report['timeline_stacks']]
+            seen = [n for i, n in enumerate(names) if n and (i == 0 or names[i - 1] != n)]
+            self.assertEqual(seen[:2], ['phase_one', 'phase_two'], 'phases appear in time order')
+            self.assertIsNone(names[-1], 'the exit point has no stack')
+
+    @unittest.skipUnless(hasattr(sys, 'monitoring'), 'needs Python 3.12+ sys.monitoring')
+    def test_trace_function_traces_only_that_function(self):
+        source = ('KEEP = []\n'
+                  'def outside():\n'
+                  '    return [bytearray(1000) for _ in range(8000)]\n'
+                  'def traced(n):\n'
+                  '    data = [bytearray(1000) for _ in range(n)]\n'
+                  '    KEEP.append(len(data))\n'
+                  '    return len(data)\n'
+                  'def fails():\n'
+                  '    x = [bytearray(1000) for _ in range(3000)]\n'
+                  '    raise ValueError(len(x))\n'
+                  'def rec(k):\n'
+                  '    return 0 if k == 0 else rec(k - 1)\n'
+                  'for _ in range(3):\n'
+                  '    outside()\n'
+                  '    traced(20000)\n'
+                  'try:\n'
+                  '    fails()\n'
+                  'except ValueError:\n'
+                  '    pass\n'
+                  'outside()\n'
+                  'rec(5)\n')
+        def run(name):
+            with tempfile.TemporaryDirectory() as tmp:
+                script = Path(tmp) / 'main.py'
+                script.write_text(source)
+                out = Path(tmp) / 'profile.json'
+                r = subprocess.run([sys.executable, str(PROFILER), '--memory', 'precise', '--trace-function', name,
+                                    '--root', tmp, '--out', str(out), str(script)], capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                return json.loads(out.read_text())
+        report = run('traced')
+        self.assertEqual(report['trace_function']['calls'], 3, 'one traced window per outermost call')
+        lines = report['files'][next(iter(report['files']))]
+        self.assertGreater(report['peak_traced_mb'], 15, 'the traced function\'s ~20 MB list was seen')
+        self.assertEqual(lines.get('3', {}).get('alloc_mb', 0), 0, 'outside() was never traced')
+        self.assertIsNone(report['memory_tracing_lost_s'], 'tracing off between calls is not "lost"')
+        self.assertFalse(any(e.get('leak_runs') for e in lines.values()), 'no leak claims across separate calls')
+        self.assertIsNotNone(report['memory_stacks'], 'snapshots at the end of each traced call')
+        # An exception ends the traced call, and tracing stops: the outside() call after it is not traced.
+        report = run('fails')
+        self.assertEqual(report['trace_function']['calls'], 1)
+        lines = report['files'][next(iter(report['files']))]
+        self.assertEqual(lines.get('3', {}).get('alloc_mb', 0), 0, 'tracing stopped when fails() raised')
+        # Recursion: one window for the outermost call.
+        self.assertEqual(run('rec')['trace_function']['calls'], 1)
+        self.assertEqual(run('missing')['trace_function']['calls'], 0, 'a name never called is reported as 0 calls')
+
+    @unittest.skipUnless(hasattr(sys, 'monitoring'), 'needs Python 3.12+ sys.monitoring')
+    def test_trace_function_reports_no_native_estimate_and_counts_open_calls(self):
+        # Python memory outside the traced function is untraced, so RSS minus traced memory would call
+        # it native (measured: 219 MB of plain str). And a traced call still running in a daemon thread
+        # at exit is counted up to exit.
+        source = ('import threading, time\n'
+                  'def outside(n):\n'
+                  '    return [str(i) * 3 for i in range(n)]\n'
+                  'def traced(seconds):\n'
+                  '    time.sleep(seconds)\n'
+                  'KEEP = outside(500_000)\n'
+                  'threading.Thread(target=traced, args=(5,), daemon=True).start()\n'
+                  'time.sleep(0.6)\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / 'main.py'
+            script.write_text(source)
+            out = Path(tmp) / 'profile.json'
+            r = subprocess.run([sys.executable, str(PROFILER), '--memory', 'precise', '--trace-function', 'traced',
+                                '--root', tmp, '--out', str(out), str(script)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            report = json.loads(out.read_text())
+            self.assertIsNone(report['native_untraced_mb'], 'no native estimate when only one function is traced')
+            self.assertEqual(report['trace_function']['calls'], 1)
+            self.assertGreater(report['trace_function']['traced_s'], 0.3, 'the call still open at exit is counted')
+
+    def test_trace_function_needs_precise_mode(self):
+        r = subprocess.run([sys.executable, str(PROFILER), '--memory', 'fast', '--trace-function', 'x', 'main.py'],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('--trace-function needs --memory precise', r.stderr)
+
+    def test_routine_snapshots_stay_within_budget_by_measured_cost(self):
+        # Each snapshot really costs 0.3 s on 10 MB of bookkeeping (30 ns/byte), above the clamped 4-20 ns
+        # prediction. The cap (10% of elapsed, at least 0.5 s) must hold against what was measured.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'precise')
+            p.rss, p.rss_kind = lambda: 0, None
+            clock, sleeps = [0.0], []
+
+            def sleep(seconds):
+                clock[0] += seconds
+                sleeps.append(True)
+                if len(sleeps) == 150:
+                    p._stop.set()
+
+            def snapshot(_t):
+                clock[0] += .3
+            with patch.object(profiler.time, 'sleep', side_effect=sleep), \
+                    patch.object(profiler.time, 'perf_counter', side_effect=lambda: clock[0]), \
+                    patch.object(profiler.time, 'process_time', return_value=0.0), \
+                    patch.object(profiler.sys, '_current_frames', return_value={}), \
+                    patch.object(profiler.tracemalloc, 'get_traced_memory', return_value=(2_000_000, 2_000_000)), \
+                    patch.object(profiler.tracemalloc, 'get_tracemalloc_memory', return_value=10_000_000), \
+                    patch.object(profiler.tracemalloc, 'reset_peak'), \
+                    patch.object(profiler.tracemalloc, 'is_tracing', return_value=True), \
+                    patch.object(p, '_snapshot', side_effect=snapshot):
+                p._run()
+            self.assertIsNone(p.sampler_error)
+            elapsed = clock[0]
+            self.assertLessEqual(p.snap_cost, max(0.10 * elapsed, 0.5) + 1e-9,
+                                 f'{p.snap_cost:.2f} s of snapshots in {elapsed:.2f} s exceeds the routine cap')
+            self.assertGreaterEqual(p.snap_cost, .3, 'the first snapshot is still taken')
+
     def test_stack_samples_keep_thread_names(self):
         source = ('import threading, time\n'
                   'def busy_worker():\n'

@@ -10,6 +10,8 @@ export interface LineEntry {
   samples: number; rss_growth_mb: number; rss_release_mb: number;
   line_events?: number;
   alloc_mb?: number; transient_peak_mb?: number; peak_mb?: number; end_mb?: number;
+  /** precise mode: growth of tracemalloc's own bookkeeping while this line ran (profiler memory inside rss_growth_mb). */
+  profiler_mb?: number;
   leak_runs?: number; func_line?: number;
   /** Names from the source line (via ast): enclosing scope, assigned variables, called functions. */
   scope?: string; assigns?: string[]; calls?: string[];
@@ -21,13 +23,15 @@ export interface LineEntry {
 
 export interface FuncEntry {
   name: string; time_s: number; python_s: number; native_s: number; system_s: number;
-  peak_mb: number; transient_peak_mb: number; alloc_mb?: number; rss_growth_mb?: number;
+  peak_mb: number; transient_peak_mb: number; alloc_mb?: number; rss_growth_mb?: number; profiler_mb?: number;
   end_line?: number | null;
 }
 
 export interface StackFrame { file: string; line: number; name: string; first_line: number; user: boolean; }
 export interface StackSample { thread: string; thread_name: string; frames: number[];
-  python_s: number; native_s: number; system_s: number; unsplit_s: number; samples: number; }
+  python_s: number; native_s: number; system_s: number; unsplit_s: number; samples: number;
+  /** precise mode: traced growth seen while this was the busiest thread's stack (sampled, net between samples). */
+  alloc_bytes?: number; }
 
 export interface Profile {
   schema: number; script: string; python: string; gil_split: boolean;
@@ -53,6 +57,12 @@ export interface Profile {
   largest_objects?: { objects: LargestObject[]; complete: boolean } | null;
   monitoring?: { requested: 'off' | 'lines'; active: boolean; reason: string | null;
     dropped_line_events: number };
+  /** Per timeline point: index into stacks.samples of the main thread's stack then; -1 when it had none. */
+  timeline_stacks?: number[];
+  /** precise mode: largest tracemalloc bookkeeping seen (profiler memory, not the program's). */
+  tracemalloc_peak_mb?: number | null;
+  /** precise mode scoped to one function (--trace-function): its name, traced calls, traced seconds. */
+  trace_function?: { name: string; calls: number; traced_s: number } | null;
   /** How the run was started: the script's own arguments, UTC start time, sys.platform. Used to compare runs. */
   run?: { argv: string[]; started_at: string | null; platform: string };
 }
@@ -108,7 +118,7 @@ export function parseProfile(json: string): Profile | undefined {
       for (const [line, e] of Object.entries(entries)) {
         if (!/^[1-9]\d*$/.test(line) || !record(e) || !numeric(e,
           ['time_s', 'share', 'python_s', 'native_s', 'system_s', 'samples', 'rss_growth_mb', 'rss_release_mb'])) return undefined;
-        for (const k of ['alloc_mb', 'transient_peak_mb', 'peak_mb', 'end_mb', 'leak_runs', 'func_line']) {
+        for (const k of ['alloc_mb', 'transient_peak_mb', 'peak_mb', 'end_mb', 'leak_runs', 'func_line', 'profiler_mb']) {
           if (e[k] != null && !number(e[k])) return undefined;
         }
         if (e.line_events != null && (!Number.isSafeInteger(e.line_events) || e.line_events < 0)) return undefined;
@@ -131,6 +141,7 @@ export function parseProfile(json: string): Profile | undefined {
     for (const entries of Object.values(p.functions ?? {})) {
       if (!record(entries) || !Object.values(entries).every(f => record(f) && typeof f.name === 'string'
         && numeric(f, ['time_s', 'python_s', 'native_s', 'system_s', 'peak_mb', 'transient_peak_mb'])
+        && ['alloc_mb', 'rss_growth_mb', 'profiler_mb'].every(k => f[k] == null || number(f[k]))
         && (f.end_line == null || number(f.end_line)))) return undefined;
     }
     if (p.stacks != null) {
@@ -141,7 +152,7 @@ export function parseProfile(json: string): Profile | undefined {
           && Number.isInteger(f.line) && f.line >= 0 && Number.isInteger(f.first_line) && f.first_line >= 0)
         || !Array.isArray(s.samples) || !s.samples.every((v: unknown) => record(v)
           && typeof v.thread === 'string' && typeof v.thread_name === 'string'
-          && numeric(v, ['python_s', 'native_s', 'system_s', 'unsplit_s', 'samples'])
+          && numeric(v, ['python_s', 'native_s', 'system_s', 'unsplit_s', 'samples']) && (v.alloc_bytes == null || number(v.alloc_bytes))
           && Array.isArray(v.frames) && v.frames.length <= 128
           && v.frames.every((id: unknown) => Number.isInteger(id) && Number(id) >= 0 && Number(id) < s.frames.length))) return undefined;
     }
@@ -168,6 +179,11 @@ export function parseProfile(json: string): Profile | undefined {
       || (p.monitoring.reason != null && typeof p.monitoring.reason !== 'string')
       || !Number.isSafeInteger(p.monitoring.dropped_line_events)
       || p.monitoring.dropped_line_events < 0)) return undefined;
+    if (p.timeline_stacks != null && (!Array.isArray(p.timeline_stacks) || p.timeline_stacks.length !== (p.timeline ?? []).length
+      || !p.timeline_stacks.every((i: unknown) => Number.isInteger(i) && Number(i) >= -1 && Number(i) < (p.stacks?.samples.length ?? 0)))) return undefined;
+    if (!(p.tracemalloc_peak_mb == null || number(p.tracemalloc_peak_mb))) return undefined;
+    if (p.trace_function != null && (!record(p.trace_function) || typeof p.trace_function.name !== 'string'
+      || !Number.isSafeInteger(p.trace_function.calls) || p.trace_function.calls < 0 || !number(p.trace_function.traced_s))) return undefined;
     if (p.run != null && (!record(p.run) || !Array.isArray(p.run.argv) || !p.run.argv.every((a: unknown) => typeof a === 'string')
       || (p.run.started_at != null && typeof p.run.started_at !== 'string') || typeof p.run.platform !== 'string')) return undefined;
     return p as unknown as Profile;
@@ -233,27 +249,41 @@ export class ProfileIndex {
 }
 
 /**
- * Precise mode: process-memory growth beyond traced Python growth on the same line, for any library.
- * Both are charged to the line running at each sample; RSS grows where memory is first written and
- * rarely shrinks, so this is an estimate of native memory (C extensions, their own allocators).
+ * Precise mode: process-memory growth beyond traced Python growth and tracemalloc's own bookkeeping growth
+ * (profiler_mb) on the same line, for any library. All are charged to the line running at each sample; RSS
+ * grows where memory is first written and rarely shrinks, so this is an estimate of native memory (C
+ * extensions, their own allocators). The reported bookkeeping misstates tracing's real cost in both
+ * directions (by up to about 1.4x of itself, measured), so an estimate within twice the bookkeeping is
+ * indistinguishable from profiler overhead and reads 0. Profiles without profiler_mb keep the plain difference.
+ * run: when the profile itself found no native memory beyond tracing overhead (native_untraced_mb 0 with
+ * tracemalloc_peak_mb recorded), every line reads 0 too: RSS is charged where pages are first touched and
+ * bookkeeping where tables grow, so per-line differences do not line up (measured: 372 MB "native" on a
+ * pure-Python function with 0.08 MB of bookkeeping growth).
  */
-export function nativeMb(e: { rss_growth_mb?: number; alloc_mb?: number } | undefined): number {
-  return e ? Math.max(0, (e.rss_growth_mb ?? 0) - (e.alloc_mb ?? 0)) : 0;
+export type NativeRun = Pick<Profile, 'memory_mode'> & { tracemalloc_peak_mb?: number | null; native_untraced_mb?: number | null;
+  trace_function?: { name: string } | null };
+export function nativeMb(e: { rss_growth_mb?: number; alloc_mb?: number; profiler_mb?: number } | undefined, run?: NativeRun): number {
+  if (!e) return 0;
+  if (run && run.memory_mode === 'precise' && run.tracemalloc_peak_mb != null && !((run.native_untraced_mb ?? 0) > 0)) return 0;
+  // With --trace-function, Python memory allocated outside the traced calls is untraced: RSS growth there is not native.
+  if (run?.trace_function) return 0;
+  const prof = e.profiler_mb ?? 0, native = (e.rss_growth_mb ?? 0) - (e.alloc_mb ?? 0) - prof;
+  return native > 2 * prof ? native : 0;
 }
 
-export function memoryMb(e: LineEntry | undefined, mode: Profile["memory_mode"]): number {
+export function memoryMb(e: LineEntry | undefined, mode: Profile["memory_mode"], run?: NativeRun): number {
   if (!e) return 0;
   if (mode === "precise") {
-    return Math.max(e.alloc_mb ?? 0, e.transient_peak_mb ?? 0, e.peak_mb ?? 0, nativeMb(e));
+    return Math.max(e.alloc_mb ?? 0, e.transient_peak_mb ?? 0, e.peak_mb ?? 0, nativeMb(e, run));
   }
   return mode === "fast" ? e.rss_growth_mb : 0;
 }
 
 export function heat(e: LineEntry | undefined, mode: Profile["memory_mode"], th: Thresholds,
-                     insideSampledFn = false): Heat {
-  if (!e || (e.samples === 0 && memoryMb(e, mode) === 0))
+                     insideSampledFn = false, run?: NativeRun): Heat {
+  if (!e || (e.samples === 0 && memoryMb(e, mode, run) === 0))
     return insideSampledFn || !!e?.line_events ? "unknown" : "cold";
-  if (e.share >= th.hotShare || memoryMb(e, mode) >= th.hotMb || e.leak_runs) return "hot";
+  if (e.share >= th.hotShare || memoryMb(e, mode, run) >= th.hotMb || e.leak_runs) return "hot";
   return "unknown";
 }
 
@@ -296,7 +326,7 @@ export function lineLabel(e: LineEntry, p: Profile): string {
     if ((e.alloc_mb ?? 0) >= 1) mem.push(`alloc ${mb(e.alloc_mb!)}`);
     if ((e.peak_mb ?? 0) >= 1) mem.push(`held ${mb(e.peak_mb!)}`);
     if ((e.transient_peak_mb ?? 0) >= 1) mem.push(`spike ${mb(e.transient_peak_mb!)}`);
-    if (nativeMb(e) >= 1) mem.push(`native ≈ +${mb(nativeMb(e))}`);
+    if (nativeMb(e, p) >= 1) mem.push(`native ≈ +${mb(nativeMb(e, p))}`);
     if (mem.length) out.push(`▲ ${mem.join(" · ")}${into}`);
   }
   if (e.leak_runs) {
@@ -314,7 +344,7 @@ export function funcLabel(f: FuncEntry, p: Profile): string {
     ? Math.max(f.peak_mb, f.transient_peak_mb, f.alloc_mb ?? 0)
     : p.memory_mode === "fast" ? (f.rss_growth_mb ?? 0) : 0;
   if (m >= 1) out.push(p.memory_mode === "fast" ? `· RSS +${mb(m)}` : `· ${mb(m)}`);
-  if (p.memory_mode === "precise" && nativeMb(f) >= 1) out.push(`· native ≈ +${mb(nativeMb(f))}`);
+  if (p.memory_mode === "precise" && nativeMb(f, p) >= 1) out.push(`· native ≈ +${mb(nativeMb(f, p))}`);
   return out.join(" ");
 }
 
@@ -322,7 +352,7 @@ export function funcLabel(f: FuncEntry, p: Profile): string {
 export function evidence(e: LineEntry | undefined, h: Heat, p: Profile): string {
   if (h === "hot" && e) {
     const bits = [`${pct(e.share)} of runtime`];
-    const m = memoryMb(e, p.memory_mode);
+    const m = memoryMb(e, p.memory_mode, p);
     if (m >= 1) bits.push(mb(m));
     if (e.leak_runs) bits.push("leaking");
     return `🔥 Measured in last profile: ${bits.join(", ")}. `;

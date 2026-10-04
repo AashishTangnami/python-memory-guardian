@@ -73,12 +73,13 @@ if __name__ == "__main__":
             sys.exit("FAIL " + msg)
         print("SKIP " + msg + "\n     Checking the Python server on its own instead.")
     failures = 0
-    for fixture in ("sample.py", "native_patterns.py", "edge_cases.py", "scope_cases.py", "new_rules_cases.py"):
+    for fixture in ("sample.py", "native_patterns.py", "edge_cases.py", "scope_cases.py", "new_rules_cases.py",
+                    "list_once_cases.py"):
         text = open(os.path.join(HERE, fixture), encoding="utf-8").read()
         for pname, prof in profiles.items():
             try:
                 py = run(SERVERS["python"], prof, text)
-                if fixture in {"scope_cases.py", "new_rules_cases.py"}:
+                if fixture in {"scope_cases.py", "new_rules_cases.py", "list_once_cases.py"}:
                     expected = set()
                     for line, source in enumerate(text.splitlines()):
                         if '# expect:' in source:
