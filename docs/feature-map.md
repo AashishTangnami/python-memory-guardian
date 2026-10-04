@@ -23,24 +23,30 @@ Each feature below follows the same order: **behavior → trigger/result → flo
 
 ## System overview
 
+**Static analysis**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    User["Python developer"] -->|opens or edits| Static["Static diagnostics"]
-    User -->|runs command or CLI| Runtime["Runtime profiling"]
-    User -->|changes settings or restarts| Setup["Backend and interpreter setup"]
-    Setup -->|supplies facts| Static
-    Static -->|publishes findings| Problems["Editor squiggles and Problems"]
-    Runtime -->|writes profile JSON| Profile["Validated profile"]
-    Profile -->|renders| Inline["Line and function annotations"]
-    Profile -->|adjusts fresh findings| Problems
-    Profile -->|renders| Report["Overview charts, memory diagnosis and Stack Explorer"]
-    Profile -->|publishes suspected leaks| Problems
+Edit("Python source") -->|open or edit| Static("Static analysis")
+    Facts("Interpreter facts") -->|inform analysis| Static
+    Static -->|publish findings| Problems("Problems")
+```
+
+**Runtime profiling**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+Runtime("Profiler") -->|write JSON| JSON("Profile JSON")
+    JSON -->|validate and load| Profile("Loaded profile")
+    Profile -->|fresh evidence| Editor("Editor feedback")
+    Profile -->|render measurements| Report("Report")
 ```
 
 The two main paths meet in the editor: static findings arrive from the selected language server, while a validated runtime profile supplies annotations, runtime warnings, report data and freshness-gated prioritization of static findings.
 
-**Diagram key:** solid arrows show runtime calls or data flow; dotted arrows show build-time dependencies. Boxes group separate processes where relevant. Diagrams use top-down flow, the viewer's colors, a sans-serif font and straight lines.
+**Diagram key:** rounded rectangles show actions or data; dashed diamonds show stop/continue decisions. Bordered arrow labels describe calls and transfers. Solid arrows show runtime calls or data flow; dotted arrows show build-time dependencies. Process groups identify their owner inside the first node, keeping process names clear of arrow labels; captions identify scope for unboxed feature flows. Overview and build diagrams summarize feature/artifact relationships. Each small diagram covers one part of the flow; repeated nodes refer to the same component. Labels use SVG text with a consistent Arial/sans-serif font at 18 px, explicit line breaks and room around words and process titles. Nodes and process boxes have rounded corners; arrows remain straight and colors follow the viewer.
 
 ## Implemented features
 
@@ -50,31 +56,45 @@ The selected Python or Rust language server recognizes source patterns and publi
 
 **Trigger:** open, edit, save or close a Python `file` or `untitled` document. **Result:** editor squiggles and Problems entries, optionally adjusted using a fresh runtime profile.
 
+**Analyze source**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    subgraph EXT["VS Code extension host"]
-      Event["Python document event"]
-      Feedback["Diagnostic middleware"]
-      UI["Editor squiggles and Problems"]
+subgraph EXT[" "]
+      Event("Extension host<br/>Document event")
     end
-    subgraph PY["Python language-server process: one backend"]
-      Py["Document handlers and AST analyzer"]
-      PyKeep["Last good diagnostics"]
+    subgraph LSP[" "]
+      Py("Language server<br/>Python / AST")
+      Rs("Rust / tree-sitter")
     end
-    subgraph RS["Rust language-server process: alternative backend"]
-      Rs["Document handlers and tree-sitter analyzer"]
-      RsKeep["Last good diagnostics"]
+    Event -->|Python: LSP event| Py
+    Event -->|Rust: LSP event| Rs
+```
+
+**Render findings**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+subgraph LSP[" "]
+      Findings("Language server<br/>Findings")
     end
-    Event -->|selected Python client sends LSP event| Py
-    Event -->|selected Rust client sends LSP event| Rs
-    Py -->|publishes deduplicated diagnostics| Feedback
-    Rs -->|publishes deduplicated diagnostics| Feedback
-    Py -->|invalid syntax retains| PyKeep
-    Rs -->|parse errors retain| RsKeep
-    Py -->|close publishes empty list| Feedback
-    Rs -->|close publishes empty list| Feedback
-    Feedback -->|applies fresh runtime evidence and renders| UI
+    subgraph EXT[" "]
+      Feedback("Extension host<br/>Diagnostic middleware")
+      UI("Problems")
+    end
+    Findings -->|publish findings| Feedback
+    Feedback -->|apply evidence; render| UI
+```
+
+**Invalid source and file close — selected server**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+Server("Selected server") -->|parse failure: retain| Keep("Last good findings")
+    Server -->|close: publish empty list| Clear("Cleared findings")
 ```
 
 **Implementation**
@@ -122,29 +142,42 @@ The editor command and standalone CLI run the same profiler. It executes the tar
 
 **Trigger:** `pythonMemoryGuardian.profileFile` (Profile Current File), or direct `pmg_profile.py` invocation. **Result:** task/terminal output and schema-3 `.pmg/profile.json`.
 
+**Launch the profiler**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    subgraph EXT["VS Code extension host"]
-      Command["Profile Current File"]
-      Task["Save file, choose mode and create task"]
+    subgraph EXT[" "]
+      Editor("Extension host<br/>Prepare run")
+      Stop{"Invalid file,<br/>save fails,<br/>or cancel?"}
+      Cancel("No task")
     end
-    CLI["Standalone profiler CLI"]
-    subgraph PROC["Target Python process: local or configured container"]
-      Main["Profiler entry point"]
-      Capture["Execute script and collect samples"]
-      Finish["Finalize measurements and report"]
+    subgraph PROC[" "]
+      Main("Target Python<br/>Profiler main")
     end
-    JSON["Profile JSON"]
-    Command -->|checks editor and calls runProfiler| Task
-    Task -->|invalid editor, failed save or cancellation stops| Cancel["No task launched"]
-    Task -->|launches Python with profiler arguments| Main
-    CLI -->|calls main with script arguments| Main
-    Main -->|starts sampler and runs script as __main__| Capture
-    Capture -->|normal exit or handled exception calls finalizer| Finish
-    Finish -->|atomically writes schema 3| JSON
-    Main -->|setup failure prevents| Missing["No new profile"]
-    Finish -->|write failure prevents| Missing
+    Editor -->|validate, save, choose mode| Stop
+    Stop -->|yes: stop| Cancel
+    Stop -->|no: launch task| Main
+    CLI("CLI + script args") -->|call main| Main
+    classDef decision stroke-width:2px,stroke-dasharray:4 3;
+    class Stop decision;
+```
+
+**Capture and write**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+subgraph PROC[" "]
+      Start("Target Python<br/>Profiler setup")
+      Run("Execute script<br/>and sample")
+      Finish("Finalize report")
+    end
+    Start -->|start sampler; run script| Run
+    Run -->|exit or exception| Finish
+    Finish -->|atomic write| JSON("Profile JSON")
+    Start -->|setup fails| Missing("No new profile")
+    Finish -->|write fails| Missing
 ```
 
 **Implementation**
@@ -185,25 +218,25 @@ A profile must pass schema validation before it replaces the loaded profile. Its
 
 **Trigger:** startup discovery; `.pmg/profile.json` create/change; saved-report selection; JSON editor graph action; Python source edit. **Result:** an indexed profile, a warning on invalid data, or a freshness decision for each source file.
 
+**Load and validate — extension host**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    subgraph EXT["VS Code extension host"]
-      Load["Profile loader"]
-      Valid["Schema validator"]
-      Index["Path mapping and profile index"]
-      Fresh["Source freshness check"]
-      Current["Current editor evidence"]
-      Historical["Historical report"]
-      Previous["Previous profile"]
-    end
-    Load -->|reads disk or revealed editor text| Valid
-    Valid -->|accepts schema 2 or 3| Index
-    Valid -->|rejects data and keeps| Previous
-    Index -->|supplies mapped paths and hashes| Fresh
-    Fresh -->|matching source permits| Current
-    Fresh -->|stale source hides evidence and cues| Rerun["Re-run profiling"]
-    Index -->|supplies validated measurements even when stale| Historical
+Load("Read profile JSON") -->|parseProfile| Valid("Schema validator")
+    Valid -->|accept schema 2/3| Index("Map paths;<br/>create index")
+    Valid -->|invalid: retain| Old("Previous profile")
+    Index -->|update report| Report("Historical measurements")
+```
+
+**Check source freshness — extension host**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+Index("Profile paths + hashes") -->|compare current text| Check("Source hash check")
+    Check -->|match: enable| Editor("Editor evidence")
+    Check -->|missing / mismatch: hide| Stale("Re-run cue")
 ```
 
 **Implementation**
@@ -236,23 +269,24 @@ A fresh profile supplies line/function labels, suspected runtime leak warnings a
 
 **Trigger:** valid profile load, editor visibility/source change, static diagnostic publication or overlay toggle. **Result:** end-of-line annotations, runtime Problems entries, adjusted static severity and profile status.
 
+**Annotations and warnings — extension host**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    subgraph EXT["VS Code extension host"]
-      Gate["Fresh profile evidence"]
-      Render["Editor renderer"]
-      Adjust["Static diagnostic adjustment"]
-      Labels["Line/function annotations"]
-      Runtime["Runtime leak warnings"]
-      Static["Static Problems entries"]
-    end
-    Gate -->|supplies line and function data| Render
-    Gate -->|supplies heat and measured evidence| Adjust
-    Raw["Raw LSP diagnostics"] -->|middleware intercepts| Adjust
-    Render -->|overlay enabled renders| Labels
-    Render -->|leak_runs publishes| Runtime
-    Adjust -->|returns prioritized or raw findings| Static
+Fresh("Fresh profile") -->|supply measurements| Render("Editor renderer")
+    Render -->|overlay enabled: draw| Labels("Line / function labels")
+    Render -->|leak_runs: publish| Warnings("Runtime warnings")
+```
+
+**Prioritize static findings — extension host**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+Raw("Raw LSP findings") -->|middleware intercepts| Adjust("Adjust severity")
+    Fresh("Fresh profile") -->|supply heat + evidence| Adjust
+    Adjust -->|return adjusted or raw| UI("Static Problems")
 ```
 
 **Implementation**
@@ -290,26 +324,41 @@ The webview presents an Overview, precise-memory diagnosis and a time-weighted S
 
 **Trigger:** `pythonMemoryGuardian.showReport`, `pythonMemoryGuardian.openSavedReport`, `pythonMemoryGuardian.visualizeReport`, status click, or automatic opening after a profiling task's next valid load. **Result:** interactive charts, evidence cards, stack filters and verified source navigation.
 
+**Render and filter**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    subgraph EXT["VS Code extension host"]
-      Profile["Indexed profile"]
-      Models["Overview, diagnosis and call-tree models"]
-      Bridge["Report controller"]
-      Check["Location and freshness validation"]
-      Source["Source editor"]
+subgraph EXT[" "]
+      Profile("Extension host<br/>Indexed profile")
+      Models("Report models")
+      Bridge("Report controller")
     end
-    subgraph WEB["Report webview"]
-      Panel["Charts, cards and Stack Explorer"]
+    subgraph WEB[" "]
+      Panel("Webview<br/>Charts / cards / stacks")
     end
-    Profile -->|refresh projects measurements through| Models
-    Models -->|returns view data to| Bridge
-    Bridge -->|posts report payload| Panel
-    Panel -->|filter message selects metric/thread| Bridge
-    Panel -->|open message requests file/line| Check
-    Check -->|report-listed fresh source opens| Source
-    Check -->|stale or invalid location warns| Warning["Navigation warning"]
+    Profile -->|project measurements| Models
+    Models -->|return view data| Bridge
+    Bridge -->|post report| Panel
+    Panel -->|filter metric / thread| Bridge
+```
+
+**Navigate to source**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+subgraph WEB[" "]
+      Request("Webview<br/>Source request")
+    end
+    subgraph EXT[" "]
+      Check("Extension host<br/>Check location<br/>and freshness")
+      Source("Source editor")
+      Warning("Navigation warning")
+    end
+    Request -->|open file / line| Check
+    Check -->|listed + fresh: open| Source
+    Check -->|invalid / stale: warn| Warning
 ```
 
 **Implementation**
@@ -344,30 +393,47 @@ Activation probes the target interpreter, then starts the selected language serv
 
 **Trigger:** Python document activation, `pythonMemoryGuardian.restart` or any Guardian setting change. **Result:** a running language client, logs/trace, or a startup error.
 
+**Probe interpreter facts**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    subgraph EXT["VS Code extension host"]
-      Activate["Activation or serialized restart"]
-      Probe["Interpreter probe launcher"]
-      Select["Backend selection and language client"]
+subgraph EXT[" "]
+      Probe("Extension host<br/>Start / restart probe")
+      Init("Initialization facts")
     end
-    subgraph TARGET["Target Python process: local or configured container"]
-      Facts["Version, sizes, GIL and allocator facts"]
+    subgraph TARGET[" "]
+      Facts("Target Python<br/>probe.py")
     end
-    subgraph PY["Python language-server process"]
-      Python["Python stdio server"]
+    Probe -->|execFile| Facts
+    Facts -->|JSON stdout| Init
+    Probe -->|failure: use empty facts| Init
+```
+
+**Launch the selected backend**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+subgraph EXT[" "]
+      Client("Extension host<br/>Backend + stdio client")
     end
-    subgraph RS["Rust language-server process"]
-      Rust["Packaged Rust stdio server"]
+    subgraph PY[" "]
+      Python("Python LSP<br/>guardian_server.py")
     end
-    Activate -->|calls startClient| Probe
-    Probe -->|execFile runs probe.py| Facts
-    Facts -->|JSON stdout supplies initialization facts| Select
-    Probe -->|failure supplies empty facts| Select
-    Select -->|Python backend launches and initializes| Python
-    Select -->|Rust backend launches and initializes| Rust
-    Select -->|missing binary or start failure reports| Error["Startup error"]
+    subgraph RS[" "]
+      Rust("Rust LSP<br/>Packaged binary")
+    end
+    Client -->|Python: initialize| Python
+    Client -->|Rust: initialize| Rust
+```
+
+**Startup failure — extension host**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+Start("Server startup") -->|binary missing / start fails| Error("Startup error")
 ```
 
 **Implementation**
@@ -400,26 +466,41 @@ With the editor on the host, a configured exec prefix launches the probe/profile
 
 **Trigger:** nonempty `pythonMemoryGuardian.container.execPrefix`. **Result:** target measurements from container Python, remapped editor/report paths, or a mapping/execution error.
 
+**Map outbound paths and execute**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    subgraph HOST["VS Code extension host"]
-      Settings["Exec prefix, interpreter and path mappings"]
-      Stage["Stage helper and map outbound paths"]
-      Load["Load profile and remap inbound paths"]
-      Editor["Host source identity and feedback"]
+subgraph HOST[" "]
+      Config("Extension host<br/>Container settings")
+      Stage("Stage helper;<br/>map paths")
+      Error("Probe fallback /<br/>task error")
     end
-    subgraph CONT["Configured container process"]
-      Target["Python probe or profiler"]
+    subgraph CONT[" "]
+      Target("Container<br/>Probe / profiler")
     end
-    Shared["Bind-mounted workspace"]
-    Settings -->|resolved mappings and prefix configure| Stage
-    Stage -->|exec prefix launches mapped helper arguments| Target
-    Target -->|profiler writes JSON through| Shared
-    Shared -->|host-visible profile is read by| Load
-    Settings -->|supplies reverse mappings| Load
-    Load -->|rewrites paths before indexing| Editor
-    Stage -->|unmapped outbound path throws| Error["Neutral probe facts or task error"]
+    Config -->|resolve mappings| Stage
+    Stage -->|exec prefix + argv| Target
+    Stage -->|unmapped: throw| Error
+```
+
+**Remap incoming profile paths**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+subgraph CONT[" "]
+      JSON("Container<br/>Profile JSON")
+    end
+    subgraph HOST[" "]
+      Remap("Extension host<br/>toLocal")
+      Index("Host profile index")
+      Unmapped("Unchanged path")
+    end
+    JSON -->|bind mount: load| Remap
+    Remap -->|matched host paths| Index
+    Remap -->|no mapping: keep path| Unmapped
+    Unmapped -->|index may miss source| Index
 ```
 
 **Implementation**
@@ -452,40 +533,46 @@ Packaging creates the JavaScript bundle and vendors Python dependencies. Rust co
 
 #### Extension and Python resources
 
+**Vendor Python dependencies**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    Manifest["package.json: vscode:prepublish"]
-    Vendor["vendor:python"]
-    Compile["compile and bundle"]
-    Pins["requirements.txt"]
-    Libs["server/libs"]
-    Bundle["dist/extension.js"]
-    Server["Python language server"]
-    Manifest -. build-time invokes .-> Vendor
-    Manifest -. build-time invokes .-> Compile
-    Pins -. build-time supplies pinned packages .-> Vendor
-    Vendor -. build-time installs into .-> Libs
-    Sources["src/extension.ts and imported modules"] -. build-time esbuild bundles through .-> Compile
-    Compile -. build-time writes .-> Bundle
-    Server -->|early _vendor import prepends libs to sys.path| Libs
+Prepub("vscode:prepublish") -. build-time invokes .-> Vendor("vendor:python")
+    Pins("requirements.txt") -. build-time pins .-> Vendor
+    Vendor -. build-time installs .-> Libs("server/libs")
+    Server("Python server") -->|_vendor adds to sys.path| Libs
+```
+
+**Bundle the extension**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+Prepub("vscode:prepublish") -. build-time invokes .-> Compile("compile / bundle")
+    Sources("TypeScript source") -. build-time esbuild input .-> Compile
+    Compile -. build-time writes .-> Bundle("dist/extension.js")
 ```
 
 #### Rust executable
 
+**Compile Rust**
+
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    Inputs["Rust crate source and Cargo.toml"]
-    Messages["server/messages.json"]
-    Build["build:rust: cargo build --release"]
-    Target["rust-server/target/release/guardian-server"]
-    Bin["bin/guardian-server"]
-    Client["Extension server selection"]
-    Inputs -. build-time compiled by .-> Build
-    Messages -. build-time include_str embeds bytes .-> Build
-    Build -. build-time writes executable .-> Target
-    Client -->|expects packaged executable at runtime| Bin
+Source("Rust crate") -. build-time compiled by .-> Cargo("cargo build --release")
+    Messages("messages.json") -. build-time include_str .-> Cargo
+    Cargo -. build-time writes .-> Target("target/release binary")
+```
+
+**Look up the installed binary**
+
+```mermaid
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
+flowchart TD
+Client("serverOptions") -->|load bin/guardian-server| Bin("Packaged binary")
+    Client -->|binary missing: report| Error("Startup error")
 ```
 
 There is no scripted copy edge from `target/release` to `bin`. See [optional Rust packaging](05-local-deploy.md#optional-rust-backed-package) for placing the binary.
@@ -493,17 +580,12 @@ There is no scripted copy edge from `target/release` to `bin`. See [optional Rus
 #### Local installer
 
 ```mermaid
-%%{init: {"fontFamily":"Inter, ui-sans-serif, system-ui, sans-serif","flowchart":{"curve":"linear","nodeSpacing":50,"rankSpacing":60},"layout":"dagre"}}%%
+%%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
 flowchart TD
-    Installer["scripts/install-local.js"]
-    Ci["npm ci"]
-    Pack["npm run package -- --out"]
-    VSIX["Manifest-version VSIX"]
-    Code["VS Code extension installation"]
-    Installer -->|first launches| Ci
-    Ci -->|success permits installer to launch| Pack
-    Pack -. build-time prepublish bundles resources into .-> VSIX
-    VSIX -->|artifact existence permits code --install-extension --force| Code
+Installer("Local installer") -->|run npm ci| Ci("Dependencies")
+    Ci -->|success: run package| Pack("VSIX packaging")
+    Pack -. build-time prepublish output .-> VSIX("Versioned VSIX")
+    VSIX -->|exists: code --install| Code("VS Code installation")
 ```
 
 **Implementation**
@@ -608,6 +690,6 @@ This map describes the current `package.json`, `src`, `server`, `rust-server/src
 - Rust startup requires `bin/guardian-server[.exe]`. The build output is under `rust-server/target/release` and requires placement at the installed lookup path. Parity tests can exercise the release binary directly.
 - Container tests simulate an exec prefix and mapped paths; they do not start Docker.
 - UI flows are supported by source inspection and model/entry/lifecycle tests, rather than an automated VS Code-host integration run.
-- For this documentation refactor, local file/heading links, Mermaid block structure, edge labels and styling JSON were checked. No Mermaid renderer is installed locally, so rendered layout could not be confirmed; viewers may override diagram styling.
+- Local file/heading links, Mermaid block structure, edge labels and styling JSON were checked. All 23 small diagrams were rendered with the Mermaid bundle included in VS Code and headless Chrome at 720 px and 480 px column widths. The diagrams fit a 720 px column at 18 px type; in the 480 px check the smallest scaled type was about 14 px. SVG label bounds were checked for collisions, with no overlaps detected; rounded corners and the profiler decision diamond were inspected in the rendered preview. All 71 arrow labels were checked for visible rounded borders and filled backgrounds. The unspecified Markdown viewer may use a different Mermaid version or override styling.
 
 [Back to navigation](#start-here)
