@@ -32,6 +32,7 @@ const vscode = {
     createFileSystemWatcher: () => ({ ...disposable(), onDidCreate: disposable,
       onDidChange: disposable, onDidDelete: disposable }),
     onDidChangeTextDocument: disposable,
+    onDidCloseTextDocument: disposable,
     findFiles: async () => [],
     getConfiguration: () => ({ get: (_key, fallback) => fallback }),
   },

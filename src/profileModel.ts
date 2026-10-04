@@ -39,6 +39,10 @@ export interface Profile {
   peak_traced_mb: number | null; rss_peak_mb: number; native_untraced_mb: number | null;
   /** precise mode: MB held at the peak whose tracebacks never reached the user's code. */
   unattributed_peak_mb?: number | null; frames?: number | null;
+  /** precise mode: elapsed seconds at which the script stopped tracemalloc; memory evidence ends there. */
+  memory_tracing_lost_s?: number | null;
+  /** The sampler stopped early with this error; timing after it is missing. */
+  sampler_error?: string | null;
   file_hashes: Record<string, string>;
   files: Record<string, Record<string, LineEntry>>;
   functions: Record<string, Record<string, FuncEntry>>;
@@ -78,6 +82,8 @@ export function parseProfile(json: string): Profile | undefined {
     if (!['cpu_s', 'samples', 'interval_s', 'snapshots', 'rss_start_mb', 'rss_end_mb']
       .every(k => p[k] == null || number(p[k]))) return undefined;
     if (p.rss_kind != null && !['current', 'peak'].includes(p.rss_kind)) return undefined;
+    if (!(p.memory_tracing_lost_s == null || number(p.memory_tracing_lost_s))) return undefined;
+    if (p.sampler_error != null && typeof p.sampler_error !== 'string') return undefined;
     if (p.timeline != null && (!Array.isArray(p.timeline) || p.timeline.length > 10000
       || !p.timeline.every((point: unknown) => Array.isArray(point) && point.length === 3
         && point.every(number))
@@ -149,11 +155,21 @@ export class ProfileIndex {
     for (const [k, v] of Object.entries(profile.file_hashes ?? {})) this.hashes.set(normPath(k, platform), v);
   }
 
+  /** True if the profile has measurements for this file; callers can skip hashing otherwise. */
+  has(path: string, platform = process.platform): boolean {
+    return this.files.has(normPath(path, platform));
+  }
+
   /** "fresh" only if the document text is exactly what was profiled. */
   state(path: string, text: string, platform = process.platform): "fresh" | "stale" | "absent" {
+    return this.has(path, platform) ? this.stateOfHash(path, textHash(text), platform) : "absent";
+  }
+
+  /** Same as state() for a precomputed textHash(), so callers can hash once per document version. */
+  stateOfHash(path: string, hash: string, platform = process.platform): "fresh" | "stale" | "absent" {
     const key = normPath(path, platform);
     if (!this.files.has(key)) return "absent";
-    return this.hashes.get(key) === textHash(text) ? "fresh" : "stale";
+    return this.hashes.get(key) === hash ? "fresh" : "stale";
   }
 
   line(path: string, line1: number, platform = process.platform): LineEntry | undefined {
@@ -284,6 +300,17 @@ export function unattributedNote(p: Profile): string {
   return `${mb(u)} held at the peak was allocated deep inside library code (e.g. an import) and ` +
     `couldn't be traced back to your lines with ${p.frames ?? 2}-frame tracebacks. Raise ` +
     `pythonMemoryGuardian.profile.frames to attribute more (slower).`;
+}
+
+/** Conditions that make part of a run's evidence incomplete; shown in the status tooltip and report. */
+export function runNotes(p: Profile): string[] {
+  const notes: string[] = [];
+  if (p.memory_tracing_lost_s != null) {
+    notes.push(`The script stopped tracemalloc at ${secs(p.memory_tracing_lost_s)}; precise memory evidence ` +
+      `covers only the run before that, and leak detection was skipped.`);
+  }
+  if (p.sampler_error) notes.push(`Sampling stopped early (${p.sampler_error}); later timing is missing.`);
+  return notes;
 }
 
 export function leakMessage(e: LineEntry): string {

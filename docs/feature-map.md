@@ -83,7 +83,7 @@ flowchart TD
 | Parse source, build scope indexes and visit patterns | [rules.py](../server/rules.py#L705): `analyze`, `index_file`, `classify`, `Visitor`; [main.rs](../rust-server/src/main.rs#L1111): `analyze`, `index_with_imports`, `classify`, `Visitor::visit` |
 | Render advice and sized or neutral messages | [messages.json](../server/messages.json); `render` and `prefix` in both analyzers |
 | Convert ranges and suppress marked findings | [rules.py](../server/rules.py#L661): `_utf16`, `_range`, `SUPPRESS`; [main.rs](../rust-server/src/main.rs#L1096): `to_utf16`, `lsp_range`, `SUPPRESS` |
-| Apply runtime evidence before display | [extension.ts](../src/extension.ts#L146): `startClient` middleware; [profileView.ts](../src/profileView.ts#L185): `adjust` |
+| Apply runtime evidence before display | [extension.ts](../src/extension.ts#L148): `startClient` middleware; [profileView.ts](../src/profileView.ts#L193): `adjust` |
 
 **Important branches and limits**
 
@@ -162,12 +162,12 @@ subgraph PROC[" "]
 
 | Responsibility | Files and symbols |
 |---|---|
-| Validate/save editor, choose mode, build argv and launch task | [profileView.ts](../src/profileView.ts#L79): `runProfiler`; [package.json](../package.json): profile settings |
-| Parse CLI arguments and execute target | [pmg_profile.py](../server/pmg_profile.py#L900): `main`, `runpy.run_path`, `finish` |
-| Sample stacks, time and RSS | [pmg_profile.py](../server/pmg_profile.py#L560): `Profiler.start`, `_run`, `_record_stack` |
-| Collect precise retention and possible holders | [pmg_profile.py](../server/pmg_profile.py#L511): `_snapshot`, `_leaks`, `_find_holders` |
-| Count optional line execution events | [pmg_profile.py](../server/pmg_profile.py#L217): `_enable_monitoring`, `_on_line_event` |
-| Finalize, bound timeline, verify source hashes and write JSON | [pmg_profile.py](../server/pmg_profile.py#L571): `stop`, `report`, `_remember_sources`, `_unchanged_source`, `_text_hash`; `main.finish` uses `os.replace` |
+| Validate/save editor, choose mode, build argv and launch task | [profileView.ts](../src/profileView.ts#L85): `runProfiler`; [package.json](../package.json): profile settings |
+| Parse CLI arguments and execute target | [pmg_profile.py](../server/pmg_profile.py#L990): `main`, `runpy.run_path`, `finish` |
+| Sample stacks, time and RSS | [pmg_profile.py](../server/pmg_profile.py#L642): `Profiler.start`, `_run`/`_sample_loop`, `_walk`, `_code`, `_record_stack` |
+| Collect precise retention and possible holders | [pmg_profile.py](../server/pmg_profile.py#L593): `_snapshot`, `_leaks`, `_find_holders` |
+| Count optional line execution events | [pmg_profile.py](../server/pmg_profile.py#L229): `_enable_monitoring`, `_on_line_event` |
+| Finalize, bound timeline, verify source hashes and write JSON | [pmg_profile.py](../server/pmg_profile.py#L653): `stop`, `report`, `_remember_sources`, `_unchanged_source`, `_text_hash`; `main.finish` uses `os.replace` |
 
 **Important branches and limits**
 
@@ -178,15 +178,17 @@ subgraph PROC[" "]
 | `off` / time only | Memory omitted from line labels and heat; process RSS fields still recorded |
 
 - The editor requires a saved Python file and saves dirty text before prompting. Invalid editors warn; save failure or Quick Pick cancellation launches no task. The `memoryMode` setting supplies placeholder text; the actual selected item supplies the CLI mode.
-- Timing is sampled per thread and classified as Python, native, waiting or unsplit where clocks/GIL signals permit. Native timing is estimated at Python call sites; native stacks are not captured.
-- `profile.frames` / `--frames` controls precise traceback depth (1–64). `profile.monitoring=lines` / `--monitoring lines` uses Python 3.12+ `sys.monitoring` for line-event counts and records why activation failed when unavailable. Timing remains sampled.
+- Timing is sampled per thread and classified as Python, native, waiting or unsplit where clocks/GIL signals permit. Native timing is estimated at Python call sites; native stacks are not captured. Each sample walks a thread's frames once (`_walk`): the innermost user frame gives line attribution, and the frames from the outermost user call to the active frame (at most 128) become the stack, keyed by interned code ids so the sampler hashes small ints; `report` decodes them into frame records, merged by content.
+- `profile.frames` / `--frames` controls precise traceback depth (1–64). `profile.monitoring=lines` / `--monitoring lines` uses Python 3.12+ `sys.monitoring` for line-event counts and records why activation failed when unavailable. Timing remains sampled. `_on_line_event` returns `sys.monitoring.DISABLE` for library and stdlib lines, turning LINE events off at that location for this tool after one event, and resolves user paths once per file name; user lines keep exact counts.
 - The CLI also accepts `--root`, `--out`, `--interval` and target-script arguments.
 - Precise leak detection requires at least four snapshots in the run (including the exit snapshot), at least three trailing snapshot increases without an intervening decrease, and at least 1 MiB retained at exit (`_leaks`). A run too short for four snapshots reports no suspected leaks; its retention cards can still appear in the report. Holder search is bounded; it provides possible references, not a complete ownership graph.
-- `stop` adds a post-script RSS/traced-memory sample; `report` retains the endpoint while bounding the timeline to 300 points. It also emits line/function data, stack samples, source metadata and verified hashes.
+- `stop` adds a post-script RSS/traced-memory sample; `report` retains the endpoint while bounding the timeline to 300 points. During the run, `_record_timeline` keeps at most `TIMELINE_CAP` (600) evenly spaced samples, halving the keep rate each time it fills, so the profiler's own memory stays constant instead of growing with run length and being charged to user lines. RSS is read once per sample; `rss_max` tracks every sample, so `rss_peak_mb` and `native_untraced_mb` include spikes that thinning drops from the timeline. It also emits line/function data, stack samples, source metadata and verified hashes.
 - Normal exit, `SystemExit`, `KeyboardInterrupt` and script exceptions all attempt finalization. Non-daemon threads can defer it through `atexit`. Failure during setup or report writing can prevent output.
+- If the script stops `tracemalloc` (for example an interpreter probe or a memory test), `_precise` records `memory_tracing_lost_s` and precise collection ends: no further snapshots, traced-memory samples or exit leak/holder search, and `report` emits no `leak_runs`. Time sampling and RSS continue and the profile is still written. A `stop()` followed by `start()` between two samples is not detected.
+- `_run` wraps the sampling loop: an unexpected sampler exception is recorded as `sampler_error` and ends sampling instead of killing the thread silently; finalization still writes the profile.
 - Container task staging and path arguments are described under [Container execution](#container-execution).
 
-**Tests:** [profiler_test.py](../test-fixtures/profiler_test.py) and [profiler_regression_test.py](../test-fixtures/profiler_regression_test.py) cover measurements, retention, monitoring and output; [test_model.js](../test-fixtures/test_model.js) checks consumed line-event data; [test_report.js](../test-fixtures/test_report.js) checks diagnosis from precise evidence.
+**Tests:** [profiler_test.py](../test-fixtures/profiler_test.py) and [profiler_regression_test.py](../test-fixtures/profiler_regression_test.py) cover measurements, retention, monitoring and output; [test_model.js](../test-fixtures/test_model.js) checks consumed line-event data; [test_report.js](../test-fixtures/test_report.js) checks diagnosis from precise evidence. `test_script_stopping_tracemalloc_keeps_profile` and `test_sampler_failure_is_reported` cover lost tracing and sampler failure; `test_timeline_memory_is_bounded_and_evenly_spaced` and `test_rss_peak_survives_timeline_thinning` cover the timeline bound; `test_monitoring_disables_library_lines_and_counts_user_lines` covers the line-event callback; `test_single_walk_attributes_line_and_stack` covers the single stack walk; `test_gil_holding_call_result_is_credited_once_to_its_line` checks, without real scheduling, that a GIL-holding C call's live result is credited once to its line and that small in-call buffers stay below the spike threshold; [test_model.js](../test-fixtures/test_model.js) checks the new fields' validation and notes.
 
 [Back to navigation](#start-here)
 
@@ -216,12 +218,12 @@ flowchart TD
 
 | Responsibility | Files and symbols |
 |---|---|
-| Discover/watch profiles and refresh on Python edits | [profileView.ts](../src/profileView.ts#L37): constructor, `PROFILE_GLOB` |
-| Select a saved JSON file or receive an editor URI | [profileView.ts](../src/profileView.ts#L133): `openSavedReport`, `visualizeReport`; [package.json](../package.json): `visualizeReport` command and editor/title menu |
-| Read, validate, replace index and update consumers | [profileView.ts](../src/profileView.ts#L149): `load`; [profileModel.ts](../src/profileModel.ts#L67): `parseProfile`, `ProfileIndex` |
+| Discover/watch profiles and refresh on Python edits | [profileView.ts](../src/profileView.ts#L43): constructor, `PROFILE_GLOB` |
+| Select a saved JSON file or receive an editor URI | [profileView.ts](../src/profileView.ts#L139): `openSavedReport`, `visualizeReport`; [package.json](../package.json): `visualizeReport` command and editor/title menu |
+| Read, validate, replace index and update consumers | [profileView.ts](../src/profileView.ts#L155): `load`; [profileModel.ts](../src/profileModel.ts#L67): `parseProfile`, `ProfileIndex` |
 | Normalize paths and compare current text with recorded hashes | [profileModel.ts](../src/profileModel.ts#L57): `normPath`, `textHash`, `ProfileIndex.state` |
-| Rewrite container paths before indexing | [containerPaths.ts](../src/containerPaths.ts#L53): `remapProfileKeys`, `toLocal` |
-| Clear loaded evidence and report state | [profileView.ts](../src/profileView.ts#L175): `clear` |
+| Rewrite container paths before indexing | [containerPaths.ts](../src/containerPaths.ts#L72): `remapProfileKeys`, `toLocal` |
+| Clear loaded evidence and report state | [profileView.ts](../src/profileView.ts#L182): `clear` |
 
 **Important branches and limits**
 
@@ -229,10 +231,11 @@ flowchart TD
 - The graph action is contributed for any local JSON file. It passes its URI to `visualizeReport`; validation decides whether it is a supported profile.
 - Unreadable selected files or malformed/unsupported profiles warn and retain the previous index/report. No partially validated profile is installed.
 - `ProfileIndex.state` returns `fresh`, `stale` or `absent`. Freshness requires a matching normalized file path and SHA-1 of decoded source text with CRLF normalized to LF. The producer records hashes only for verified unchanged source; the consumer hashes current editor text. See the [source identity contract](#shared-contracts-and-coordinated-changes).
-- Editing a file refreshes diagnostics, report freshness and decorations. Stale files lose current editor evidence and regain unadjusted static diagnostics; historical measurements can still appear in the report.
+- Editing a profiled file does work only when its freshness changes (`onEdit`): the first edit after profiling makes it stale, and an undo back to the profiled text makes it fresh again. That transition re-adjusts that file's diagnostics, refreshes the report once and re-renders decorations. Stale files lose current editor evidence and regain unadjusted static diagnostics; historical measurements can still appear in the report. Typing in an unprofiled or already-stale file, or with no profile loaded, does no profile work.
+- `docState` hashes an open document at most once per `TextDocument.version`; the decorations, middleware and report freshness checks share that hash. Closing a document, or a server publishing an empty list for it, drops its stored findings and cached hash.
 - `pythonMemoryGuardian.clearProfile` or watched profile deletion clears the index, runtime diagnostics and report, restores raw static findings and removes decorations/status.
 
-**Tests:** [test_model.js](../test-fixtures/test_model.js), [test_report.js](../test-fixtures/test_report.js), [test_report_entry.js](../test-fixtures/test_report_entry.js) and [profiler_regression_test.py](../test-fixtures/profiler_regression_test.py) cover validation, report entry, hashing and freshness.
+**Tests:** [test_model.js](../test-fixtures/test_model.js), [test_report.js](../test-fixtures/test_report.js), [test_report_entry.js](../test-fixtures/test_report_entry.js) and [profiler_regression_test.py](../test-fixtures/profiler_regression_test.py) cover validation, report entry, hashing and freshness; [test_editor_events.js](../test-fixtures/test_editor_events.js) counts per-keystroke diagnostics publishes, report refreshes and hashes across unprofiled, fresh, stale and closed files.
 
 [Back to navigation](#start-here)
 
@@ -259,11 +262,11 @@ flowchart TD
 
 | Responsibility | Files and symbols |
 |---|---|
-| Store raw findings, check freshness and adjust severity | [profileView.ts](../src/profileView.ts#L185): `adjust`, `refreshDiagnostics` |
-| Classify heat and format diagnostic evidence | [profileModel.ts](../src/profileModel.ts#L194): `heat`, `memoryMb`, `adjustSeverity`, `evidence`, `ProfileIndex.insideSampledFunction` |
-| Render decorations, runtime diagnostics and status | [profileView.ts](../src/profileView.ts#L214): `render`, `thresholds` |
-| Format line/function totals and leak advice | [profileModel.ts](../src/profileModel.ts#L221): `lineLabel`, `funcLabel`, `leakMessage`, `unattributedNote` |
-| Register overlay and clear controls | [profileView.ts](../src/profileView.ts#L37): constructor; `pythonMemoryGuardian.toggleProfileOverlay` and `pythonMemoryGuardian.clearProfile` |
+| Store raw findings, check freshness and adjust severity | [profileView.ts](../src/profileView.ts#L193): `adjust`, `refreshDiagnostics` (all files, or only the edited one), `onEdit`, `docState`, `forget` |
+| Classify heat and format diagnostic evidence | [profileModel.ts](../src/profileModel.ts#L204): `heat`, `memoryMb`, `adjustSeverity`, `evidence`, `ProfileIndex.insideSampledFunction` |
+| Render decorations, runtime diagnostics and status | [profileView.ts](../src/profileView.ts#L270): `render`, `thresholds` |
+| Format line/function totals and leak advice | [profileModel.ts](../src/profileModel.ts#L231): `lineLabel`, `funcLabel`, `leakMessage`, `unattributedNote` |
+| Register overlay and clear controls | [profileView.ts](../src/profileView.ts#L43): constructor; `pythonMemoryGuardian.toggleProfileOverlay` and `pythonMemoryGuardian.clearProfile` |
 
 **Important branches and limits**
 
@@ -279,7 +282,7 @@ flowchart TD
 - Overlay toggling skips decorations only. Runtime leak warnings still publish, and the static adjustment path is unchanged.
 - `render` publishes runtime leak warnings per **visible** editor whose source is fresh. A profiled file that is not open in a visible editor has no runtime warnings in Problems until it becomes visible; static severity adjustment does not depend on visibility.
 - `memory-guardian: ignore` suppresses a static finding, not runtime leak warnings.
-- Status shows run duration, memory mode/peak or a stale re-run cue. Its click opens the report; the tooltip explains substantial unattributed precise memory and traceback-depth tuning.
+- Status shows run duration, memory mode/peak or a stale re-run cue. Its click opens the report; the tooltip explains substantial unattributed precise memory and traceback-depth tuning, plus `runNotes` for lost tracing or a sampler error. The report summary repeats those notes, and the Overview stops the traced-memory line at `memory_tracing_lost_s`.
 
 **Tests:** [test_model.js](../test-fixtures/test_model.js) and [test_report.js](../test-fixtures/test_report.js) cover model and consumed evidence behavior. These checks do not constitute an automated VS Code editor integration run.
 
@@ -343,19 +346,19 @@ flowchart TD
 
 | Responsibility | Files and symbols |
 |---|---|
-| Register report commands and update after valid loads | [profileView.ts](../src/profileView.ts#L37): constructor, `openSavedReport`, `visualizeReport`, `load`, `showNextReport` |
-| Create/reveal panel and exchange messages | [reportView.ts](../src/reportView.ts#L20): `GuardianReport.show`, `update`, `refresh` |
+| Register report commands and update after valid loads | [profileView.ts](../src/profileView.ts#L43): constructor, `openSavedReport`, `visualizeReport`, `load`, `showNextReport` |
+| Create/reveal panel and exchange messages | [reportView.ts](../src/reportView.ts#L23): `GuardianReport.show`, `update`, `refresh` |
 | Project bounded timeline and top sampled lines | [reportModel.ts](../src/reportModel.ts#L17): `overview` |
 | Classify retention and suggest checks | [reportModel.ts](../src/reportModel.ts#L51): `diagnose`, `recommendations` |
 | Aggregate sampled stacks by time metric and thread | [reportModel.ts](../src/reportModel.ts#L103): `callTree` |
 | Render charts, cards, filters and source controls | [reportWebview.ts](../src/reportWebview.ts#L2): `reportHtml`, `memoryChart`, `overview` |
-| Validate requested location and current source before opening | [reportView.ts](../src/reportView.ts#L20): `GuardianReport.show` message handler, `fresh` |
+| Validate requested location and current source before opening | [reportView.ts](../src/reportView.ts#L23): `GuardianReport.show` message handler, `fresh` |
 
 **Important branches and limits**
 
 - Overview shows run metrics, bounded RSS/traced-memory timeline and top sampled-line bars. Time-only mode hides the memory chart. `timeline` and `rss_kind` come from the profiler through schema validation.
 - Only precise profiles produce memory cards (`growing`, `retained`, `released`) and recommendations. Editor leak text and report recommendations are separate consumers of the same evidence.
-- Stack Explorer aggregates Python call stacks, including library frames, by elapsed/Python/native/system/unsplit time and thread. Missing stacks leave it empty. Sampled time across threads may exceed run duration; widths are aggregated time, not chronological order or allocation weights.
+- Stack Explorer aggregates Python call stacks, including library frames, by elapsed/Python/native/system/unsplit time and thread. Missing stacks leave it empty. Sampled time across threads may exceed run duration; widths are aggregated time, not chronological order or allocation weights. `callTree` sends only the stack frames its nodes reference, renumbered in node order, and the webview skips drawing the explorer while its tab is hidden.
 - `ready` requests a refresh; `filter` selects metric/thread; `open` requests navigation. The controller validates message shape, metric and report-listed locations. Producer/consumer payload changes must stay coordinated.
 - Navigation accepts a profiled line or user stack-frame location only if its source hash is fresh; freshness is checked again after opening the document. Stale, unavailable or unverified source warns. Historical measurements remain visible with freshness warnings.
 - Opening a report with no loaded profile shows an information message.
@@ -369,7 +372,7 @@ flowchart TD
 
 Activation probes the target interpreter, then starts the selected language server over stdio. Probe facts let either backend render messages for the target Python.
 
-**Trigger:** Python document activation, `pythonMemoryGuardian.restart` or any Guardian setting change. **Result:** a running language client, logs/trace, or a startup error.
+**Trigger:** Python document activation, `pythonMemoryGuardian.restart`, or a change to `backend`, `interpreter` or `container.*` settings. **Result:** a running language client, logs/trace, or a startup error.
 
 **Probe interpreter facts**
 
@@ -416,10 +419,10 @@ flowchart TD
 | Responsibility | Files and symbols |
 |---|---|
 | Declare activation, commands and settings | [package.json](../package.json): `activationEvents`, `contributes` |
-| Construct profile view before starting server | [extension.ts](../src/extension.ts#L187): `activate` |
+| Construct profile view before starting server | [extension.ts](../src/extension.ts#L189): `activate` |
 | Select interpreter and launch probe with fallback | [extension.ts](../src/extension.ts#L37): `interpreter`, `probeInterpreter`; [probe.py](../server/probe.py#L51): `probe` |
-| Select server command and initialize stdio client | [extension.ts](../src/extension.ts#L112): `serverOptions`, `startClient`, `LanguageClient` |
-| Serialize stop/start and stop on deactivation | [extension.ts](../src/extension.ts#L177): `restartClient`, `deactivate` |
+| Select server command and initialize stdio client | [extension.ts](../src/extension.ts#L114): `serverOptions`, `startClient`, `LanguageClient` |
+| Serialize stop/start and stop on deactivation | [extension.ts](../src/extension.ts#L179): `restartClient`, `deactivate` |
 | Consume initialization facts and serve LSP | [guardian_server.py](../server/guardian_server.py#L30): `on_initialize`, `start_io`; [main.rs](../rust-server/src/main.rs#L1176): `Backend::initialize`, `main` |
 
 **Important branches and limits**
@@ -429,9 +432,9 @@ flowchart TD
 - **Container mode changes the probe and profiler, not the language-server launch.** Both backends receive target-interpreter facts via `initializationOptions.profile`.
 - Probe failure supplies `{}` and neutral wording where sized facts are unavailable. Python probes itself only if initialization supplies no facts object; an explicit empty object does not trigger a host probe.
 - Failed server start leaves static analysis unavailable. Profile tasks/report commands remain registered because `ProfileView` was constructed first.
-- Any `pythonMemoryGuardian` setting change restarts the client; deactivation waits for the serialized lifecycle and stops it. `trace.server` controls LSP traffic in the output channel.
+- Changing `backend`, `interpreter` or any `container.*` setting re-probes and restarts the client (`RESTART_SETTINGS`); deactivation waits for the serialized lifecycle and stops it. `profile.*` settings are client-only: they call `ProfileView.settingsChanged` to re-apply thresholds without a restart. `trace.server` controls LSP traffic in the output channel; `vscode-languageclient` applies changes to it without a restart.
 
-**Tests:** [test_extension_lifecycle.js](../test-fixtures/test_extension_lifecycle.js), [server_lifecycle_test.py](../test-fixtures/server_lifecycle_test.py) and [parity_test.py](../test-fixtures/parity_test.py) cover lifecycle, facts and backend behavior.
+**Tests:** [test_extension_lifecycle.js](../test-fixtures/test_extension_lifecycle.js), [server_lifecycle_test.py](../test-fixtures/server_lifecycle_test.py) and [parity_test.py](../test-fixtures/parity_test.py) cover lifecycle, settings that do and do not restart the server, facts and backend behavior.
 
 [Back to navigation](#start-here)
 
@@ -482,10 +485,10 @@ subgraph CONT[" "]
 
 | Responsibility | Files and symbols |
 |---|---|
-| Read container configuration and stage probe | [extension.ts](../src/extension.ts#L50): `containerConfig`, `stageHelper`, `probeInterpreter` |
+| Read container configuration and stage probe | [extension.ts](../src/extension.ts#L52): `containerConfig`, `stageHelper`, `probeInterpreter` |
 | Resolve mapping settings and compose container argv | [containerPaths.ts](../src/containerPaths.ts#L24): `resolveMappings`, `toContainer`, `containerCommand` |
-| Copy profiler under workspace `.pmg` and map task paths | [profileView.ts](../src/profileView.ts#L79): `runProfiler` |
-| Rewrite profile paths on load | [profileView.ts](../src/profileView.ts#L149): `load`; [containerPaths.ts](../src/containerPaths.ts#L53): `toLocal`, `remapProfileKeys` |
+| Copy profiler under workspace `.pmg` and map task paths | [profileView.ts](../src/profileView.ts#L85): `runProfiler` |
+| Rewrite profile paths on load | [profileView.ts](../src/profileView.ts#L155): `load`; [containerPaths.ts](../src/containerPaths.ts#L53): `toLocal`, `remapProfileKeys` |
 
 **Important branches and limits**
 
@@ -557,7 +560,7 @@ Installer("Local installer") -->|run npm ci| Ci("Dependencies")
 | Define compile, bundle, vendor, package and Rust build commands | [package.json](../package.json): `scripts`, `main` |
 | Pin Python packages and load vendored dependencies | [requirements.txt](../requirements.txt); [_vendor.py](../server/_vendor.py): `sys.path` setup; [guardian_server.py](../server/guardian_server.py) and [rules.py](../server/rules.py): early `_vendor` imports |
 | Compile Rust and embed diagnostic messages | [Cargo.toml](../rust-server/Cargo.toml); [main.rs](../rust-server/src/main.rs#L24): `MESSAGES_JSON` |
-| Check/load installed Rust binary | [extension.ts](../src/extension.ts#L112): `serverOptions` |
+| Check/load installed Rust binary | [extension.ts](../src/extension.ts#L114): `serverOptions` |
 | Derive VSIX filename, run ordered commands and stop on failure | [install-local.js](../scripts/install-local.js#L8): `manifest`, `vsix`, `run` |
 
 **Important branches and limits**
@@ -583,10 +586,10 @@ Feature sections own their detailed code/test mappings. This table identifies th
 | Commands and settings | [package.json](../package.json) | [extension.ts](../src/extension.ts), [profileView.ts](../src/profileView.ts), build/install scripts |
 | Interpreter facts: `initializationOptions.profile` | [probe.py](../server/probe.py) via `probeInterpreter` | Python/Rust initialization and message renderers |
 | Diagnostic codes and text | [messages.json](../server/messages.json), Python/Rust analyzers | LSP handlers, `ProfileView.adjust` and editor diagnostics |
-| Profile schema 2/3, modes, timeline and measurements | [pmg_profile.py](../server/pmg_profile.py#L749): `Profiler.report` | [profileModel.ts](../src/profileModel.ts#L32): `Profile`/`parseProfile`; editor and report models |
-| Source identity: `file_hashes` and normalized text | [pmg_profile.py](../server/pmg_profile.py#L307): `_text_hash`, verified source | [profileModel.ts](../src/profileModel.ts#L63): `textHash`/`ProfileIndex.state`; report navigation |
+| Profile schema 2/3, modes, timeline and measurements | [pmg_profile.py](../server/pmg_profile.py#L832): `Profiler.report` | [profileModel.ts](../src/profileModel.ts#L32): `Profile`/`parseProfile`; editor and report models |
+| Source identity: `file_hashes` and normalized text | [pmg_profile.py](../server/pmg_profile.py#L327): `_text_hash`, verified source | [profileModel.ts](../src/profileModel.ts#L63): `textHash`/`ProfileIndex.state`; report navigation |
 | Host/container paths | [containerPaths.ts](../src/containerPaths.ts), container settings | Probe/task argv, profile loader, source identity |
-| Runtime retention: `leak_runs`, `held_by`, trends | [pmg_profile.py](../server/pmg_profile.py#L671): `_leaks`/`_find_holders`/`report` | `leakMessage` in [profileModel.ts](../src/profileModel.ts); `diagnose`/`recommendations` in [reportModel.ts](../src/reportModel.ts) |
+| Runtime retention: `leak_runs`, `held_by`, trends | [pmg_profile.py](../server/pmg_profile.py#L754): `_leaks`/`_find_holders`/`report` | `leakMessage` in [profileModel.ts](../src/profileModel.ts); `diagnose`/`recommendations` in [reportModel.ts](../src/reportModel.ts) |
 | Webview `report`/`clear` and `ready`/`filter`/`open` messages | [reportView.ts](../src/reportView.ts) ↔ [reportWebview.ts](../src/reportWebview.ts) | Report rendering, filters and validated navigation |
 
 **When changing a contract**

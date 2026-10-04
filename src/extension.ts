@@ -34,6 +34,8 @@ let profileView: ProfileView | undefined;
 let lifecycle: Promise<void> = Promise.resolve();
 let shuttingDown = false;
 
+const RESTART_SETTINGS = ["backend", "interpreter", "container"].map((key) => `pythonMemoryGuardian.${key}`);
+
 function interpreter(): string {
   const configured = vscode.workspace
     .getConfiguration("pythonMemoryGuardian")
@@ -192,10 +194,13 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     output,
     profileView,
     vscode.commands.registerCommand("pythonMemoryGuardian.restart", () => restartClient(ctx)),
-    // A new interpreter or backend needs a fresh probe and a fresh server process.
+    // A new interpreter, backend or container needs a fresh probe and server process. profile.* settings
+    // are read by the client only, and the language client applies trace.server changes itself.
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("pythonMemoryGuardian")) {
+      if (RESTART_SETTINGS.some((key) => e.affectsConfiguration(key))) {
         void restartClient(ctx);
+      } else if (e.affectsConfiguration("pythonMemoryGuardian.profile")) {
+        profileView?.settingsChanged();
       }
     }),
   );

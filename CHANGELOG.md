@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- The sampler walks each thread's stack once per sample instead of twice and caches per-function facts, about 2.8× less sampler work per sample on deep multi-threaded stacks. Less time holding the GIL also means less distortion of the native/Python time split. Report output is unchanged.
+- Line-event coverage (`profile.monitoring: lines`) now switches itself off for library and standard-library lines after their first event, instead of running a Python callback on every library line. On a library-heavy workload, its overhead fell from 3.2× to 1.25× while user-line counts stay exact.
+- The profiler's memory timeline is now bounded during the run (at most 600 evenly spaced points), so long runs no longer grow profiler memory that was charged to your busiest line as RSS or allocation growth. RSS is read once per sample, and the reported RSS peak still includes spikes between kept points.
+- Precise mode no longer loses the whole profile when the profiled script stops `tracemalloc`: memory evidence ends at that point, leak detection is skipped, timing continues, and the status tooltip and report say when tracing stopped. A sampler failure is also recorded instead of silently ending sampling.
+- Reduce editor work per keystroke while a profile is loaded: only edits that change a profiled file's freshness re-adjust its diagnostics and refresh the report; source hashes are cached per document version; the report sends only referenced stack frames and skips drawing a hidden Stack Explorer.
+- Changing `profile.*` or `trace.server` settings no longer restarts the language server or re-runs the interpreter probe.
 - Add a macOS/Linux `scripts/install-local.js` helper to install locked npm packages, build the VSIX, and force-install it into local VS Code with one command.
 - Add a one-click graph action to JSON editor tabs for opening valid Memory Guardian profiles in the visual report.
 

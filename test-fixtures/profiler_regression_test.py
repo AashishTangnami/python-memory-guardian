@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +31,139 @@ class ProfileRegressions(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return script, json.loads(report.read_text())
 
+    def test_script_stopping_tracemalloc_keeps_profile(self):
+        # probe.py-style measurement: a nested start() is a no-op, but stop() ends the profiler's tracing.
+        source = ('import time, tracemalloc\n'
+                  'keep = [bytearray(1 << 20) for _ in range(4)]\n'
+                  'time.sleep(0.3)\n'
+                  'tracemalloc.start()\n'
+                  'tracemalloc.stop()\n'
+                  't = time.perf_counter()\n'
+                  'while time.perf_counter() - t < 0.3:\n'
+                  '    pass\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            script, report = self.run_script(Path(tmp), source, memory='precise')
+            self.assertIsNone(report['sampler_error'])
+            self.assertGreater(report['memory_tracing_lost_s'], 0.2)
+            lines = report['files'][str(script)]
+            self.assertFalse([ln for ln, e in lines.items() if e.get('leak_runs')], 'no leak claims without an exit snapshot')
+            self.assertGreater(sum(lines.get(n, {}).get('samples', 0) for n in ('7', '8')), 0,
+                               'timing continues after tracing stops')
+
+    def test_timeline_memory_is_bounded_and_evenly_spaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'fast')
+            for i in range(100_000):                     # ~17 min of samples at the default interval
+                p._record_timeline((i * .01, 0.0, 0.0))
+            self.assertLessEqual(len(p.timeline), profiler.TIMELINE_CAP)
+            self.assertGreaterEqual(len(p.timeline), profiler.TIMELINE_CAP // 2)
+            self.assertEqual(p.timeline[0][0], 0.0, 'the run start is kept')
+            gaps = {round(b[0] - a[0], 6) for a, b in zip(p.timeline, p.timeline[1:])}
+            self.assertEqual(len(gaps), 1, f'points stay evenly spaced: {sorted(gaps)[:5]}')
+
+    def test_rss_peak_survives_timeline_thinning(self):
+        # A short spike in a run that thins the timeline (cap lowered to 8); rss_peak_mb must keep it.
+        def wait(seconds):
+            t = time.perf_counter()
+            while time.perf_counter() - t < seconds:
+                pass
+        with tempfile.TemporaryDirectory() as tmp, patch.object(profiler, 'TIMELINE_CAP', 8):
+            p = profiler.Profiler(tmp, .005, 'fast')
+            if p.rss_kind != 'current':
+                self.skipTest('platform reports only a running RSS peak')
+            p.start()
+            wait(.3)
+            spike = b'\x01' * (200 << 20)                 # written bytes, so the pages are resident
+            during = p.rss()                              # baseline-independent: RSS while the spike lives
+            wait(.15)
+            del spike
+            wait(.3)
+            p.stop()
+            report = p.report(str(Path(tmp) / 'main.py'))
+        self.assertLessEqual(len(p.timeline), 8 + 1, 'bounded, plus the exit point')
+        self.assertGreaterEqual(report['rss_peak_mb'], during / 1e6 - 1, 'peak includes the thinned-out spike')
+
+    def test_single_walk_attributes_line_and_stack(self):
+        # User code (under root) and library code (this test file, outside root) interleave.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'off')
+            user_file = str(Path(tmp) / 'user.py')
+            ns = {}
+            exec(compile('def rec(n, lib):\n    return lib(n)\n', user_file, 'exec'), ns)
+            captured = {}
+
+            def lib(n, depth=0):
+                if depth:                                   # pure library recursion, no user frames
+                    return lib(n, depth - 1)
+                if n:
+                    return ns['rec'](n - 1, lib)
+                captured['frame'] = sys._getframe()
+                return None
+
+            ns['rec'](3, lib)
+            loc, func, stack = p._walk(captured['frame'])
+            names = [p._codes[stack[k]][1] for k in range(0, len(stack), 2)]
+            users = [p._codes[stack[k]][3] for k in range(0, len(stack), 2)]
+            self.assertEqual((loc, func), ((os.path.abspath(user_file), 2), ('rec', 1)), 'innermost user line')
+            self.assertTrue(users[0] and not users[-1], 'stack runs from the outermost user frame to the active frame')
+            self.assertEqual(names.count('rec'), 4)
+            self.assertTrue(all(isinstance(v, int) for v in stack), 'sampler keys are flat ints')
+
+            # A user frame under more than 128 library frames: attribution still finds it, the stack is empty.
+            deep = {}
+            def bottom(n, depth=150):
+                if depth:
+                    return bottom(n, depth - 1)
+                deep['frame'] = sys._getframe()
+            ns['rec'](0, bottom)
+            loc, _, stack = p._walk(deep['frame'])
+            self.assertEqual(loc, (os.path.abspath(user_file), 2))
+            self.assertEqual(stack, ())
+            self.assertTrue(p.stack_depth_limited)
+
+    def test_gil_holding_call_result_is_credited_once_to_its_line(self):
+        # Deterministic replacement for profiler_test's end-to-end sorted() check. A C call that
+        # holds the GIL (sorted) lets the sampler in only when it returns, while its 12 MB copy is
+        # still alive: the step in traced memory goes to the call's line, once. The 6 MB timsort
+        # buffer freed inside the call is a spike below the threshold (the larger of 10 MiB and 25%
+        # of traced memory, here 15 MB), so it is not charged.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'precise')
+            p.rss, p.rss_kind = lambda: 0, None
+            build, call = (str(Path(tmp) / 'work.py'), 34), (str(Path(tmp) / 'work.py'), 16)
+            MB = 1_000_000
+            traced = iter([(48 * MB, 48 * MB),           # list built (attributed to the build line)
+                           (60 * MB, 66 * MB),           # after sorted(): copy alive, buffer was the peak
+                           (60 * MB, 66 * MB)])          # after the next sorted(): same level
+            lines = iter([build, call, call])
+            sleeps = []
+
+            def sleep(_):
+                sleeps.append(True)
+                if len(sleeps) == 3:
+                    p._stop.set()
+
+            with patch.object(profiler.time, 'sleep', side_effect=sleep), \
+                    patch.object(profiler.sys, '_current_frames', return_value={profiler.threading.get_ident() + 1: None}), \
+                    patch.object(p, '_walk', side_effect=lambda _f: (next(lines), ('work', 1), ())), \
+                    patch.object(profiler.tracemalloc, 'get_traced_memory', side_effect=lambda: next(traced)), \
+                    patch.object(profiler.tracemalloc, 'reset_peak'), \
+                    patch.object(profiler.tracemalloc, 'is_tracing', return_value=True), \
+                    patch.object(profiler.tracemalloc, 'get_tracemalloc_memory', return_value=0), \
+                    patch.object(p, '_snapshot'):
+                p._run()
+            self.assertIsNone(p.sampler_error)
+            self.assertEqual(p.lines[build].traced_up, 48 * MB)
+            self.assertEqual(p.lines[call].traced_up, 12 * MB, 'the live copy is credited once to the call line')
+            self.assertEqual(p.lines[call].transient, 0, 'a 6 MB in-call buffer is below 25% of 60 MB traced')
+
+    def test_sampler_failure_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'off')
+            with patch.object(p, '_sample_loop', side_effect=ValueError('boom')):
+                p._run()
+            self.assertEqual(p.sampler_error, 'ValueError: boom')
+
     def test_optional_monitoring_reports_executed_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
             script, report = self.run_script(Path(tmp),
@@ -42,6 +176,21 @@ class ProfileRegressions(unittest.TestCase):
             else:
                 self.assertFalse(status['active'])
                 self.assertEqual(status['reason'], 'requires Python 3.12+')
+
+    def test_monitoring_disables_library_lines_and_counts_user_lines(self):
+        mon = getattr(sys, 'monitoring', None)
+        if mon is None:
+            self.skipTest('sys.monitoring requires Python 3.12+')
+        with tempfile.TemporaryDirectory() as tmp:
+            p = profiler.Profiler(tmp, .01, 'off', monitoring='lines')
+            p._monitoring_disable = mon.DISABLE
+            self.assertIs(p._on_line_event(json.dumps.__code__, 1), mon.DISABLE,
+                          'stdlib lines switch themselves off after one event')
+            user = str(Path(tmp) / 'work.py')
+            code = compile('x = 1\n', user, 'exec')
+            for _ in range(3):
+                self.assertIsNone(p._on_line_event(code, 1), 'user lines keep reporting')
+            self.assertEqual(p.line_events, {(os.path.abspath(user), 1): 3})
 
     def test_monitoring_busy_tool_falls_back_without_claiming_coverage(self):
         mon = getattr(sys, 'monitoring', None)
@@ -147,6 +296,7 @@ class ProfileRegressions(unittest.TestCase):
                     patch.object(profiler.sys, '_current_frames', return_value={}), \
                     patch.object(profiler.tracemalloc, 'get_traced_memory', return_value=(1000, 64_000_000)), \
                     patch.object(profiler.tracemalloc, 'reset_peak'), \
+                    patch.object(profiler.tracemalloc, 'is_tracing', return_value=True), \
                     patch.object(profiler.tracemalloc, 'get_tracemalloc_memory', return_value=0), \
                     patch.object(p, '_snapshot'):
                 p._run()
@@ -273,7 +423,7 @@ class ProfileRegressions(unittest.TestCase):
                 with patch.object(profiler.time, 'sleep', side_effect=sleep), \
                         patch.object(profiler.time, 'perf_counter', side_effect=ticks), \
                         patch.object(profiler.sys, '_current_frames', return_value={ident: None}), \
-                        patch.object(p, '_user_line', return_value=(loc, ('work', 1))):
+                        patch.object(p, '_walk', return_value=(loc, ('work', 1), ())):
                     p._run()
                 line = p.lines[loc]
                 self.assertAlmostEqual(getattr(line, expected + '_s'), .01)

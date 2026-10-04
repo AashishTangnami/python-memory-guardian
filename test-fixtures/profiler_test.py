@@ -34,7 +34,8 @@ check("temporary(): substantial fast-mode RSS growth (function level)", fn["temp
 
 p, f = run("workload.py", "precise")
 check("L24 LEAK.append flagged as leak, 48 MB held", "leak_runs" in f["24"] and abs(f["24"]["end_mb"] - 48) < 2)
-check("L16 sorted() copy ~12 MB attributed", f["16"].get("alloc_mb", 0) + f["16"].get("transient_peak_mb", 0) > 10)
+# sorted()'s copy attribution depends on where the OS lets the sampler in, so it is checked
+# deterministically in profiler_regression_test.py: test_gil_holding_call_result_is_credited_once_to_its_line.
 check("L28 temporary(): ~160 MB observed, then freed",
       max(f["28"]["alloc_mb"], f["28"]["transient_peak_mb"], f["28"]["peak_mb"]) > 150
       and f["28"]["end_mb"] < 1)

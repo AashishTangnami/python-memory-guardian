@@ -134,5 +134,13 @@ export function callTree(profile: Profile, metric: CallMetric, thread = '', limi
     nodes[parent].self += weight;
   }
   for (const n of nodes) n.children.sort((a, b) => nodes[b].value - nodes[a].value);
-  return { nodes, frames: profile.stacks?.frames ?? [], omitted };
+  // Send only frames the tree references: a thread/metric filter or the node cap can leave most unused.
+  const all = profile.stacks?.frames ?? [], frames: StackFrame[] = [], remap = new Map<number, number>();
+  for (const n of nodes) {
+    if (n.frame < 0) continue;
+    let id = remap.get(n.frame);
+    if (id == null) { id = frames.length; remap.set(n.frame, id); frames.push(all[n.frame]); }
+    n.frame = id;
+  }
+  return { nodes, frames, omitted };
 }

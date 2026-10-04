@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
-import { ProfileIndex } from './profileModel';
+import { ProfileIndex, runNotes } from './profileModel';
 import { diagnose, callTree, overview, CallMetric } from './reportModel';
 import { reportHtml } from './reportWebview';
 
@@ -10,6 +10,9 @@ export class GuardianReport implements vscode.Disposable {
   private index?: ProfileIndex;
   private metric: CallMetric = 'elapsed';
   private thread = '';
+
+  /** docState lets open documents reuse the controller's per-version hash instead of rehashing their text. */
+  constructor(private readonly docState?: (doc: vscode.TextDocument) => string) {}
 
   update(index: ProfileIndex | undefined): void {
     this.index = index;
@@ -60,6 +63,7 @@ export class GuardianReport implements vscode.Disposable {
     if (!this.index) return false;
     const uri = vscode.Uri.file(file);
     const doc = vscode.workspace.textDocuments.find(d => d.uri.toString() === uri.toString());
+    if (doc && this.docState) return this.docState(doc) === 'fresh';
     try {
       // Open documents handle their configured encoding. Closed non-UTF8 files
       // remain conservatively stale until opened in the editor.
@@ -79,7 +83,8 @@ export class GuardianReport implements vscode.Disposable {
       diagnosisCount: diagnoses.length, growingCount: diagnoses.filter(d => d.status === 'growing').length,
       freshness, tree: callTree(p, this.metric, this.thread), metric: this.metric, thread: this.thread,
       threads, stacksAvailable: !!p.stacks, dropped: p.stacks?.dropped_s ?? 0,
-      depthLimited: p.stacks?.depth_limited ?? false, monitoring: p.monitoring });
+      depthLimited: p.stacks?.depth_limited ?? false, monitoring: p.monitoring,
+      notes: runNotes(p), tracingLostS: p.memory_tracing_lost_s ?? null });
   }
 
   dispose(): void { this.panel?.dispose(); }

@@ -36,6 +36,15 @@ assert.strictEqual(m.heat({ samples: 0, line_events: 0, rss_growth_mb: 0 }, "off
   const file = Object.keys(p.files)[0];
   p.files[file][Object.keys(p.files[file])[0]].line_events = -1;
   assert.strictEqual(m.parseProfile(JSON.stringify(p)), undefined, "negative line-event count is rejected"); }
+{ const p = m.parseProfile(fs.readFileSync(require("path").join(__dirname, "profiler/out/workload_fast.json"), "utf8"));
+  assert.deepStrictEqual(m.runNotes(p), [], "a complete run has no notes");
+  const lost = m.parseProfile(JSON.stringify({ ...p, memory_tracing_lost_s: 1.25, sampler_error: "ValueError: boom" }));
+  assert(lost, "tracing-lost and sampler-error fields are accepted");
+  const [tracing, sampler] = m.runNotes(lost);
+  assert(tracing.includes("1.25 s") && tracing.includes("leak detection was skipped"), tracing);
+  assert(sampler.includes("ValueError: boom"), sampler);
+  assert.strictEqual(m.parseProfile(JSON.stringify({ ...p, memory_tracing_lost_s: -1 })), undefined, "negative time is rejected");
+  assert.strictEqual(m.parseProfile(JSON.stringify({ ...p, sampler_error: 3 })), undefined, "non-string error is rejected"); }
 assert.strictEqual(m.normPath("C:\\Proj\\a.py", "win32"), m.normPath("c:/proj/A.py", "win32"));
 const pp = m.parseProfile(fs.readFileSync(require("path").join(__dirname, "profiler/out/workload_precise.json"), "utf8"));
 console.log("leak msg:", m.leakMessage(new m.ProfileIndex(pp).line(WL, 24)).slice(0, 120) + "…");

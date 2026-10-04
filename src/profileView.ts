@@ -11,17 +11,23 @@ import * as path from "path";
 import * as vscode from "vscode";
 import {
   adjustSeverity, evidence, funcLabel, heat, leakMessage, lineLabel, parseProfile,
-  ProfileIndex, Thresholds, unattributedNote,
+  ProfileIndex, runNotes, textHash, Thresholds, unattributedNote,
 } from "./profileModel";
 import { ContainerConfig, containerCommand, remapProfileKeys, toContainer, toLocal } from "./containerPaths";
 import { GuardianReport } from "./reportView";
 
 const PROFILE_GLOB = "**/.pmg/profile.json";
 
+type Freshness = "fresh" | "stale" | "absent";
+
 export class ProfileView implements vscode.Disposable {
   private index: ProfileIndex | undefined;
   private overlay = true;
   private readonly raw = new Map<string, vscode.Diagnostic[]>();
+  /** One source hash per document version; every freshness check on a keystroke shares it. */
+  private readonly hashCache = new Map<string, { version: number; hash: string }>();
+  /** Last freshness seen per profiled document, so edits that cannot change evidence do no work. */
+  private readonly lastState = new Map<string, Freshness>();
   private readonly runtime = vscode.languages.createDiagnosticCollection("python-memory-guardian-runtime");
   private readonly status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   private readonly lineDeco = vscode.window.createTextEditorDecorationType({
@@ -40,7 +46,7 @@ export class ProfileView implements vscode.Disposable {
     private readonly interpreter: () => string,
     private readonly container: () => ContainerConfig | undefined = () => undefined,
   ) {
-    this.report = new GuardianReport();
+    this.report = new GuardianReport((doc) => this.docState(doc));
     const watcher = vscode.workspace.createFileSystemWatcher(PROFILE_GLOB);
     this.disposables.push(
       watcher, this.runtime, this.status, this.lineDeco, this.hotDeco, this.report,
@@ -48,14 +54,8 @@ export class ProfileView implements vscode.Disposable {
       watcher.onDidChange((u) => this.load(u)),
       watcher.onDidDelete(() => this.clear()),
       vscode.window.onDidChangeVisibleTextEditors(() => this.render()),
-      vscode.workspace.onDidChangeTextDocument((e) => {
-        if (e.document.languageId === "python") {
-          this.refreshDiagnostics();
-          if (this.index?.state(e.document.uri.fsPath, e.document.getText()) !== 'fresh') this.runtime.delete(e.document.uri);
-          this.report.refresh();
-          this.render();
-        }
-      }),
+      vscode.workspace.onDidChangeTextDocument((e) => this.onEdit(e.document)),
+      vscode.workspace.onDidCloseTextDocument((d) => this.forget(d.uri)),
       vscode.commands.registerCommand("pythonMemoryGuardian.showReport", () => this.report.show()),
       vscode.commands.registerCommand("pythonMemoryGuardian.openSavedReport", () => this.openSavedReport()),
       vscode.commands.registerCommand("pythonMemoryGuardian.visualizeReport", (uri?: vscode.Uri) => this.visualizeReport(uri)),
@@ -68,6 +68,12 @@ export class ProfileView implements vscode.Disposable {
     );
     this.status.command = "pythonMemoryGuardian.showReport";
     void vscode.workspace.findFiles(PROFILE_GLOB, undefined, 1).then((u) => u[0] && this.load(u[0]));
+  }
+
+  /** Re-apply thresholds after a profile.* setting change; the language server is unaffected. */
+  settingsChanged(): void {
+    this.refreshDiagnostics();
+    this.render();
   }
 
   private thresholds(): Thresholds {
@@ -165,6 +171,7 @@ export class ProfileView implements vscode.Disposable {
       return;
     }
     this.index = new ProfileIndex(p);
+    this.lastState.clear();
     this.runtime.clear();
     this.report.update(this.index);
     if (this.showNextReport || reveal) { this.showNextReport = false; this.report.show(); }
@@ -174,6 +181,7 @@ export class ProfileView implements vscode.Disposable {
 
   private clear(): void {
     this.index = undefined;
+    this.lastState.clear();
     this.report.update(undefined);
     this.runtime.clear();
     this.refreshDiagnostics();
@@ -183,10 +191,13 @@ export class ProfileView implements vscode.Disposable {
   // ---------------------------------------------------------------- static diagnostics middleware
   /** Called from the language client middleware for every publishDiagnostics. */
   adjust(uri: vscode.Uri, diags: vscode.Diagnostic[]): vscode.Diagnostic[] {
-    this.raw.set(uri.toString(), diags);
+    // Servers publish [] on close; dropping it keeps full refreshes proportional to files with findings.
+    if (diags.length) this.raw.set(uri.toString(), diags);
+    else this.raw.delete(uri.toString());
     const idx = this.index;
+    if (!idx || !diags.length) return diags;
     const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === uri.toString());
-    if (!idx || !doc || idx.state(uri.fsPath, doc.getText()) !== "fresh") return diags;
+    if (!doc || this.docState(doc) !== "fresh") return diags;
     const th = this.thresholds();
     return diags.map((d) => {
       const ln = d.range.start.line + 1;
@@ -202,12 +213,57 @@ export class ProfileView implements vscode.Disposable {
     });
   }
 
-  private refreshDiagnostics(): void {
+  /** Re-adjust stored static findings: every file after a profile/setting change, or one edited file. */
+  private refreshDiagnostics(only?: vscode.Uri): void {
     const coll = this.diagnostics();
+    if (!coll) return;
+    if (only) {
+      const diags = this.raw.get(only.toString());
+      if (diags) coll.set(only, this.adjust(only, diags));
+      return;
+    }
     for (const [key, diags] of this.raw) {
       const uri = vscode.Uri.parse(key);
-      coll?.set(uri, this.adjust(uri, diags));
+      coll.set(uri, this.adjust(uri, diags));
     }
+  }
+
+  // ---------------------------------------------------------------- editor events
+  /**
+   * An edit matters only when it changes a profiled file's freshness (fresh -> stale, or an undo back to
+   * fresh). Typing in an unprofiled or already-stale file leaves diagnostics, report and decorations as they are.
+   */
+  private onEdit(doc: vscode.TextDocument): void {
+    if (doc.languageId !== "python" || !this.index) return;
+    const state = this.docState(doc);
+    if (state === "absent") return;
+    const key = doc.uri.toString();
+    if (this.lastState.get(key) === state) return;
+    this.lastState.set(key, state);
+    if (state !== "fresh") this.runtime.delete(doc.uri);
+    this.refreshDiagnostics(doc.uri);
+    this.report.refresh();
+    this.render();
+  }
+
+  private forget(uri: vscode.Uri): void {
+    const key = uri.toString();
+    this.hashCache.delete(key);
+    this.lastState.delete(key);
+    this.raw.delete(key);
+  }
+
+  /** Freshness of an open document, hashing its text at most once per version. */
+  private docState(doc: vscode.TextDocument): Freshness {
+    const idx = this.index;
+    if (!idx || !idx.has(doc.uri.fsPath)) return "absent";
+    const key = doc.uri.toString();
+    let cached = this.hashCache.get(key);
+    if (!cached || cached.version !== doc.version) {
+      cached = { version: doc.version, hash: textHash(doc.getText()) };
+      this.hashCache.set(key, cached);
+    }
+    return idx.stateOfHash(doc.uri.fsPath, cached.hash);
   }
 
   // ---------------------------------------------------------------- rendering
@@ -227,7 +283,7 @@ export class ProfileView implements vscode.Disposable {
     for (const ed of vscode.window.visibleTextEditors) {
       const doc = ed.document;
       if (doc.languageId !== "python") continue;
-      const state = idx.state(doc.uri.fsPath, doc.getText());
+      const state = this.docState(doc);
       stale ||= state === "stale";
       const normal: vscode.DecorationOptions[] = [];
       const hot: vscode.DecorationOptions[] = [];
@@ -267,9 +323,9 @@ export class ProfileView implements vscode.Disposable {
     this.status.text = stale
       ? "$(warning) PMG profile stale — re-run"
       : `$(pulse) PMG ${p.wall_s.toFixed(2)} s${mem} (${p.memory_mode})`;
-    const note = unattributedNote(p);
+    const notes = [...runNotes(p), unattributedNote(p)].filter(Boolean);
     this.status.tooltip = `Profiled ${path.basename(p.script)} on Python ${p.python}. Click to open the report.` +
-      (note ? `\n\n${note}` : "");
+      notes.map((n) => `\n\n${n}`).join("");
     this.status.show();
   }
 

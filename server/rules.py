@@ -381,7 +381,7 @@ class Visitor(ast.NodeVisitor):
                 return False  # ownership may be passed to the caller
             if isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is cur:
                 targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
-                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                names = {t.id for t in targets if isinstance(t, ast.Name)}
                 if names:
                     scope = parent
                     while scope in self.parents and not isinstance(scope, (ast.Module, ast.FunctionDef,

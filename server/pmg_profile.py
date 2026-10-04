@@ -53,6 +53,9 @@ import tokenize
 import tracemalloc
 
 SCHEMA = 3
+# In-memory timeline bound. The report shows <= 300 points; keeping 300-600 evenly spaced ones
+# makes the profiler's own memory constant instead of growing (and being charged to user lines).
+TIMELINE_CAP = 600
 THIS_FILE = os.path.normcase(os.path.abspath(__file__))
 
 
@@ -64,7 +67,7 @@ def _make_rss_reader():
 
         def linux():
             with open("/proc/self/statm", "rb") as f:
-                return int(f.read().split()[1]) * page
+                return int(f.read().split()[1]) * page  # memory-guardian: ignore (statm is ~30 bytes)
         try:
             linux()
             return linux, "current"
@@ -201,10 +204,15 @@ class Profiler:
         self.snapshots: list[tuple[float, dict, dict]] = []  # (t, held{loc:bytes}, None)
         self.snap_cost = 0.0
         self.timeline: list[tuple[float, float, float]] = []
+        self._timeline_every = 1    # keep one sample in this many; doubles each time the cap is hit
+        self._timeline_tick = 0
+        self.rss_max = 0            # every sample's RSS, so thinning the timeline never hides the peak
         self.peak_traced = 0
         self.samples = 0
         self._source_versions: dict[str, tuple[tuple, str]] = {}
         self.stack_totals: dict = {}
+        self._code_info: dict[int, tuple] = {}
+        self._codes: list[tuple] = []
         self.stack_dropped_s = 0.0
         self.stack_depth_limited = False
         self.monitoring_requested = monitoring
@@ -212,7 +220,11 @@ class Profiler:
         self._monitoring_tool = None
         self.monitoring_enabled = False
         self.line_events: dict[tuple[str, int], int] = {}
+        self._line_files: dict[str, str | None] = {}   # co_filename -> absolute user path, or None
+        self._monitoring_disable = None                  # sys.monitoring.DISABLE once enabled
         self.monitoring_dropped = 0
+        self.memory_tracing_lost_s = None   # elapsed time when the script stopped tracemalloc
+        self.sampler_error = None
 
     def _enable_monitoring(self):
         """Optional execution evidence; sampled timing still uses _current_frames()."""
@@ -227,6 +239,7 @@ class Profiler:
             self.monitoring_reason = 'profiler monitoring tool ID is already in use'
             return
         try:
+            self._monitoring_disable = mon.DISABLE
             mon.use_tool_id(tool, 'python-memory-guardian')
             self._monitoring_tool = tool
             mon.register_callback(tool, mon.events.LINE, self._on_line_event)
@@ -237,10 +250,17 @@ class Profiler:
             self._disable_monitoring()
 
     def _on_line_event(self, code, line):
+        """Count user line events. Library and stdlib lines return DISABLE, which turns LINE
+        events off at that location for this tool only, so they cost one callback each, not one
+        per execution. User paths are resolved once per file name."""
         filename = code.co_filename
-        if not self._is_user(filename):
-            return
-        loc = (os.path.abspath(filename), line)
+        path = self._line_files.get(filename, False)
+        if path is False:
+            path = self._line_files[filename] = (
+                os.path.abspath(filename) if self._is_user(filename) else None)
+        if path is None:
+            return self._monitoring_disable
+        loc = (path, line)
         if loc in self.line_events:
             self.line_events[loc] += 1
         elif len(self.line_events) < 50_000:
@@ -321,37 +341,59 @@ class Profiler:
             self._user_cache[filename] = hit
         return hit
 
-    def _user_line(self, frame):
-        """Innermost user frame -> ((file, line), (func name, first line))."""
-        f = frame
-        while f is not None:
-            co = f.f_code
-            if self._is_user(co.co_filename):
-                # co_qualname (3.11+) gives "Service.handle"; older versions fall back to co_name.
-                qn = getattr(co, "co_qualname", co.co_name).replace(".<locals>", "")
-                return (os.path.abspath(co.co_filename), f.f_lineno), (qn, co.co_firstlineno)
-            f = f.f_back
-        return None, None
+    def _code(self, co):
+        """Per-code facts, computed once: (display file, qualname, first line, is_user, id).
 
-    def _stack(self, frame):
-        """Python frames from the outermost user call through the active frame.
-
-        Store immutable values only, never frame references that retain locals.
-        Native C frames are not visible through sys._current_frames().
+        Keyed by id(co); the entry holds co itself so the id cannot be reused by another code
+        object. co_qualname (3.11+) gives "Service.handle"; older versions fall back to co_name.
         """
-        frames = []
-        while frame is not None and len(frames) < 128:
-            co = frame.f_code
+        info = self._code_info.get(id(co))
+        if info is None:
             filename = co.co_filename
-            user = self._is_user(filename)
-            frames.append((os.path.abspath(filename) if not filename.startswith('<') else filename,
-                           frame.f_lineno, getattr(co, 'co_qualname', co.co_name).replace('.<locals>', ''),
-                           co.co_firstlineno, user))
+            info = (filename if filename.startswith('<') else os.path.abspath(filename),
+                    getattr(co, 'co_qualname', co.co_name).replace('.<locals>', ''),
+                    co.co_firstlineno, self._is_user(filename), len(self._codes), co)
+            self._code_info[id(co)] = info
+            self._codes.append(info)
+        return info
+
+    def _walk(self, frame):
+        """One pass over a thread's frames -> (line, func, stack).
+
+        line/func: the innermost user frame ((file, line), (qualname, first line)), used for
+        attribution. stack: Python frames from the outermost user call through the active
+        frame, at most 128 deep, as a flat tuple (code id, line, code id, line, ...) so the
+        sampler hashes small ints. report() turns it back into frame records. Native C
+        frames are not visible through sys._current_frames(); no frame references are kept.
+        """
+        flat = []
+        loc = func = None
+        outer = -1                      # index of the outermost user frame seen
+        depth = 0
+        while frame is not None and depth < 128:
+            info = self._code(frame.f_code)
+            line = frame.f_lineno
+            if info[3]:
+                if loc is None:
+                    loc, func = (info[0], line), (info[1], info[2])
+                outer = depth
+            flat.append(info[4])
+            flat.append(line)
+            depth += 1
             frame = frame.f_back
         self.stack_depth_limited |= frame is not None
-        frames.reverse()
-        first = next((i for i, fr in enumerate(frames) if fr[4]), None)
-        return tuple(frames[first:]) if first is not None else ()
+        while loc is None and frame is not None:      # user code below a >128-frame library stack
+            info = self._code(frame.f_code)
+            if info[3]:
+                loc, func = (info[0], frame.f_lineno), (info[1], info[2])
+            frame = frame.f_back
+        if outer < 0:
+            return loc, func, ()
+        stack = []
+        for k in range(outer, -1, -1):                 # outermost user frame first
+            stack.append(flat[2 * k])
+            stack.append(flat[2 * k + 1])
+        return loc, func, tuple(stack)
 
     def _record_stack(self, ident, name, stack, values):
         if not stack:
@@ -373,8 +415,30 @@ class Profiler:
             st = self.lines[loc] = LineStats()
         return st
 
+    def _precise(self, t: float) -> bool:
+        """Whether precise memory evidence is still being collected at elapsed time t.
+
+        The profiled script can call tracemalloc.stop() (interpreter probes and memory tests
+        do). After that, snapshots raise and get_traced_memory() reads (0, 0), so precise
+        collection ends for the rest of the run and the report says when. A stop() followed
+        by start() between two samples cannot be detected.
+        """
+        if self.memory != "precise" or self.memory_tracing_lost_s is not None:
+            return False
+        if tracemalloc.is_tracing():
+            return True
+        self.memory_tracing_lost_s = t
+        return False
+
     # ------------------------------------------------------------ sampling loop
     def _run(self):
+        """Sampler thread. A failure ends sampling but is reported, never a lost profile."""
+        try:
+            self._sample_loop()
+        except Exception as e:
+            self.sampler_error = f"{type(e).__name__}: {e}"
+
+    def _sample_loop(self):
         me = threading.get_ident()
         main = threading.main_thread().ident
         last_wall = time.perf_counter()
@@ -416,10 +480,10 @@ class Profiler:
                         dcpu = None
                 else:
                     dcpu = dproc if ident == main else None
-                loc, func = self._user_line(frame)
+                loc, func, stack = self._walk(frame)
                 if loc is not None:
                     self._stats(loc).func = func
-                    stacks[ident] = self._stack(frame)
+                    stacks[ident] = stack
                 per_thread.append((ident, loc, dcpu))
 
             running = [t for t in per_thread if t[2] is not None and t[2] > 0.2 * dw]
@@ -450,8 +514,10 @@ class Profiler:
                                    tuple(b - a for a, b in zip(before, after)))
 
             # fast memory: attribute RSS change to the busiest thread's line
+            rss = 0
             if self.rss_kind:
-                rss = self.rss()
+                rss = self.rss()                     # one read per sample, shared with the timeline
+                self.rss_max = max(self.rss_max, rss)
                 d = rss - last_rss
                 last_rss = rss
                 if d and per_thread:
@@ -463,7 +529,8 @@ class Profiler:
                         else:
                             st.rss_down -= d
             traced = 0
-            if self.memory == "precise":
+            precise = self._precise(now - t0)
+            if precise:
                 traced, interval_peak = tracemalloc.get_traced_memory()
                 self.peak_traced = max(self.peak_traced, interval_peak)
                 if hasattr(tracemalloc, "reset_peak"):          # 3.9+
@@ -480,9 +547,9 @@ class Profiler:
                         st.traced_up += traced - prev_traced     # cheap, no snapshot needed
                     if transient > max(10 << 20, 0.25 * traced):
                         st.transient = max(st.transient, transient)
-            self.timeline.append((now - t0, traced / 1e6, (self.rss() if self.rss_kind else 0) / 1e6))
+            self._record_timeline((now - t0, traced / 1e6, rss / 1e6))
 
-            if self.memory == "precise":
+            if precise:
                 self.peak_traced = max(self.peak_traced, traced)
                 elapsed = now - t0
                 # spike: sudden jump since the previous *sample* -> snapshot now, so
@@ -507,6 +574,21 @@ class Profiler:
                     if book:
                         self.snap_rate = 0.5 * self.snap_rate + 0.5 * (cost / book)
                     last_snap_t, last_snap_traced = elapsed, traced
+
+    def _record_timeline(self, point):
+        """Keep at most TIMELINE_CAP evenly spaced samples: when full, drop every other point
+        and halve the keep rate, so memory stays constant for any run length."""
+        self._timeline_tick += 1
+        if self._timeline_tick < self._timeline_every:
+            return
+        self._timeline_tick = 0
+        self.timeline.append(point)
+        if len(self.timeline) >= TIMELINE_CAP:
+            # The dropped last point was one old stride after the new last point, so the next
+            # kept sample is one old stride away: that keeps the spacing exactly even.
+            del self.timeline[1::2]
+            self._timeline_tick = self._timeline_every
+            self._timeline_every *= 2
 
     def _snapshot(self, t: float):
         """Bytes still held per allocating user line, plus held bytes with no user frame.
@@ -577,13 +659,14 @@ class Profiler:
         self.holders: dict = {}
         self.rss1 = self.rss() if self.rss_kind else None    # before our own snapshot work
         traced_now = 0
-        if self.memory == "precise":
+        precise = self._precise(self.wall)
+        if precise:
             traced_now, traced_peak = tracemalloc.get_traced_memory()
             self.peak_traced = max(self.peak_traced, traced_peak)
         # Capture the process after user code exits; a short-lived allocation can
         # otherwise be the timeline's last point even though the exit snapshot frees it.
         self.timeline.append((self.wall, traced_now / 1e6, (self.rss1 or 0) / 1e6))
-        if self.memory == "precise":
+        if precise:
             self._snapshot(self.wall)          # what is still held at exit
             leaks = self._leaks()
             if leaks:                          # needs tracemalloc still running
@@ -633,13 +716,13 @@ class Profiler:
         spaces = []
         if main_globals is not None:
             spaces.append(("__main__", main_globals))
-        for m in list(sys.modules.values()):
+        for m in list(sys.modules.values()):  # memory-guardian: ignore (snapshot: imports may mutate it)
             fn = getattr(m, "__file__", None)
             if fn and self._is_user(fn) and getattr(m, "__name__", "") != "__main__":
                 spaces.append((m.__name__, vars(m)))
         seen = set()
         for mod, g in spaces:                          # 1) module globals
-            for k, v in list(g.items()):
+            for k, v in list(g.items()):  # memory-guardian: ignore (snapshot of a live module dict)
                 if k.startswith("__") or id(v) in seen:
                     continue
                 seen.add(id(v))
@@ -656,7 +739,7 @@ class Profiler:
             user_cls = cls.__module__ == "__main__" or (
                 mod is not None and getattr(mod, "__file__", None) and self._is_user(mod.__file__))
             if user_cls and not isinstance(obj, type) and hasattr(obj, "__dict__"):
-                for k, v in list(vars(obj).items()):
+                for k, v in list(vars(obj).items()):  # memory-guardian: ignore (snapshot of a live __dict__)
                     if id(v) not in seen:
                         scan(v, f"{cls.__qualname__}.{k}")
             elif id(obj) not in seen and isinstance(obj, (list, dict, set, tuple)):
@@ -751,7 +834,8 @@ class Profiler:
                        default=None)
         peak = self.snapshots[peak_idx][1] if peak_idx is not None else {}
         end = self.snapshots[-1][1] if self.snapshots else {}
-        leaks = self._leaks()
+        # Leak claims need an exit snapshot; after tracing was lost the last one is not at exit.
+        leaks = self._leaks() if self.memory_tracing_lost_s is None else {}
         total = sum(s.python_s + s.native_s + s.system_s + s.cpu_s for s in self.lines.values()) or 1.0
         files: dict[str, dict] = {}
         funcs: dict[str, dict] = {}
@@ -844,7 +928,10 @@ class Profiler:
         stack_frames, frame_ids, stack_samples = [], {}, []
         for (ident, name, stack), values in self.stack_totals.items():
             ids = []
-            for fr in stack:
+            for k in range(0, len(stack), 2):
+                file, name, first_line, user = self._codes[stack[k]][:4]
+                # Merge by content, not code object: a reloaded function is still one frame.
+                fr = (file, stack[k + 1], name, first_line, user)
                 if fr not in frame_ids:
                     frame_ids[fr] = len(stack_frames)
                     stack_frames.append(dict(zip(('file', 'line', 'name', 'first_line', 'user'), fr)))
@@ -879,13 +966,16 @@ class Profiler:
             "unattributed_peak_mb": (round((self.snapshots[peak_idx][2] or 0) / 1e6, 3)
                                      if self.snapshots and peak_idx is not None else None),
             "frames": self.frames if self.memory == "precise" else None,
+            "memory_tracing_lost_s": (round(self.memory_tracing_lost_s, 4)
+                                      if self.memory_tracing_lost_s is not None else None),
+            "sampler_error": self.sampler_error,
             "peak_traced_mb": round(self.peak_traced / 1e6, 3) if self.memory == "precise" else None,
             "rss_start_mb": round(self.rss0 / 1e6, 3) if self.rss0 else None,
             "rss_end_mb": round(self.rss1 / 1e6, 3) if self.rss1 else None,
-            "rss_peak_mb": round(max([c for _, _, c in self.timeline] + [(self.rss1 or 0) / 1e6]), 3),
+            "rss_peak_mb": round(max(self.rss_max, self.rss1 or 0) / 1e6, 3),
             # Process-level native estimate: memory the Python allocator never saw
             # (C extensions, NumPy/Arrow buffers, interpreter). Not attributed per line.
-            "native_untraced_mb": (round(max(0.0, max((c for _, _, c in self.timeline), default=0)
+            "native_untraced_mb": (round(max(0.0, self.rss_max / 1e6
                                              - self.peak_traced / 1e6
                                              - (self.rss0 or 0) / 1e6), 3)
                                    if self.memory == "precise" and self.rss_kind == "current" else None),
