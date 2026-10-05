@@ -17,7 +17,7 @@ if (args.some(arg => arg !== '--dry-run')) {
   process.exit(2);
 }
 if (process.platform === 'win32') {
-  console.error('This helper supports macOS and Linux. On Windows, use the manual steps in docs/05-local-deploy.md.');
+  console.error('This helper supports macOS and Linux. On Windows, use the manual steps in docs/05-build-and-release.md.');
   process.exit(1);
 }
 

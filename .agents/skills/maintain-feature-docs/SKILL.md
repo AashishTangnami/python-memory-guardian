@@ -10,7 +10,14 @@ Apply this skill to every code-related change in this repository. Make a meaning
 ## Documentation targets
 
 - `docs/feature-map.md` is the canonical implemented-feature map. Update it when a change affects a trigger, command, editor event, setting, CLI action, view, processing path, result, failure path, shared dependency, process boundary, backend difference, schema, rule, or build-time resource relationship. Update its feature-to-code table and test references when the corresponding paths or symbols change. Keep planned and unused capabilities separate from implemented ones.
-- Update `README.md` and `docs/01-quickstart.md` through `docs/03-container-setup.md` when user-facing behavior, setup, or container usage changes. Update `docs/04-developer-setup.md`, `docs/05-local-deploy.md`, or `guide-deploy.md` for development, build, packaging, or deployment changes. Update `CHANGELOG.md` when a user-visible release change warrants a release note.
+- Each topic has one home; update that file and link to it instead of repeating its content elsewhere (`docs/00-guides.md` lists them):
+  - `docs/01-quickstart.md` through `docs/03-container-setup.md` for user-facing behavior, setup, settings, or container usage (`docs/02-using-the-extension.md` owns the report, labels, settings and user troubleshooting);
+  - `docs/06-rules.md` for static rule codes, triggers and wording;
+  - `docs/reference/cli.md` for profiler options, arguments and exit codes; `docs/reference/profile-format.md` for any `profile.json` field (with `docs/pmg-summary.schema.json` for `summary.json`);
+  - `docs/07-technical-design.md` for how a measurement works, its accuracy, cost and limits (written in ASD-STE100 style: short sentences, active voice, no -ing verb forms);
+  - `docs/04-developer-setup.md` for development, tests and debugging; `docs/05-build-and-release.md` for packaging, installation and publishing;
+  - `README.md` only when the product summary, requirements, first-run steps or the documentation table change; it is also the Marketplace page.
+- Update `CHANGELOG.md` when a user-visible release change warrants a release note.
 - For internal changes that leave the feature overview intact, document the changed implementation relationship in the relevant dependency graph or developer guide. Do not alter the overview merely to record an internal refactor.
 
 ## Method

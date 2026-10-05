@@ -640,7 +640,7 @@ flowchart TD
     Client("serverOptions") -->|load at startup| Bin
 ```
 
-The manual-copy edge has no repository script. See [optional Rust packaging](05-local-deploy.md#optional-rust-backed-package) for placing the binary; a missing binary produces a startup error.
+The manual-copy edge has no repository script. See [optional Rust packaging](05-build-and-release.md#optional-a-package-with-the-rust-backend-for-your-machine) for placing the binary; a missing binary produces a startup error.
 
 #### Local installer
 
@@ -671,7 +671,7 @@ Installer("Local installer") -->|run npm ci| Ci("Dependencies")
 - `build:rust` writes into `rust-server/target/release`; `serverOptions` expects `bin/guardian-server[.exe]`. Repository scripts do not copy the binary. Missing it breaks Rust startup; that gap does not mean the Rust implementation is unused.
 - The local installer supports macOS/Linux, runs `npm ci` then packaging then `code --install-extension --force`, and stops when a command fails or the VSIX is missing.
 - `PMG_CODE_CLI` overrides the VS Code executable; `--dry-run` prints commands without running them. The filename comes from manifest name/version.
-- The installer does not build/copy Rust or reload an open VS Code window. See [local deployment](05-local-deploy.md) and [developer setup](04-developer-setup.md) for those steps.
+- The installer does not build/copy Rust or reload an open VS Code window. See [build, install and release](05-build-and-release.md) and [developer setup](04-developer-setup.md) for those steps.
 
 **Checks:** `node scripts/install-local.js --dry-run` previews installer commands; [package_test.py](../test-fixtures/package_test.py) checks the VSIX.
 

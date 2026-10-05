@@ -12,7 +12,7 @@ The extension bundles its Python server dependencies. You do not need to install
 
 ## 1. Install
 
-If the extension has been published to the Marketplace, install it from VS Code's Extensions view. Otherwise, obtain a `.vsix` from a maintainer or [build one locally](05-local-deploy.md), then run **Extensions: Install from VSIX…** from the Command Palette and reload VS Code.
+If the extension has been published to the Marketplace, install it from VS Code's Extensions view. Otherwise, obtain a `.vsix` from a maintainer or [build one locally](05-build-and-release.md), then run **Extensions: Install from VSIX…** from the Command Palette and reload VS Code.
 
 For a Dev Container, WSL, or Remote-SSH workspace, install the extension in that remote environment. See [container and remote setup](03-container-setup.md).
 
@@ -30,13 +30,7 @@ If no diagnostics appear, open **View → Output**, select **Python Memory Guard
 
 ## 4. Run a profile
 
-Save a Python file that can run as a script. Click the pulse icon in the editor title bar or run **Python Memory Guardian: Profile Current File**. Choose:
-
-| Mode | Use it for |
-|---|---|
-| **fast** | Timing and process RSS growth with lower overhead |
-| **precise** | Allocation, retained-memory, and suspected-leak evidence |
-| **time only** | Timing without memory measurement |
+Save a Python file that can run as a script. Click the pulse icon in the editor title bar or run **Python Memory Guardian: Profile Current File**. Choose **fast** to measure time, or **precise** to find which code keeps memory ([all modes](02-using-the-extension.md#profile-a-script)), then enter the script's arguments, if any.
 
 The script runs in a VS Code terminal. After it finishes, the report opens and measured lines receive inline labels. The profile is written to `.pmg/profile.json` in the project folder. Add `.pmg/` to `.gitignore` if you do not want to commit profiles.
 

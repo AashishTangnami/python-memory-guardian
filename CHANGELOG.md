@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Documentation is reorganized so each topic has one home: the README is a short landing page, `docs/06-rules.md` holds the rules reference, `docs/05-build-and-release.md` replaces `guide-deploy.md`, `docs/05-local-deploy.md` and `docs/06-marketplace-publish.md`, and `docs/07-technical-design.md` describes how PMG measures and its limits.
 - Fixed: precise mode's native memory estimate (`native ≈` and the Overview card) included `tracemalloc`'s own bookkeeping, so pure-Python code showed hundreds of MB of "native" memory (492 MB on `generators.py`). The bookkeeping is now subtracted, and an estimate within twice it counts as none, because `tracemalloc` misstates its own cost in both directions.
 - Profile Current File asks for the script's arguments (remembered per file), and offers **precise, only while `f()` runs** when the cursor is inside a function (Python 3.12+): `tracemalloc` runs only during that function, so the rest of the program runs at full speed (4.3× instead of 10.7× on `generators.py`). The profiler CLI has the same option as `--trace-function NAME`.
 - Overview adds **Phases**: the run split by what the main thread was doing, with each phase's peak traced memory, peak RSS and the new RSS it needed beyond earlier phases, so variants run in one process can be compared even though RSS stays high. Phases can narrow Memory diagnosis or focus the Stack Explorer.
