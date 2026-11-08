@@ -46,7 +46,8 @@ console.log("PASS path rules (Windows host, longest match, boundaries, unmapped,
 
 // ---- Part 2: simulated container run ------------------------------------------------
 const docker = process.env.PMG_CONTAINER_TEST === "docker";
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pmg-ctr-"));
+// On CI the runner's temp folder is one the Docker daemon can bind-mount; os.tmpdir() may not be.
+const tmp = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP || os.tmpdir(), "pmg-ctr-"));
 const host = path.join(tmp, "host-project");          // what the editor sees
 const alias = docker ? "/app" : path.join(tmp, "app"); // what the container sees
 fs.mkdirSync(host);
@@ -67,6 +68,10 @@ const toC = (p) => c.toContainer(p, cfg.mappings, false);
 
 const probe = c.containerCommand(cfg, toC(path.join(host, ".pmg", "probe.py")), []);
 const pr = spawnSync(probe.command, probe.args, { encoding: "utf8" });
+// Report the exec prefix's own failure (docker not running, image or mount missing), not a JSON error.
+const failed = (what, cmd, res) => `${what} failed: ${[cmd.command, ...cmd.args].join(" ")}\n` +
+  `status ${res.status}${res.error ? `, ${res.error.message}` : ""}\nstderr: ${res.stderr}\nstdout: ${res.stdout}`;
+assert.strictEqual(pr.status, 0, failed("probe", probe, pr));
 const facts = JSON.parse(pr.stdout);
 assert(facts.py_version && facts.int_size, "probe ran through the exec prefix");
 console.log(`PASS probe through exec prefix -> Python ${facts.py_version}, GIL ${facts.gil_state}`);
@@ -75,7 +80,7 @@ const out = path.join(host, ".pmg", "profile.json");
 const run = c.containerCommand(cfg, toC(path.join(host, ".pmg", "pmg_profile.py")),
   ["--memory", "precise", "--root", toC(host), "--out", toC(out), toC(path.join(host, "service.py"))]);
 const r = spawnSync(run.command, run.args, { encoding: "utf8" });
-assert.strictEqual(r.status, 0, r.stderr);
+assert.strictEqual(r.status, 0, failed("profile run", run, r));
 const raw = m.parseProfile(fs.readFileSync(out, "utf8"));
 assert(Object.keys(raw.files).every((k) => k.startsWith(alias)), "profile is written with container paths");
 const p = c.remapProfileKeys(raw, (k) => c.toLocal(k, cfg.mappings, false));

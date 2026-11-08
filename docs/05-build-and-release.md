@@ -454,9 +454,11 @@ Prefer *unpublish* unless you're certain.
 ## Acceptance gate
 
 The platform workflow packages and checks Python 3.9/3.13 runtimes on Linux,
-macOS and Windows. The separate acceptance job saves trace evidence on failure
-and requires all criteria and original overhead budgets to pass. Definition of
-this matrix does not establish release readiness. Incomplete native timestamps,
+macOS and Windows. The separate acceptance job blocks on failed or incomplete
+cases (`--gate regression`) and records overhead without blocking; it saves the
+evidence either way. Release readiness still needs the full gate,
+`npm run test:acceptance`, with all criteria and original overhead budgets
+passing on a serial, isolated host. Definition of this matrix does not establish release readiness. Incomplete native timestamps,
 unannotated concurrency coverage or failed budgets keep the gate red. The VSIX
 contains `src/python/pmg_profiler/`, including `allocations.py`, and `src/python/pmg_diagnostics.py`; optional Memray binaries
 are installed in the target environment, not bundled in the extension.

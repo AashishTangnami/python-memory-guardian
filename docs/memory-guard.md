@@ -33,7 +33,11 @@ Windows observations currently cover only the root process. Processes that
 escape the group are not covered.
 
 Linux additionally sets `RLIMIT_AS` before target execution. Its acknowledgement
-records the applied byte limit. This limits each process's virtual address
+records the applied byte limit. The child skips the limit when its address
+space already maps half the budget or more (a free-threaded build's mimalloc
+reserves about 1 GiB at startup): such a limit would refuse new mappings, the
+sampler's thread stack first, long before RSS reaches the budget. `hard_limit`
+is then `null` and only the polled RSS budget applies. This limits each process's virtual address
 space, not combined family RSS. It can refuse a virtual mapping before RSS
 reaches the budget. macOS and Windows have no equivalent hard limit in this
 implementation. RSS polling can overshoot, especially for sudden native
@@ -62,6 +66,9 @@ independently, then checks protection and corrected execution. It also tests GIL
 starvation, native mapping growth, child-process pressure, invalid budgets, abrupt exit and unavailable
 observations. `test_memory_guard.js` checks evidence validation, comparison
 semantics and container artifact paths. Skipped platform cases are incomplete.
+On free-threaded builds the corrected-run ceiling is 96 MiB per process instead
+of 64 MiB: mimalloc keeps freed pages resident, but the amount stays flat as the
+work grows, so the run is still bounded and stays below the 256 MiB test budget.
 Controlled-counter tests verify reserve and reader-loss policy with real child
 cleanup. These tests do not claim to exhaust the host's available memory.
 Pressure witnesses fill retained buffers with data: payload size alone does not

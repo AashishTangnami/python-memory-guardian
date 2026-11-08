@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import unittest
@@ -16,6 +17,13 @@ from pmg_profiler.guard import choose_budget, linux_cgroup_available, system_mem
 PROFILER = ROOT / 'src' / 'python' / 'pmg_profile.py'
 FIXTURE = ROOT / 'tests' / 'fixtures' / 'acceptance' / 'guard_workload.py'
 MIB = 1 << 20
+# Free-threaded builds allocate with mimalloc, which keeps about 50 MiB of freed pages resident. The
+# cache stays flat as work grows (70.8 MiB after 64 MiB or 1.5 GiB processed on 3.13.3t), so a
+# corrected run is still bounded, only above the 64 MiB the default allocator reaches. Both ceilings
+# stay below the 256 MiB budget, so the red and green runs remain separated.
+FREE_THREADED = bool(sysconfig.get_config_var('Py_GIL_DISABLED'))
+FIXED_PEAK = (96 if FREE_THREADED else 64) * MIB         # one corrected process
+FIXED_FAMILY_PEAK = (192 if FREE_THREADED else 64) * MIB  # two corrected workers together
 
 
 class BudgetPolicy(unittest.TestCase):
@@ -105,7 +113,7 @@ class GuardExecutions(unittest.TestCase):
         self.assertGreater(bad['peak_rss_bytes'], small['peak_rss_bytes'])
         self.assertLess(small['peak_rss_bytes'], 256 * MIB)
         self.assertGreater(bad['peak_rss_bytes'], 256 * MIB)
-        self.assertLess(fixed['peak_rss_bytes'], 64 * MIB)
+        self.assertLess(fixed['peak_rss_bytes'], FIXED_PEAK)
         self.assertEqual(fixed['retained_bytes'], 0)
         self.assertEqual(bad['bytes_processed'], fixed['bytes_processed'])
         with tempfile.TemporaryDirectory() as directory:
@@ -126,6 +134,9 @@ class GuardExecutions(unittest.TestCase):
             self.assertEqual(green.returncode, 0, green.stderr)
             self.assertEqual(corrected['memory_guard']['status'], 'completed')
             self.assertIsNone(corrected['memory_guard']['stop_reason'])
+            if sys.platform.startswith('linux') and not FREE_THREADED:
+                # Free-threaded mimalloc reserves about 1 GiB at startup, so the runner skips RLIMIT_AS there.
+                self.assertEqual(corrected['memory_guard']['hard_limit'], 'RLIMIT_AS')
             self.assertEqual(json.loads(green.stdout)['bytes_processed'], bad['bytes_processed'])
             self.assertFalse(any(e.get('leak_runs') for lines in corrected['files'].values() for e in lines.values()))
 
@@ -170,7 +181,7 @@ class GuardExecutions(unittest.TestCase):
         bad_value, fixed_value = json.loads(bad.stdout), json.loads(fixed.stdout)
         self.assertGreater(bad_value['peak_rss_bytes'], 256 * MIB)
         self.assertLess(bad_value['python_peak_bytes'], 16 * MIB)
-        self.assertLess(fixed_value['peak_rss_bytes'], 64 * MIB)
+        self.assertLess(fixed_value['peak_rss_bytes'], FIXED_PEAK)
         self.assertEqual(bad_value['bytes_processed'], fixed_value['bytes_processed'])
         with tempfile.TemporaryDirectory() as directory:
             result, profile, _ = self.run_case(directory, ['--native'])
@@ -258,7 +269,7 @@ if '--detach' not in sys.argv:
             self.assertLess(abs(bad_rows[0]['t'] - bad_rows[1]['t']), 1)
             self.assertGreater(sum(row['peak'] for row in bad_rows), 256 * MIB)
             self.assertEqual(sum(row['bytes_processed'] for row in bad_rows), sum(row['bytes_processed'] for row in fixed_rows))
-            self.assertLess(sum(row['peak'] for row in fixed_rows), 64 * MIB)
+            self.assertLess(sum(row['peak'] for row in fixed_rows), FIXED_FAMILY_PEAK)
             result, profile, _ = self.run_case(directory, [str(worker), '--detach'], fixture=target)
             self.assertEqual(result.returncode, 3, result.stderr)
             self.assertEqual(profile['memory_guard']['stop_reason'], 'rss_budget')

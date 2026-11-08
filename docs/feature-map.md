@@ -224,8 +224,9 @@ The default profiling CLI uses [pmg_profiler/guard.py](../src/python/pmg_profile
 `system_memory` and `choose_budget` select a budget from current availability;
 `supervise` launches a separate child and waits 100 ms between observation rounds.
 `terminate_family` stops it on measured budget/reserve pressure or unavailable
-observations. Linux's child acknowledges an applied `RLIMIT_AS` limit before
-target execution. POSIX group RSS includes descendants; Windows is root-only.
+observations. Linux's child ([runner.py](../src/python/pmg_profiler/runner.py) `run`, `address_space_bytes`)
+applies and acknowledges `RLIMIT_AS` before target execution, unless its mapped
+address space already reaches half the budget (free-threaded mimalloc reservation). POSIX group RSS includes descendants; Windows is root-only.
 This guard includes in-process profiler costs and cannot attribute RSS to a
 Python line or guarantee a hard family RSS ceiling. Full limits and policy live
 in the [memory guard guide](memory-guard.md).
@@ -254,7 +255,8 @@ containers. `validMemoryGuard` validates observations; `runNotes` shows stopped
 execution. `compareProfiles` marks incomplete guarded deltas as context.
 `buildSummary` preserves guard evidence; `remapProfileKeys` maps raw-artifact
 paths. [memory_guard_test.py](../tests/guard/memory_guard_test.py) checks
-independent growth/fixed witnesses, GIL starvation and descendant pressure;
+independent growth/fixed witnesses, GIL starvation and descendant pressure
+(corrected-run ceilings `FIXED_PEAK`/`FIXED_FAMILY_PEAK` are higher on free-threaded builds, for mimalloc's cache);
 [test_memory_guard.js](../tests/guard/test_memory_guard.js) checks consumer
 contracts. Both run through `npm run test:guard`; acceptance includes the Python
 fixtures and keeps unsupported cases incomplete.
@@ -882,11 +884,12 @@ fixtures. [test_container.js](../tests/client/test_container.js) checks nested
 source/artifact mapping without mutation.
 
 [validate.yml](../.github/workflows/validate.yml) defines Python 3.9/3.13 runtime
-and package checks on Linux, macOS and Windows, plus a non-blocking free-threaded 3.13t job on
-Linux and a container job that runs [test_container.js](../tests/client/test_container.js)
-against real Docker (`PMG_CONTAINER_TEST=docker`). A separate Linux acceptance job
-blocks on incomplete criteria or failed budgets and uploads saved evidence on
-failure. The workflow definition does not prove remote platform checks ran.
+and package checks on Linux, macOS and Windows, plus a free-threaded 3.13t job on
+Linux (blocking; free-threaded RSS and GC limits in the tests) and a container job that runs [test_container.js](../tests/client/test_container.js)
+against real Docker (`PMG_CONTAINER_TEST=docker`, temp project under `RUNNER_TEMP`). A separate Linux acceptance job
+runs [acceptance_suite.py](../tests/acceptance/acceptance_suite.py) with `--gate regression` (failed, skipped or
+unsupported cases block; documented-limit partials do not), then
+[measure_overhead.py](../tests/acceptance/measure_overhead.py) as a non-blocking step, and uploads saved evidence. The workflow definition does not prove remote platform checks ran.
 [package_test.py](../tests/packaging/package_test.py) checks the profiler folder, the rules package and the helper modules,
 and invokes the extracted profiler. [acceptance-validation.md](acceptance-validation.md)
 explains serial overhead, preregistered budgets and incomplete observations.

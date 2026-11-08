@@ -294,6 +294,11 @@ def main(argv=None):
     parser.add_argument('--include-overhead', action='store_true')
     parser.add_argument('--overhead-results', type=Path, help='reuse an isolated measured benchmark directory')
     parser.add_argument('--reuse-rust-build', action='store_true', help='check source timestamps instead of running cargo build')
+    parser.add_argument('--gate', choices=('full', 'regression'), default='full',
+                        help='full: exit 0 only when all nine criteria pass (default). regression: the same report, but '
+                             'exit 0 when no case, prerequisite or criterion failed and no executed case was skipped or '
+                             'unsupported; a criterion that is partial only because of its documented limit, and '
+                             'criterion 9 when overhead was not requested, do not change the exit status')
     parser.add_argument('--worker', choices=MODULES, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     out = args.out.resolve()
@@ -416,6 +421,12 @@ def main(argv=None):
     print(json.dumps({'case_counts': counts, 'report': str(out / 'report.md')}))
     if counts['failed'] or any(item['status'] == 'fail' for item in criteria) or any(p['status'] == 'failed' for p in prerequisites):
         return 1
+    if args.gate == 'regression':
+        # The report keeps every partial and unsupported status; only the exit status ignores the
+        # documented coverage limits (LIMITS) and an overhead measurement that was not requested.
+        incomplete = counts['skipped'] or counts['unsupported'] or any(p['status'] != 'passed' for p in prerequisites)
+        measured = [item for item in criteria if item['number'] != 9 or args.include_overhead or args.overhead_results]
+        return 2 if incomplete or any(item['status'] not in ('pass', 'partial') for item in measured) else 0
     return 2 if any(item['status'] != 'pass' for item in criteria) else 0
 
 

@@ -43,6 +43,13 @@ def main():
             'reason': 'OS time RSS parser is available only on macOS and Linux',
             'results': [], 'thresholds': preregistered}))
         return 2
+    # Linux needs GNU time (`time` package) for -v; a missing tool is an incomplete measurement, not a crash.
+    if not Path('/usr/bin/time').is_file():
+        (OUT / 'results.json').write_text(json.dumps({'status': 'unsupported',
+            'reason': '/usr/bin/time is unavailable; install GNU time on Linux to record peak RSS',
+            'results': [], 'thresholds': preregistered}))
+        print('/usr/bin/time is unavailable; overhead not measured', file=sys.stderr)
+        return 2
     runs = []
     for size in (20000, 200000):
         for repeat in range(3):

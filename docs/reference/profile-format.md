@@ -3,7 +3,9 @@
 `memory_guard` optionally records the external supervisor's initial host/container
 availability, budget, reserve, root/group RSS peaks, final pressure observation,
 process identities, exit code and stop reason. Linux `hard_limit` is `RLIMIT_AS`
-only after the child acknowledges the applied byte limit. Scope and partial
+only after the child acknowledges the applied byte limit; it is `null` when the
+child skipped the limit because its address space already mapped half the
+budget (free-threaded builds). Scope and partial
 coverage remain explicit. Raw artifacts have unverified integrity. A forced
 stop has no exit snapshot or invented Python/native allocation evidence. See
 [memory guard](../memory-guard.md) for policy, platform limits and exit codes.

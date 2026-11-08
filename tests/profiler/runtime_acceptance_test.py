@@ -8,11 +8,13 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 PROFILER = ROOT / 'src' / 'python' / 'pmg_profile.py'
+FREE_THREADED = bool(sysconfig.get_config_var('Py_GIL_DISABLED'))
 
 
 class RuntimeAcceptance(unittest.TestCase):
@@ -220,8 +222,11 @@ print(json.dumps({'collections': len(observed), 'collected': sum(observed)}))
 '''
         truth, measured = self.witness_then_profile(source)
         fixed_truth, fixed = self.witness_then_profile(source, arguments=('--fixed',))
-        self.assertGreater(truth['collections'], fixed_truth['collections'] * 3)
-        self.assertGreater(measured['gc']['total_collections'], fixed['gc']['total_collections'] * 3)
+        # The free-threaded collector is not generational and runs far less often (2 runs against 1 on
+        # 3.13.3t, 18 against 1 with the GIL), so there the pressure shows in the cycles collected.
+        factor = 1 if FREE_THREADED else 3
+        self.assertGreater(truth['collections'], fixed_truth['collections'] * factor)
+        self.assertGreater(measured['gc']['total_collections'], fixed['gc']['total_collections'] * factor)
         self.assertGreater(measured['gc']['collected'], 2500)
         self.assertFalse(any(e.get('leak_runs') for f in measured['files'].values() for e in f.values()))
 

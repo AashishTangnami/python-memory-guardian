@@ -15,6 +15,15 @@ from .common import check_output_folder, register_helper, write_json_atomic
 from .session import Profiler
 
 
+def address_space_bytes() -> int:
+    """Linux: this process's mapped virtual address space (/proc/self/statm), or 0 if unreadable."""
+    try:
+        with open('/proc/self/statm') as statm:
+            return int(statm.readline().split()[0]) * os.sysconf('SC_PAGE_SIZE')
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
 def run(options: Options, entry_point: str) -> int:
     """entry_point: the absolute path of pmg_profile.py, which the guard relaunches and the run records."""
     ns, script_args, arguments, fail = options
@@ -38,8 +47,13 @@ def run(options: Options, entry_point: str) -> int:
             import resource
             _, hard = resource.getrlimit(resource.RLIMIT_AS)
             limit = min(ns._guard_budget, hard) if hard != resource.RLIM_INFINITY else ns._guard_budget
-            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-            write_json_atomic(out + '.limit.json', {'hard_limit': 'RLIMIT_AS', 'bytes': limit})
+            # A free-threaded build's mimalloc reserves about 1 GiB of address space at startup. A limit
+            # at or near the space already mapped refuses new mappings (the sampler's thread stack first)
+            # long before RSS reaches the budget. Below twice that space it is not applied; the polled
+            # RSS budget still holds and hard_limit stays null.
+            if address_space_bytes() * 2 <= limit:
+                resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+                write_json_atomic(out + '.limit.json', {'hard_limit': 'RLIMIT_AS', 'bytes': limit})
     capture_id = str(time.time_ns())
     allocations = None
     if ns.allocation_backend == 'memray':

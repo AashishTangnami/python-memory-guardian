@@ -12,6 +12,8 @@ The report writes nine criterion results to `report.md` and `results.json`. Each
 
 Exit status is `0` only if all nine criteria pass completely. Status `1` means a measured fixture, required build or overhead check failed. Status `2` means required coverage or a measurement is incomplete. The default run omits overhead and therefore leaves criterion 9 unsupported with status `2`; an omitted run is not a pass.
 
+`--gate regression` writes the same report and statuses but changes only the exit status: `0` when no case, prerequisite or criterion failed and no executed case was skipped or unsupported. A criterion that is partial only because of its documented limit, and criterion 9 when overhead was not requested, do not count. CI uses this gate to block regressions; the full gate (the default) remains the measure of complete acceptance and of release readiness.
+
 ## Saved evidence
 
 The runner executes runtime, cooperative-diagnostics, static-regression and allocation-backend unittest modules in separate processes. Each fixture suite proves its problematic behavior without the tool before its positive check and proves its fixed behavior before the negative check. The runner preserves temporary fixture sources, profiles and JSONL traces instead of deleting them. It records actual subprocess commands, outputs, return codes and elapsed time in each module's `cases.json`. Static checks also preserve their independent cost witnesses and both backend outputs.
@@ -28,7 +30,7 @@ An unavailable legacy `tp_del` fixture appears as skipped or unsupported and rem
 
 The thresholds in `tests/fixtures/acceptance/overhead-thresholds.json` precede each benchmark run. The runner does not adjust them after a failure. The result includes runtime ratios, RSS limits, actual mode coverage and missing observations. The faster modes lose allocation stacks, allocator observations and precise retention data; these losses must remain visible in the report.
 
-On macOS the benchmark uses `/usr/bin/time -l`. On Linux it uses `/usr/bin/time -v`. If the host or sandbox cannot supply peak RSS, the observation is incomplete. Re-run with the required execution permission; do not report unavailable RSS as zero.
+On macOS the benchmark uses `/usr/bin/time -l`. On Linux it uses `/usr/bin/time -v`. If the host or sandbox cannot supply peak RSS, the observation is incomplete. Re-run with the required execution permission; do not report unavailable RSS as zero. Without `/usr/bin/time` (on Linux, the GNU `time` package), the script writes an `unsupported` `results.json` and exits 2.
 
 ## Current coverage limits
 
