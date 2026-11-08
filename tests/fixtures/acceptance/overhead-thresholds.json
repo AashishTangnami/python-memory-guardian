@@ -1,0 +1,40 @@
+{
+  "registered_before_benchmark": true,
+  "recorded_date_local": "2026-10-07",
+  "timezone": "America/Toronto",
+  "sizes": [
+    20000,
+    200000
+  ],
+  "repetitions": 3,
+  "thresholds": {
+    "off": {
+      "wall_ratio_max": 1.25,
+      "rss_extra_floor_mib": 20,
+      "rss_extra_baseline_ratio": 0.25
+    },
+    "fast": {
+      "wall_ratio_max": 1.25,
+      "rss_extra_floor_mib": 20,
+      "rss_extra_baseline_ratio": 0.25
+    },
+    "precise": {
+      "wall_ratio_max": 10,
+      "rss_extra_floor_mib": 128,
+      "rss_extra_baseline_ratio": 2
+    },
+    "memray": {
+      "wall_ratio_max": 10,
+      "rss_extra_floor_mib": 128,
+      "rss_extra_baseline_ratio": 2
+    },
+    "memray_system": {
+      "wall_ratio_max": 10,
+      "rss_extra_floor_mib": 128,
+      "rss_extra_baseline_ratio": 2
+    }
+  },
+  "policy": "Pass requires complete measurements, matching results, and both median budgets. Missing, skipped and unsupported measurements are incomplete. Do not revise thresholds after seeing results. Run serially after audit fixture processes stop.",
+  "memray_budget_registered_before_measurement": true,
+  "memray_system_budget_registered_before_measurement": true
+}

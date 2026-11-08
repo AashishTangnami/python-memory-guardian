@@ -1,0 +1,79 @@
+{
+  "_comment": "Shared by the Python and Rust servers. {placeholders} come from probe.py facts or the finding itself. The 'sized' variant is used only when every placeholder in it is known; otherwise 'neutral' is used. Sources: docs.python.org (whatsnew 3.12, c-api/memory, stdtypes, faq/programming, library/threading, library/asyncio-dev, library/asyncio-task, library/functools, library/copy, library/re, library/gc, howto/free-threading-python), peps.python.org (PEP 393, 623, 703, 779), CPython Misc/NEWS 2.5a1.",
+
+  "heap-inflation": {
+    "sized": "⚠️ Heap Inflation candidate (CPython {py_version}): fetchall() materializes the remaining result rows at once. Typical boxed cell costs measured on your interpreter: {int_size} B per int, {str_empty} B for an empty str (+1 B per ASCII char), plus {ptr_size} B per tuple slot. These are interpreter probes, not measurements of this query. Use cursor iteration or bounded fetchmany() when one-pass access suffices. Columnar batches are an option if they preserve row order, types, nulls and the required access pattern.",
+    "neutral": "⚠️ Heap Inflation candidate: fetchall() materializes the remaining result rows at once, with Python objects and tuple slots for ordinary DB-API rows. The size depends on the query, row factory and input. Use cursor iteration or bounded fetchmany() when one-pass access suffices. Columnar batches are an option if they preserve row order, types, nulls and the required access pattern."
+  },
+  "pointer-chasing": {
+    "neutral": "⚠️ Pointer Chasing candidate: this pandas call explicitly requests object dtype, which stores pointers to Python objects. Static analysis does not measure object counts, cache misses or runtime cost. Consider a compatible numeric or extension dtype, or columnar batches, only if the alternative preserves ordering, mutability, mixed values, null handling and the required access pattern."
+  },
+  "cyclic-reference": {
+    "neutral": "⚠️ Cyclic Reference Risk: bidirectional links (e.g. child.parent = self) form reference cycles. Their refcounts never reach 0, so they are not freed immediately; they wait for the cyclic garbage collector, which adds pause time when many are created in a loop. Use flat arrays/index-based structs, or weakref.ref/proxy for the back-pointer."
+  },
+
+  "ram-fragmentation.append": {
+    "sized": "⚠️ RAM Fragmentation candidate (CPython {py_version}): appending a fresh dict/tuple/list per iteration creates a container per row. Synthetic probes on your interpreter: a 3-key dict ≈ {dict3} B, a 3-tuple ≈ {tuple3} B, before values; the target count and volume are unmeasured. The allocator is {allocator}; surviving blocks and C-library caching can keep RSS high after cleanup. Consider per-column lists, buffers or columnar batches only if they preserve ordering, mutability, null handling, mixed values and access patterns.",
+    "neutral": "⚠️ RAM Fragmentation candidate: appending a fresh dict/tuple/list per iteration creates a container per row. Target object counts, allocation volume and RSS impact are unmeasured. Surviving allocator blocks and C-library caching can keep RSS high after cleanup. Consider per-column lists, buffers or columnar batches only if they preserve ordering, mutability, null handling, mixed values and access patterns."
+  },
+  "ram-fragmentation.no-slots": {
+    "sized": "ℹ️ RAM Fragmentation candidate (CPython {py_version}): class {name} has no __slots__ and is instantiated in a loop. A synthetic 3-attribute instance on your interpreter costs ≈ {instance3} B vs ≈ {slots3} B with slots; these are probe sizes, not this class's measured cost. Consider __slots__ or @dataclass(slots=True) only when fields are fixed and dynamic attributes, __dict__ access, inheritance, serialization and weak references remain compatible. Columnar storage must also preserve ordering, mutability, nulls and access patterns.",
+    "neutral": "ℹ️ RAM Fragmentation candidate: class {name} has no __slots__ and is instantiated in a loop. Instances carry attribute storage, but the target cost has not been measured. Consider __slots__ or @dataclass(slots=True) only when fields are fixed and dynamic attributes, __dict__ access, inheritance, serialization and weak references remain compatible. Columnar storage must also preserve ordering, mutability, nulls and access patterns."
+  },
+
+  "text-inflation.concat": {
+    "neutral": "⚠️ Text Inflation: `+=` on a str inside a loop. str is immutable, so each concatenation can create a new object and copy everything built so far; the Python docs warn the total cost is quadratic in the final length (CPython's occasional in-place resize is an implementation detail, not a guarantee). Collect pieces in a list and ''.join() them once, or write to io.StringIO."
+  },
+  "text-inflation.whole-file": {
+    "sized": "⚠️ Text Inflation (CPython {py_version}): {call} decodes the whole file into memory, then creates one str per line/token, each with its own header ({str_empty} B empty on your interpreter). Since PEP 393 a string's width follows its widest character: 1,000 ASCII chars take {str_ascii_1000} B, but a single emoji makes the same string {str_wide_1000} B. Iterate lazily (for line in f), process bytes, or use Polars/PyArrow CSV/NDJSON readers that parse into Arrow buffers.",
+    "neutral": "⚠️ Text Inflation: {call} decodes the whole file into memory, then creates one str object per line/token, each with its own header. Since PEP 393 a string's width follows its widest character (1, 2 or 4 bytes per char), so one non-Latin-1 character widens the whole string. Iterate lazily (for line in f), process bytes, or use Polars/PyArrow CSV/NDJSON readers that parse into Arrow buffers."
+  },
+
+  "memory-swell.list-arg": {
+    "neutral": "⚠️ Memory Swell: {call}([...]) materialises the entire list before {call} sees the first item (and any()/all() can no longer stop early, because every element was already computed). Drop the brackets to pass a generator expression, which yields one item at a time."
+  },
+  "memory-swell.list-copy": {
+    "neutral": "⚠️ Memory Swell: iterating {call} builds a full in-memory copy before the loop starts. Iterate the original iterable or a generator directly, unless you need a snapshot (e.g. you mutate the source inside the loop)."
+  },
+  "memory-swell.list-once": {
+    "neutral": "⚠️ Memory Swell: `{name}` holds every item of {call} at once, but it is used only once, by {use}. Pass a generator instead (a generator expression, or the iterable itself without list()) so items are processed one at a time; keep the list if you need len(), indexing or a second pass."
+  },
+  "memory-swell.method-cache": {
+    "neutral": "⚠️ Memory Swell: an unbounded cache (@cache / lru_cache(maxsize=None)) on a method stores `self` in its keys, so every instance it ever sees stays alive until cache_clear(). Per the Python FAQ (\"How do I cache method calls?\"), use functools.cached_property for per-instance results or a bounded lru_cache(maxsize=N)."
+  },
+  "memory-swell.unbounded-cache": {
+    "neutral": "ℹ️ Memory Swell: @cache / lru_cache(maxsize=None) never evicts; every distinct argument tuple and its result live for the rest of the process. Fine for a small, fixed input domain; if the inputs come from data, set maxsize."
+  },
+  "memory-swell.deepcopy-loop": {
+    "neutral": "⚠️ Memory Swell: copy.deepcopy() recursively copies compound objects on every loop iteration. If the copy is large, this can cause substantial allocation and CPU cost. Copy only the fields that need isolation, or move an invariant copy outside the loop."
+  },
+  "memory-swell.recompile-loop": {
+    "neutral": "ℹ️ Memory Swell: re.compile() receives a literal pattern inside a loop. Compile it once outside the loop and reuse the pattern object. Python caches recent patterns, so the main avoidable work here is repeated lookup and object handling."
+  },
+  "memory-swell.setdefault-loop": {
+    "neutral": "ℹ️ Memory Swell: this bare setdefault(key, []) call creates a new empty list on every loop iteration, including when the key already exists. If you are initializing keys from many rows, consider defaultdict(list) or create the default only when the key is missing."
+  },
+  "memory-swell.list-extend-loop": {
+    "neutral": "ℹ️ Memory Swell: extend() builds a complete list comprehension on every outer-loop iteration before adding its items. Pass a generator expression or an existing iterable when the temporary list is not needed."
+  },
+  "gc-cycle-risk": {
+    "neutral": "ℹ️ GC Cycle Risk: this class has a back reference and a __del__ finalizer. Modern Python can collect most such cycles, but finalization may be delayed until cyclic GC runs. Use explicit close() or a context manager for resources that need prompt cleanup."
+  },
+  "task-retention.asyncio-task": {
+    "neutral": "⚠️ Asyncio Task: the result of asyncio.create_task() is discarded. Keep a reference until the task finishes, await it, or use asyncio.TaskGroup. For background tasks kept in a collection, remove completed tasks so the collection cannot retain them indefinitely."
+  },
+  "resource-leak.file-handle": {
+    "neutral": "⚠️ File Handle: this open() call has no visible context manager or close() in its scope. Use with open(...) as f, or close the handle in a finally block, to release it promptly even when an error occurs."
+  },
+
+  "single-thread-stall.async-blocking": {
+    "neutral": "⚠️ Single-Threaded Stall: {call} blocks inside `async def`. The event loop runs all tasks on one thread, so while this call blocks every other task and I/O operation waits. Use the async equivalent (asyncio.sleep, an async HTTP client, asyncio.create_subprocess_exec) or offload it with await asyncio.to_thread(...) (3.9+)."
+  },
+  "single-thread-stall.list-membership": {
+    "neutral": "⚠️ Single-Threaded Stall candidate: `in {name}` can scan the list on each loop iteration (O(n) per check). A separate set index can give O(1) average lookups only if all elements are hashable, hash/equality remain stable, duplicate semantics are compatible, and the index stays synchronized with mutations. Keep the list when order, unhashable or mutable values, null handling, or the access pattern requires it; no traversal cost has been measured here."
+  },
+  "single-thread-stall.cpu-thread": {
+    "sized": "ℹ️ Single-Threaded Stall (CPython {py_version}, GIL {gil_state}): {func}() runs a pure-Python loop over the data it is given and makes no I/O or GIL-releasing native calls, so these threads take turns on the GIL instead of running in parallel. Threads are the right tool for I/O-bound work (network, disk, database) and for native libraries that release the GIL (hashing, compression, NumPy, Polars, PyArrow). For CPU-bound Python use ProcessPoolExecutor, move the loop into Polars/NumPy, or run on a free-threaded build (3.13t/3.14t).",
+    "neutral": "ℹ️ Single-Threaded Stall: {func}() runs a pure-Python loop over the data it is given and makes no I/O or GIL-releasing native calls. On standard (GIL) CPython builds only one thread executes Python code at a time, so these threads take turns instead of running in parallel. Threads are the right tool for I/O-bound work and for native libraries that release the GIL. For CPU-bound Python use ProcessPoolExecutor, move the loop into Polars/NumPy, or run on a free-threaded build (3.13t/3.14t)."
+  }
+}

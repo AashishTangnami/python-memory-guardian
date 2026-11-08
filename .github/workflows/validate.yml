@@ -1,0 +1,143 @@
+name: Validate
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: '3.9' }
+          - { os: ubuntu-latest, python: '3.13' }
+          - { os: windows-latest, python: '3.9' }
+          - { os: windows-latest, python: '3.13' }
+          - { os: macos-15-intel, python: '3.9' }
+          - { os: macos-latest, python: '3.13' }
+          # Free-threaded build: no sampled time per line (those checks print SKIP). Known failures,
+          # seen on macOS 3.13.3t: the snapshot budget (profiler_test), the GC-pressure acceptance
+          # check, and three memory-guard limits. Each suite is its own step, so a new failure shows
+          # beside them; the job is reported but does not fail the workflow yet.
+          - { os: ubuntu-latest, python: '3.13t', experimental: true }
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: python -m pip install --target src/python/libs -r requirements.txt
+      - run: python -m pip install -r requirements-acceptance.txt
+        if: ${{ !matrix.experimental }}
+      # memray 1.20 has no free-threaded 3.13 wheel; the allocation tests skip without it.
+      - run: grep -v '^memray' requirements-acceptance.txt > "$RUNNER_TEMP/acceptance.txt" && python -m pip install -r "$RUNNER_TEMP/acceptance.txt"
+        if: ${{ matrix.experimental }}
+      - run: python -m pip install uv
+      - run: python -m pip install -r requirements-quality.txt
+      - run: npm run lint
+      - run: npm test
+        if: ${{ !matrix.experimental }}
+      # Free-threaded: one step per suite, so a known failure does not hide the result of every later suite.
+      - run: npm run compile
+        if: ${{ matrix.experimental }}
+      - run: npm run test:parity
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node scripts/py.js tests/profiler/profiler_regression_test.py
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node scripts/py.js tests/profiler/runtime_acceptance_test.py
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node scripts/py.js tests/profiler/diagnostics_test.py
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node scripts/py.js tests/profiler/allocation_backend_test.py
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node scripts/py.js tests/static/server_lifecycle_test.py
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node scripts/py.js tests/profiler/profiler_test.py
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_model.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_allocation_model.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_report.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_compare.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_summary.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_run_options.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_report_entry.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_editor_events.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_extension_lifecycle.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_container.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_staging.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/client/test_pmg_writes.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node scripts/py.js tests/guard/memory_guard_test.py
+        if: ${{ matrix.experimental && !cancelled() }}
+      - run: node tests/guard/test_memory_guard.js
+        if: ${{ matrix.experimental && !cancelled() }}
+      # Also after a failed suite, so the package is always checked.
+      - run: npm run package -- --out guardian.vsix
+        if: ${{ !cancelled() }}
+      - run: python tests/packaging/package_test.py guardian.vsix
+        if: ${{ !cancelled() }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            guardian.vsix
+            tests/profiler/out/*.json
+  container:
+    # Container mode against real Docker: stage into the bind-mounted project, probe and profile
+    # in the container, and map the profile back to host paths.
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['python:3.9-slim', 'python:3.13-slim']
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - run: docker pull ${{ matrix.image }}
+      - run: node tests/client/test_container.js
+        env:
+          PMG_CONTAINER_TEST: docker
+          PMG_CONTAINER_IMAGE: ${{ matrix.image }}
+  acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: python -m pip install --target src/python/libs -r requirements.txt
+      - run: python -m pip install -r requirements-acceptance.txt
+      # Incomplete or over-budget acceptance intentionally blocks this job.
+      - run: npm run test:acceptance
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-evidence
+          path: .validation/acceptance-current/

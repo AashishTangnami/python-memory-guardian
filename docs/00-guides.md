@@ -11,6 +11,7 @@ Choose the guide for the task you are doing. Each topic has one home.
 | Package a VSIX, install it locally or for a team, or publish to the Marketplace | [Build, install and release](05-build-and-release.md) |
 | Look up a warning and its rule | [Rules reference](06-rules.md) |
 | Run the profiler from a terminal, and its options and exit codes | [Profiler command line](reference/cli.md) |
+| Limit profiling memory and understand budget stops | [Memory guard](memory-guard.md) |
 | Read `.pmg/profile.json` from a script | [Profile format](reference/profile-format.md) |
 | Understand how PMG works and how far to trust its numbers | [Technical description](07-technical-design.md) |
 | Find where a feature lives in the code (contributors) | [Feature map](feature-map.md) |

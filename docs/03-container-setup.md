@@ -77,7 +77,7 @@ Step by step, using `examples/containerized-app/`:
    ```
 5. Open `src/service.py` and run **Profile Current File**. The terminal shows the command running inside the container, and results appear on your host files as usual.
 
-**How it works:** the extension copies its two helper scripts (`probe.py`, `pmg_profile.py`, standard library only) into `<project>/.pmg/`. The container already sees that folder through the bind mount, so nothing needs installing in your image. The profiler writes `.pmg/profile.json` there, and the extension maps paths back.
+**How it works:** the extension copies its helpers (`probe.py`, `pmg_profile.py`, `pmg_diagnostics.py` and the `pmg_profiler` folder, standard library only) into `<project>/.pmg/`. The container already sees that folder through the bind mount, so nothing needs installing in your image. The profiler writes `.pmg/profile.json` there, and the extension maps paths back.
 
 ## WSL and Remote-SSH
 
@@ -88,6 +88,7 @@ Open the folder through **WSL: Connect to WSL** or **Remote-SSH: Connect to Host
 | Symptom | Cause and fix |
 |---|---|
 | Output says `Container probe not possible (No pythonMemoryGuardian.container.pathMappings entry covers …)` | `pathMappings` doesn't cover the project folder and the staged `.pmg/` files; check `local` against your bind mount |
+| Error says `….pmg is a symbolic link or a file, not a folder` | the extension writes only into a real `.pmg` folder in the project (helpers, profiles, summaries, baselines), so it never writes through a link to another place. Remove the link (or file) named `.pmg`; the extension creates the folder again. The same check applies outside container mode |
 | `docker: command not found` in the profile terminal | `docker` isn't on the PATH VS Code sees; use the absolute path in `execPrefix` |
 | `service "app" is not running` | start it first: `docker compose up -d` |
 | Profile runs but no labels appear | the container path in `pathMappings` doesn't match where the container sees the files. Run `docker compose exec app ls /app` to check |

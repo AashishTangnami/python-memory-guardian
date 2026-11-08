@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py39"
+extend-exclude = ["src/python/libs", ".validation", "tests/profiler/out"]
+
+[tool.ruff.lint]
+# Intentional retention fixtures use otherwise-unused objects. Existing compact
+# layout is preserved; these rules reject import and executable-code errors.
+select = ["E9", "F401", "F63", "F7", "F82"]
+
+[tool.ruff.lint.per-file-ignores]
+# Static-analysis inputs intentionally contain unresolved names/unused imports.
+"tests/fixtures/static/list_once_cases.py" = ["F821"]
+"tests/fixtures/static/static_semantics_cases.py" = ["F821"]
+"tests/fixtures/static/native_patterns.py" = ["F401"]
+"tests/fixtures/static/sample.py" = ["F401"]

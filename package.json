@@ -91,8 +91,8 @@
           ],
           "default": "fast",
           "enumDescriptions": [
-            "Time split + RSS growth per line, ~5% overhead",
-            "tracemalloc: per-line allocations, held memory, leaks; 3-10x+ slower on allocation-heavy code",
+            "Sampled time and process RSS observations; no allocating-line attribution",
+            "tracemalloc: live traced block paths and recent retention candidates; substantial allocation-dependent overhead",
             "Time only"
           ],
           "description": "Default memory mode shown first when profiling."
@@ -168,6 +168,47 @@
           ],
           "default": "off",
           "description": "Optional Python 3.12+ execution-event coverage. Counts user-line events; sampled timing and memory measurements are unchanged. Can increase overhead."
+        },
+        "pythonMemoryGuardian.profile.allocationBackend": {
+          "type": "string",
+          "enum": [
+            "sampled",
+            "memray"
+          ],
+          "default": "sampled",
+          "description": "Optional allocator request capture. Memray must be installed in the target interpreter; requests are distinct from objects and RSS."
+        },
+        "pythonMemoryGuardian.profile.diagnostics": {
+          "type": "boolean",
+          "default": false,
+          "description": "Capture cooperative workload and access evidence through pmg_diagnostics and save a JSONL trace."
+        },
+        "pythonMemoryGuardian.profile.memoryGuard": {
+          "type": "string",
+          "enum": ["auto", "off"],
+          "default": "auto",
+          "description": "Supervise the profiled process externally and stop on a measured RSS budget or low system headroom. Polling can overshoot; Linux also applies a virtual-address-space limit."
+        },
+        "pythonMemoryGuardian.profile.memoryLimitMiB": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Optional smaller profiling-process memory budget in MiB. Zero uses 25% of initially available memory, subject to the system reserve. Includes in-process profiler memory."
+        },
+        "pythonMemoryGuardian.profile.memoryReserveMiB": {
+          "type": "number",
+          "default": 512,
+          "minimum": 1,
+          "description": "System memory reserve in MiB, bounded to half initially available memory. Profiling stops when available memory reaches this reserve."
+        },
+        "pythonMemoryGuardian.profile.allocationDetail": {
+          "type": "string",
+          "enum": [
+            "full",
+            "system"
+          ],
+          "default": "full",
+          "description": "Full captures Python and system allocator requests. System omits individual Python allocator requests to reduce capture cost; object/allocation coverage is lost."
         }
       }
     },
@@ -193,17 +234,24 @@
     ]
   },
   "scripts": {
-    "vendor:python": "node -e \"require('fs').rmSync('server/libs',{recursive:true,force:true})\" && uv pip install --python-version 3.9 --target server/libs --no-deps --only-binary=:all: -r requirements.txt",
-    "build:rust": "cargo build --release --manifest-path rust-server/Cargo.toml",
+    "format:check": "node scripts/check-format.js",
+    "lint:client": "tsc --noEmit -p ./ && eslint src/typescript scripts \"tests/**/*.js\"",
+    "lint:python": "node scripts/py.js -m ruff check src/python tests",
+    "lint:rust": "cargo clippy --manifest-path src/rust/Cargo.toml --all-targets -- -D warnings",
+    "lint": "npm run format:check && npm run lint:client && npm run lint:python && npm run lint:rust",
+    "vendor:python": "node -e \"require('fs').rmSync('src/python/libs',{recursive:true,force:true})\" && uv pip install --python-version 3.9 --target src/python/libs --no-deps --only-binary=:all: -r requirements.txt",
+    "build:rust": "cargo build --release --manifest-path src/rust/Cargo.toml",
     "compile": "tsc -p ./ && npm run bundle",
     "watch": "tsc -watch -p ./",
-    "benchmark:native": "node scripts/py.js test-fixtures/benchmark_native.py",
-    "test:parity": "node scripts/py.js test-fixtures/parity_test.py",
+    "benchmark:native": "node scripts/py.js tests/profiler/benchmark_native.py",
+    "test:parity": "npm run build:rust && node scripts/py.js tests/static/parity_test.py",
+    "test:acceptance": "npm run compile && npm run test:parity && node scripts/py.js tests/acceptance/acceptance_suite.py --reuse-rust-build --include-overhead",
     "vscode:prepublish": "npm run vendor:python && npm run compile",
     "package": "vsce package",
-    "test": "npm run compile && npm run test:parity && npm run test:runtime",
-    "test:runtime": "node scripts/py.js test-fixtures/profiler_regression_test.py && node scripts/py.js test-fixtures/server_lifecycle_test.py && node scripts/py.js test-fixtures/profiler_test.py && node test-fixtures/test_model.js && node test-fixtures/test_report.js && node test-fixtures/test_compare.js && node test-fixtures/test_summary.js && node test-fixtures/test_run_options.js && node test-fixtures/test_report_entry.js && node test-fixtures/test_editor_events.js && node test-fixtures/test_extension_lifecycle.js && node test-fixtures/test_container.js",
-    "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node18 --sourcemap"
+    "test": "npm run compile && npm run test:parity && npm run test:runtime && npm run test:guard",
+    "test:guard": "node scripts/py.js tests/guard/memory_guard_test.py && node tests/guard/test_memory_guard.js",
+    "test:runtime": "node scripts/py.js tests/profiler/profiler_regression_test.py && node scripts/py.js tests/profiler/runtime_acceptance_test.py && node scripts/py.js tests/profiler/diagnostics_test.py && node scripts/py.js tests/profiler/allocation_backend_test.py && node scripts/py.js tests/static/server_lifecycle_test.py && node scripts/py.js tests/profiler/profiler_test.py && node tests/client/test_model.js && node tests/client/test_allocation_model.js && node tests/client/test_report.js && node tests/client/test_compare.js && node tests/client/test_summary.js && node tests/client/test_run_options.js && node tests/client/test_report_entry.js && node tests/client/test_editor_events.js && node tests/client/test_extension_lifecycle.js && node tests/client/test_container.js && node tests/client/test_staging.js && node tests/client/test_pmg_writes.js",
+    "bundle": "esbuild src/typescript/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node18 --sourcemap"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -211,8 +259,10 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "1.82.0",
+    "@typescript-eslint/parser": "^8.66.0",
     "@vscode/vsce": "4.0.0",
     "esbuild": "^0.28.2",
+    "eslint": "^9.39.5",
     "typescript": "^5.4.0"
   },
   "extensionKind": [

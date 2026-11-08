@@ -36,11 +36,11 @@ PMG has five parts. They run in different processes.
 
 | Part | File | Process | Function |
 |---|---|---|---|
-| Extension client | `src/*.ts` | VS Code extension host | Starts the other parts, shows labels and warnings, writes the summary |
-| Language server | `server/guardian_server.py` or `rust-server` | Separate process | Analyzes the code and sends warnings |
-| Interpreter probe | `server/probe.py` | Your Python, once at start | Measures object sizes and the GIL state of your Python |
-| Profiler | `server/pmg_profile.py` | Your Python, as a task | Runs your script and measures time and memory |
-| Report | `src/reportWebview.ts` | VS Code webview | Shows charts, tables and call stacks |
+| Extension client | `src/typescript/` | VS Code extension host | Starts the other parts, shows labels and warnings, writes the summary |
+| Language server | `src/python/guardian_server.py` or `src/rust` | Separate process | Analyzes the code and sends warnings |
+| Interpreter probe | `src/python/probe.py` | Your Python, once at start | Measures object sizes and the GIL state of your Python |
+| Profiler | `src/python/pmg_profile.py`, `src/python/pmg_profiler/` | Your Python, as a task | Runs your script and measures time and memory |
+| Report | `src/typescript/report/webview.ts` | VS Code webview | Shows charts, tables and call stacks |
 
 ```mermaid
 %%{init: {"fontFamily":"Arial, sans-serif","themeVariables":{"fontSize":"18px","fontFamily":"Arial, sans-serif"},"flowchart":{"curve":"linear","nodeSpacing":32,"rankSpacing":40,"diagramPadding":8,"padding":18,"subGraphTitleMargin":{"top":10,"bottom":24},"htmlLabels":false},"layout":"dagre","htmlLabels":false,"themeCSS":".node rect, .cluster rect { rx: 10px; ry: 10px; } .label, .nodeLabel, .edgeLabel, .cluster-label { letter-spacing: normal; word-spacing: normal; } .edgeLabel rect { stroke: currentColor !important; stroke-width: 1px !important; stroke-dasharray: none; opacity: 1 !important; fill-opacity: 1; rx: 4px; ry: 4px; }"}}%%
@@ -88,13 +88,13 @@ PMG has two language servers with the same rules:
 - **Python server.** It uses the `ast` module. It needs Python 3.9 or later on the computer with the editor.
 - **Rust server.** It uses tree-sitter. It does not need Python.
 
-The setting `pythonMemoryGuardian.backend` selects the server. Both servers use the same message file, `server/messages.json`. A parity test sends the same files to both servers. The test fails if one server gives a different code, range, severity or message.
+The setting `pythonMemoryGuardian.backend` selects the server. Both servers use the same message file, `src/python/messages.json`. A parity test sends the same files to both servers. The test fails if one server gives a different code, range, severity or message.
 
 ## 5. Runtime profiler
 
 ### 5.1 How a profile starts
 
-The command **Profile Current File** starts `server/pmg_profile.py` as a VS Code task, with your interpreter and the arguments that you type. The profiler runs your script in its own process, as `python yourfile.py` does. At the end, it writes `.pmg/profile.json`, and the extension loads it. The [quick start](01-quickstart.md) and [using the extension](02-using-the-extension.md#profile-a-script) give the steps. The profiler can also run from a terminal: see the [command line reference](reference/cli.md).
+The command **Profile Current File** starts `src/python/pmg_profile.py` as a VS Code task, with your interpreter and the arguments that you type. The profiler runs your script in its own process, as `python yourfile.py` does. At the end, it writes `.pmg/profile.json`, and the extension loads it. The [quick start](01-quickstart.md) and [using the extension](02-using-the-extension.md#profile-a-script) give the steps. The profiler can also run from a terminal: see the [command line reference](reference/cli.md).
 
 ### 5.2 Memory modes
 
@@ -118,7 +118,7 @@ Each sample also records the full call stack of each thread. The Stack Explorer 
 
 ### 5.4 How fast mode measures memory
 
-At each sample, the profiler reads the resident set size (RSS) of the process. RSS is the physical memory that the process uses. If RSS increases, the profiler adds the increase to the current line of the busiest thread.
+At each sample, the profiler reads the resident set size (RSS) of the process. RSS is the resident memory that the process uses. The profile records changes at process scope. A sample cannot identify the allocator, object, thread or Python line that caused a change.
 
 The profiler reads RSS from `/proc/self/statm` on Linux, from `task_info` on macOS, and from `GetProcessMemoryInfo` (the working set) on Windows. On other Unix systems, only the peak RSS (`ru_maxrss`) is available. Then RSS can only increase in the report.
 
@@ -133,11 +133,12 @@ A different allocator does not solve this. With `PYTHONMALLOC=malloc`, one milli
 
 Precise mode starts the `tracemalloc` module. `tracemalloc` records each Python allocation and the call stack that made it. The depth of this stack is 2 frames, or the value of `pythonMemoryGuardian.profile.frames`.
 
-The labels `alloc`, `held` and `spike` ([label table](02-using-the-extension.md#inline-labels)) come from three different measurements. Do not add them:
+The profile keeps two distinct types of memory evidence:
 
-- `alloc` comes from the samples. At each sample, the profiler adds the increase of traced memory to the current line. Memory that a line allocates and releases between two samples is not included.
-- `held` comes from the snapshots. It is the memory from the line in the snapshot with the most memory.
-- `spike` comes from the peak that `tracemalloc` records between two samples. The profiler resets this peak after each sample.
+- `held` comes from allocation tracebacks in snapshots. It gives live traced block bytes with a source path. It does not give an object count or an owner path.
+- `memory_observations` gives process traced bytes, net growth, transient peak bytes, RSS changes and tracer bookkeeping. These values have timestamps. They have no allocation source or thread identity. Immediate allocate/free churn can be absent from net growth.
+
+PMG does not use historical sampled `alloc`, `spike` or RSS fields as source allocation evidence. The sampler releases all live frame references before it sleeps. A frame reference can otherwise keep an object alive during a finalizer.
 
 **Snapshots.** A snapshot is a full list of the memory in use, with the call stack of each allocation. The profiler takes snapshots at intervals and at the end. It also takes a snapshot when memory stays at a new high level, and when memory doubles. Thus the snapshot with the most memory is near the true peak. On `generators.py`, this snapshot held 98% to 100% of the traced peak.
 
@@ -149,33 +150,36 @@ Snapshot cost increases with the traced memory. It is approximately 5 to 8 ns fo
 
 **Leaks.** The profiler marks a line as a "suspected leak" when all these conditions are true:
 
-- The memory of the line did not decrease in the last snapshots.
-- It increased in at least 3 of these snapshots.
+- The last five snapshots have no decrease above the noise limit.
+- At least three transitions increase by more than 1 KiB or 0.1% of the preceding value, whichever is larger.
+- At least one of the last two transitions increases. Total recent growth exceeds 64 KiB or 1% of the final value, whichever is larger.
 - At least 1 MB of it was in use at the end.
 
 This needs at least four snapshots. Thus a very short run can show no suspected leak. If your script stops `tracemalloc`, the precise data stops at that time, and the report tells when.
 
-Then the profiler looks for the object that keeps the memory. It examines global variables, the attributes of your objects, and containers that the garbage collector knows. The global variables and the attributes are necessary, because CPython does not track a dictionary that holds only simple values. This search has a time limit. It can find possible holders. It cannot prove that a holder is the cause.
+This is a recent-growth candidate. It does not prove unwanted retention. A plateau removes old warmup increases from the decision. A confirmed retention issue needs a declared cleanup point or repeated-operation evidence; the explicit [diagnostic API](diagnostics.md) can supply that evidence.
 
-**Largest objects at the end.** In fast and precise mode, the profiler also lists the largest objects at the end of the run. These are objects that global variables or the attributes of your objects keep. It uses the size that each object reports (`sys.getsizeof`), and for containers it adds their items one level deep. NumPy, pandas and PyArrow report their buffers correctly. Polars reports only a small wrapper. Its memory shows as `native ≈`.
+The owner search starts at user module globals. It follows builtin containers and ordinary user instance attributes. It does not invoke properties or inspect live frames. Paths can include nested keys, such as `global owner.state['storage']['history']`. Depth, node, item and time limits are explicit. This search cannot inspect every reference in the interpreter.
+
+**Largest objects at the end.** In fast and precise mode, the profiler lists bounded user-root objects. Sizes use `sys.getsizeof` plus immediate container items, with extrapolation past the item limit. These footprints can overlap parent and child rows. Do not sum them as exclusive allocation bytes. Native storage absent from a library's `__sizeof__` is unavailable. A completed bounded scan is not a complete ownership graph.
 
 ### 5.6 Native memory estimate
 
-`tracemalloc` cannot see memory that C extensions get directly from the operating system. PyArrow and Polars are examples. Thus precise mode gives an estimate of native memory:
+`tracemalloc` cannot see all memory that C extensions get directly from the operating system. Precise mode can expose a process RSS residual:
 
-> native ≈ RSS growth − traced growth − growth of the bookkeeping of `tracemalloc`
+> RSS residual ≈ RSS peak − RSS at start − traced peak − largest tracer bookkeeping
 
 The bookkeeping is the memory that `tracemalloc` itself uses to record each allocation. It is large. For 300,000 small dictionaries, it was 72 MB, and the data was 81 MB.
 
-No profiler can give exact native memory per line for libraries that have their own allocators. Memray, which records allocations in C, gave 1 GB for an 8 MB PyArrow array, because the mimalloc allocator reserves address space. It gave 1.5 GB of Polars memory with no call stack.
+The peaks can occur at different times. Arenas, resident free pages and profiler memory can contribute to the residual. It is not a measured native allocation. PMG never assigns it to a Python line. It is unavailable after lost or scoped traces, or when RSS is unavailable.
 
-`tracemalloc` does not report its own cost correctly. Its real RSS cost was 52 MB more than it reported in one test, and 113 MB less in a different test. Thus PMG shows a native estimate only when it is more than two times the bookkeeping. Below this limit, the Overview shows "none detected". Then no line shows `native ≈`.
+PMG exposes a positive residual only above twice the tracer bookkeeping. A smaller residual is ambiguous and is `null`, not zero. The optional allocator backend provides separate native allocator evidence where its hooks work; see [allocator evidence](allocations.md).
 
 ### 5.7 Allocation by call path
 
-When a sample sees an increase of traced memory, the profiler also adds the increase to the full call stack of the busiest thread. These stacks have up to 128 frames. Thus they show the function that keeps the data, not only the function that made it.
+Memory call paths come from snapshot allocation tracebacks, with the selected `--frames` depth. Sampled time stacks can reach 128 frames, but they cannot establish allocation provenance. A worker allocation must not appear as an allocation by a waiting main thread. Allocator events, when enabled, have their own thread identity and call paths.
 
-Example from `generators.py`: in `process_eager`, 197 MB of allocation came through `list(iter_raw_records(...))`. The per-line `alloc` label shows this memory inside the generator. The call path shows the line that keeps the list.
+GC callbacks record collection count, generation, pause duration, collected objects and uncollectable objects. Events have process/thread identities and timestamps. Where tracing is active, they also have observed traced bytes. These are process observations and can include profiler effects. High collection activity alone does not create a leak finding. Collectible cycles remain separate from unwanted retention.
 
 ### 5.8 Phases
 
@@ -280,7 +284,9 @@ The cost of the profiler depends on the mode and on the number of allocations in
 | Precise mode | 122.0 s to 142.8 s | 10.7× to 12.5× |
 | Precise mode, only `process_eager` | 48.6 s to 49.8 s | 4.3× to 4.4× |
 
-The ranges come from two runs on a computer that also did other work. `tracemalloc` alone made `process_eager` 7.7 to 9.4 times slower. In precise mode, snapshots used 15 s to 34 s of the run. On code with fewer allocations, precise mode was approximately 3 times slower.
+The ranges come from two runs on a computer that also did other work. `tracemalloc` alone made `process_eager` 7.7 to 9.4 times slower. In precise mode, snapshots used 15 s to 34 s of the run. On code with fewer allocations, precise mode was approximately 3 times slower. This value comes from a measurement before the profiler code moved from `pmg_profile.py` to the `pmg_profiler` folder. After that move, `tracemalloc` finds the line of the launcher frame more quickly. Thus an allocation costs less when its traceback includes the launcher frame. At the default depth of 2 frames, this applies only to allocations at module level. With a greater depth, it also applies to allocations in functions near module level.
+
+A paired check after the move used the same workload on a different computer (8 GB, macOS, 2026-11-02). Without PMG, the run took 11.5 s. Precise mode took 120.1 s with the old code (10.4×) and 122.9 s with the new code (10.7×). Precise mode for `process_eager` only took 47.8 s and 48.4 s (4.2× for each). All allocations in this workload occur in functions.
 
 To decrease the cost:
 
@@ -296,6 +302,7 @@ PMG does not measure these items:
 - **C and C++ call stacks.** The profiler sees native time at the Python line that called the C code. It does not see the C functions.
 - **Each allocation.** The profiler samples. It does not count allocations that start and stop between two samples.
 - **GPU time and data copies.**
+- **Time on a free-threaded build.** On a free-threaded Python, such as 3.13t, other threads continue to run while the sampler reads their frames. That read can crash the process. Thus the profiler does not read these frames. This rule applies for the full run, also after an extension module enables the GIL. The profile has no time per line, no call stacks, no function totals and no phases, and `stack_sampling.active` is `false`. The sampler thread continues to read RSS and to take `tracemalloc` snapshots, because these operations do not read frames. Each thread records its allocation tracebacks and line events itself. Thus memory per line, retention and allocation stacks stay available.
 
 Display limits:
 
@@ -329,7 +336,7 @@ Other limits:
 
 Run all tests with `npm test`. The tests of the language server's bundled packages ran on Python 3.9, 3.10, 3.12, 3.13 and 3.14. The profiler tests ran on Python 3.9, 3.12 and 3.13. There is no automatic test in a real VS Code window. For container tests, see [container setup](03-container-setup.md#troubleshooting).
 
-**Comparison with Scalene 2.3.0.** One computer, the same workloads with known results (`test-fixtures/profiler/`):
+**Comparison with Scalene 2.3.0.** One computer, the same workloads with known results (`tests/fixtures/profiler/`):
 
 | | PMG | Scalene |
 |---|---|---|
@@ -385,3 +392,26 @@ All numbers in this document come from these runs. The numbers depend on the com
 | Normal difference between equal runs | Three equal runs per mode, compared function by function |
 
 The RSS values had a large variation. The same 1,000,000-dictionary test gave an RSS growth of 353 MB in one run and 597 MB in the next run. For this reason, this document gives ranges.
+
+## Optional allocator evidence
+
+The CLI executes the script in a persistent target `__main__` namespace. That
+namespace remains available until non-daemon workers finish. A temporary runpy
+namespace restores the profiler module too early and breaks late-worker class
+lookup and pickle. The target global dictionary also remains available for the
+exit owner scan after an exception. Temporary `__file__` and `__cached__`
+attributes are removed after top-level execution, as in CPython script execution.
+
+The CLI can start Memray before target execution. It stops capture before trace
+analysis. The trace includes allocator request stacks and capture-thread IDs.
+It does not establish Python object identity or unexpected retention. Domain
+totals can overlap. Source roles distinguish a captured Python frame from a
+user call site for a native request. RSS residuals remain process observations.
+Individual allocation timestamps are unavailable. Trace names are unique per
+run. The profile retains artifact hashes and explicit coverage limits. See
+[allocator capture](allocations.md).
+
+The owner observer reads native slot descriptors and instance dictionaries. It
+does not call Python properties. Graph limits cover both pending and visited
+nodes. Incomplete traversal has an explicit flag. Collection status requires
+a cleanup and GC witness; a cycle alone does not prove a leak.
