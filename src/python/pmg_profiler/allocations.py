@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import os
 from pathlib import Path
 import time
@@ -17,6 +18,11 @@ MAX_SITES = 2048
 MAX_FRAMES = 64
 MAX_SNAPSHOTS = 2048
 MAX_CAPTURE_FILES = 64
+# Serialized site records across all capture files. The memory guard reads a child report of at most
+# 8 MiB (guard.MAX_REPORT_BYTES); 2048 sites with two 64-frame symbolized stacks can reach about
+# 30 MiB (9.2 MiB for a two-line script on a CI Python with debug symbols), so the site list is
+# bounded by size too. Sites past the budget move to the omitted totals, like the site-count overflow.
+MAX_SITE_SUMMARY_BYTES = 4 << 20
 _FREES = {"PYMALLOC_FREE", "FREE", "MUNMAP"}
 _ARENA_SYMBOLS = ("new_arena", "_PyObject_Arena", "pymalloc_alloc", "allocateArena")
 
@@ -96,6 +102,34 @@ def _domain(allocator, native_frames):
            for frame in native_frames or []):
         return "interpreter_arena"
     return "system_allocator"
+
+
+def _bound_site_bytes(files, budget):
+    """Keep the report's largest sites, across all capture files, within budget bytes of JSON.
+
+    Sites are ranked by requested bytes over every file, so one large capture cannot crowd out the
+    sites of a fork child. Selection stops at the first site that does not fit: every kept site has
+    at least the requested bytes of every omitted one.
+    """
+    order = sorted(((i, j) for i, file in enumerate(files) for j in range(len(file["sites"]))),
+                   key=lambda ij: -files[ij[0]]["sites"][ij[1]]["requested_bytes"])   # stable: file order breaks ties
+    keep, used = set(), 0
+    for i, j in order:
+        size = len(json.dumps(files[i]["sites"][j])) + 2   # with its ", " list separator
+        if used + size > budget:
+            break
+        used += size
+        keep.add((i, j))
+    for i, file in enumerate(files):
+        kept = []
+        for j, site in enumerate(file["sites"]):
+            if (i, j) in keep:
+                kept.append(site)
+            else:
+                file["omitted_site_allocation_count"] += site["allocation_count"]
+                file["omitted_site_requested_bytes"] += site["requested_bytes"]
+                file["summary_complete"] = False
+        file["sites"] = kept
 
 
 def _empty_totals():
@@ -293,6 +327,7 @@ class AllocationRecorder:
             except (OSError, RuntimeError, ValueError) as exc:
                 errors.append({"artifact": str(path), "available": False,
                                "reason": f"Cannot read allocation trace: {exc}"})
+        _bound_site_bytes(files, MAX_SITE_SUMMARY_BYTES)
         self._summary = {
             "backend": "memray", "version": self.memray.__version__, "available": bool(files),
             "started_at_ns": self.started_at_ns, "stopped_at_ns": self.stopped_at_ns,
@@ -306,7 +341,8 @@ class AllocationRecorder:
             "domain_totals_additive": False, "files": files, "errors": errors,
             "omitted_capture_files": max(0, len(candidates) - MAX_CAPTURE_FILES),
             "limits": {"max_sites_per_capture": self.max_sites, "max_stack_frames": self.max_frames,
-                       "max_memory_snapshots": MAX_SNAPSHOTS, "max_capture_files": MAX_CAPTURE_FILES},
+                       "max_memory_snapshots": MAX_SNAPSHOTS, "max_capture_files": MAX_CAPTURE_FILES,
+                       "max_site_summary_bytes": MAX_SITE_SUMMARY_BYTES},
             "notes": [
                 "Counts are allocator requests or outstanding blocks, not Python object counts.",
                 "Requested volume includes repeated allocations/reallocations; it is not live memory or RSS.",

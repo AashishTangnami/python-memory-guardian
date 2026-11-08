@@ -206,6 +206,31 @@ class AllocationFixtures(unittest.TestCase):
             self.assertTrue(all(not file['python_allocator_requests_traced'] for file in capture['files']))
             self.assertTrue(all(site['domain'] != 'python_allocator' for file in capture['files'] for site in file['sites']))
 
+    def test_site_summary_fits_the_guard_reader_limit(self):
+        # Symbolized native stacks made a two-line script's report 9.2 MiB on a CI Python, over the
+        # guard's 8 MiB reader limit, so the guarded run lost its whole profile. Stand-in sites keep
+        # this independent of the interpreter's debug symbols.
+        sys.path.insert(0, str(ROOT / 'src' / 'python'))
+        from pmg_profiler import allocations
+        from pmg_profiler.guard import MAX_REPORT_BYTES
+        frame = {'function': 'f' * 40, 'file': '/' + 'p' * 80 + '.c', 'line': 1}
+        site = lambda n: {'requested_bytes': 2048 - n, 'allocation_count': 1,
+                          'python_stack': [frame] * 64, 'native_stack': [frame] * 64}
+        files = [{'sites': [site(n) for n in range(2048)], 'summary_complete': True,
+                  'omitted_site_allocation_count': 0, 'omitted_site_requested_bytes': 0} for _ in range(2)]
+        self.assertGreater(len(json.dumps(files)), MAX_REPORT_BYTES)
+        allocations._bound_site_bytes(files, allocations.MAX_SITE_SUMMARY_BYTES)
+        self.assertLessEqual(len(json.dumps([s for f in files for s in f['sites']])), allocations.MAX_SITE_SUMMARY_BYTES)
+        self.assertLess(allocations.MAX_SITE_SUMMARY_BYTES, MAX_REPORT_BYTES)
+        first, second = files
+        self.assertTrue(first['sites'] and second['sites'], 'one capture file does not crowd out another')
+        self.assertEqual(first['sites'][0]['requested_bytes'], 2048, 'the largest sites are kept')
+        kept = {s['requested_bytes'] for f in files for s in f['sites']}
+        self.assertEqual(kept, set(range(min(kept), 2049)), 'every kept site is larger than every omitted one')
+        for f in files:
+            self.assertFalse(f['summary_complete'])
+            self.assertEqual(len(f['sites']) + f['omitted_site_allocation_count'], 2048)
+
     def test_site_overflow_keeps_volume_and_reports_incomplete(self):
         witness, _ = self.execute('churn')
         self.assertGreater(witness['requested_payload_bytes'], 4_000_000)

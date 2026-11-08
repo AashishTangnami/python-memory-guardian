@@ -8,9 +8,14 @@ OUT = os.path.join(HERE, "out")
 
 def run(script, mode):
     out = os.path.join(OUT, f"{os.path.splitext(script)[0]}_{mode}.json")
+    # workload.py writes the measured wall time of its sleeping calls here: a CI host can oversleep
+    # (macos-latest: 12 x sleep(0.25) took 3.5-4.1 s), so off-CPU time is checked against that, not
+    # against the nominal sleep.
+    env = dict(os.environ, PMG_WORKLOAD_WALL=out + ".wall")
     subprocess.run([sys.executable, PROF, "--memory-guard", "off", "--memory", mode, "--out", out, os.path.join(W, script)],
-                   check=True, capture_output=True)
+                   check=True, capture_output=True, env=env)
     p = json.load(open(out))
+    p["_wall"] = json.load(open(out + ".wall")) if os.path.exists(out + ".wall") else {}
     return p, next((v for k, v in p["files"].items() if k.endswith(script)), {})
 
 def dominant(e):
@@ -33,12 +38,21 @@ def skip(*names):
         print("SKIP " + name + " (free-threaded build: no sampled time per line)")
 
 p, f = run("workload.py", "fast")
+wall = p["_wall"]
 if SAMPLED:
-    check("L7  pure-Python loop -> python", dominant(f["7"]) == "python")
-    check("L12 hashlib (releases GIL) -> native", dominant(f["12"]) == "native")
-    check("L16 sorted (holds GIL) -> native", dominant(f["16"]) == "native")
-    check("L19 time.sleep(0.8) -> system ~0.8 s", dominant(f["19"]) == "system" and abs(f["19"]["system_s"] - 0.8) < 0.1)
-    check("L25 12 x sleep(0.25) -> system ~3.0 s", abs(f["25"]["system_s"] - 3.0) < 0.2)
+    # The GIL split reads sleep overshoot past the measured timer baseline (sleep_overhead_s). When
+    # that baseline is several switch intervals, its jitter is larger than the signal, so the
+    # python/native split is not checked on that host (macos-latest runners: 40-65 ms).
+    if p["sleep_overhead_s"] <= 4 * sys.getswitchinterval():
+        check("L7  pure-Python loop -> python", dominant(f["7"]) == "python")
+        check("L12 hashlib (releases GIL) -> native", dominant(f["12"]) == "native")
+        check("L16 sorted (holds GIL) -> native", dominant(f["16"]) == "native")
+    else:
+        print(f"SKIP L7, L12, L16 GIL split (timer overshoot {p['sleep_overhead_s'] * 1000:.0f} ms is above "
+              f"4 switch intervals; the split cannot be measured on this host)")
+    check(f"L19 time.sleep(0.8) -> system ~{wall['waiting']:.2f} s measured",
+          dominant(f["19"]) == "system" and abs(f["19"]["system_s"] - wall["waiting"]) < 0.1)
+    check(f"L25 12 x sleep(0.25) -> system ~{wall['leaky']:.2f} s measured", abs(f["25"]["system_s"] - wall["leaky"]) < 0.2)
     fn = {v["name"]: v for v in next(iter(p["functions"].values())).values()}
     check("fast memory has no invented per-function attribution", 'rss_growth_mb' not in fn['temporary'])
 else:

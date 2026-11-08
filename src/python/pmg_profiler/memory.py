@@ -149,8 +149,11 @@ class MemoryTracker:
         # Budgets are shares of the time memory has been traced: the whole run, or with --trace-function
         # only the traced calls (based on the whole run, one 45 s-in call spent 17.8 s on peak snapshots).
         base = elapsed if not self.scoped else self.traced_s + (now - self.window_open_t)
+        # A routine snapshot may use at most half the remaining headroom: a cost up to twice the
+        # prediction (rates rose 8 -> 15 ns/B while one ramp grew) still stays inside the cap, and one
+        # large snapshot cannot spend the budget that later cheap snapshots of a leak trend need.
         routine_ok = due and (self.snap_cost - self.peak_snap_cost
-                              + book * max(self.snap_rate, self._last_rate) <= max(0.10 * base, 0.5))
+                              + 2 * book * max(self.snap_rate, self._last_rate) <= max(0.10 * base, 0.5))
         plateau_ok = plateau_due and self._plateau_cost + one <= max(PLATEAU_BUDGET * base, 2.0)
         doubling_ok = not plateau_ok and doubling_due and self._doubling_cost + one <= max(DOUBLING_BUDGET * base, 1.0)
         peak_ok = plateau_ok or doubling_ok

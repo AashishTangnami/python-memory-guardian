@@ -101,7 +101,8 @@ PMG_REQUIRE_RUST=1 npm run test:parity
 
 The [acceptance validation suite](acceptance-validation.md) adds independent positive and corrected-negative witnesses for memory, GC, structure costs and concurrent conflicts. It preserves commands, outputs and profile artifacts, separates unsupported observations from passes, and measures runtime and peak RSS against a baseline with budgets set before the run. These fixtures assess measurement limits as well as rule recognition; they do not add capabilities to PMG. Each run writes its report, with the recorded environment and results, to `.validation/` (local, not tracked by git).
 
-A failing check in `profiler_test.py` stops the later JavaScript tests, because `npm test` chains them with `&&`.
+A failing check in `profiler_test.py` stops the later JavaScript tests, because `npm test` chains them with `&&` (CI runs each suite as its own step).
+`profiler_test.py` checks the off-CPU lines of `workload.py` against the wall time that the fixture measures for its own sleeping calls (`PMG_WORKLOAD_WALL`), because a CI host can oversleep. It skips the python/native split checks when the measured timer overshoot (`sleep_overhead_s`) is above four switch intervals, because the GIL signal is then smaller than the timer jitter.
 
 ## Change a static rule
 
@@ -185,9 +186,9 @@ corrected variants. Missing Memray remains incomplete in acceptance.
 (one run per PR push; a newer push cancels the older run). The runtime job sets `PMG_PYTHON=python`, so `scripts/py.js` uses the setup-python interpreter. It defines runtime/package checks on Python
 3.9 and 3.13 across Linux, macOS and Windows, plus a free-threaded 3.13t job on
 Linux that blocks like the others. The Linux 3.9 job is pinned to `ubuntu-24.04`, because
-setup-python has no 3.9 build for newer `ubuntu-latest` images. It runs each suite as
-its own step, so one failure does not hide the result of later suites.
-Checks of sampled time print `SKIP` there (the profiler samples no time per
+setup-python has no 3.9 build for newer `ubuntu-latest` images. Every job runs the suites of
+`npm test` as separate steps, so one failure does not hide the result of later suites.
+On the free-threaded job, checks of sampled time print `SKIP` (the profiler samples no time per
 line on free-threaded builds); on such fixtures `test_model.js` and
 `test_summary.js` check only that the profiles parse, the summaries match the
 schema and both explain the missing time. Memray is not installed (no 3.13t
@@ -198,7 +199,10 @@ instead of 64 MiB, because mimalloc keeps about 50 MiB of freed pages resident
 `runtime_acceptance_test.py` expects the GC-pressure workload to run more
 collections than the fixed one rather than three times as many, because the
 free-threaded collector is not generational (2 against 1 runs, 3000 against 0
-cycles collected). A container job runs `test_container.js` against real Docker with
+cycles collected). The workflow uses the Node 24 majors of the GitHub actions (`checkout`, `setup-node`,
+`setup-python` and `upload-artifact` at `v7`); their `v4`/`v5` majors run on the deprecated
+Node 20. Tests run on Python 3.9 too, so they use only 3.9 APIs (`diagnostics_test.py` has its
+own `AsyncBarrier`, because `asyncio.Barrier` is 3.11+). A container job runs `test_container.js` against real Docker with
 `PMG_CONTAINER_TEST=docker` on `python:3.9-slim` and `python:3.13-slim`; set
 the same variable locally (and optionally `PMG_CONTAINER_IMAGE`) to run it
 with a local Docker; on failure it prints the exec prefix's exit status, stderr

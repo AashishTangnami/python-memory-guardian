@@ -152,10 +152,28 @@ def thread_counter(fixed=False, annotate=False, partial_lock=False):
     return shared['counter']
 
 
+class AsyncBarrier:
+    """Reusable rendezvous for asyncio tasks. asyncio.Barrier needs Python 3.11; this suite runs on 3.9."""
+
+    def __init__(self, parties):
+        self.parties, self.arrived, self.generation = parties, 0, 0
+        self.condition = asyncio.Condition()
+
+    async def wait(self):
+        async with self.condition:
+            generation = self.generation
+            self.arrived += 1
+            if self.arrived == self.parties:
+                self.arrived, self.generation = 0, generation + 1
+                self.condition.notify_all()
+            else:
+                await self.condition.wait_for(lambda: self.generation != generation)
+
+
 async def async_counter(fixed=False, annotate=False):
     shared = {'counter': 0}
     lock = asyncio.Lock()
-    barrier = asyncio.Barrier(2)
+    barrier = AsyncBarrier(2)
 
     async def operation():
         for _ in range(20):

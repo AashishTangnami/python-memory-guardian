@@ -57,6 +57,12 @@ does not change the timing/memory mode or turn outstanding blocks into leaks.
 The reader skips free-event enumeration and aggregates domain/scope request
 totals from stored sites once. Overflow still contributes exact request totals,
 but `summary_complete` is false. Backend read costs remain outside these bounds.
+The site lists of all capture files together are also limited to 4 MiB of JSON
+(`limits.max_site_summary_bytes`), so a guarded run stays below the 8 MiB report
+limit of the memory guard. Symbolized native stacks made a two-line script's
+report 9.2 MiB. The largest sites across all files stay (ranked by requested bytes, so one
+capture cannot crowd out a fork child's); the other sites move to the omitted
+totals of their file, and `summary_complete` is false.
 
 Report notes identify allocator and cooperative-observer overhead. Cross-run
 comparisons warn when capture availability, Python allocator detail, or
