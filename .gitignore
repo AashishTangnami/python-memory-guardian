@@ -1,13 +1,17 @@
 /python-memory-guardian-*-source.zip
 /python-memory-guardian-*.vsix
-/rust-server/target/
+/src/rust/target/
 /node_modules/
 /out/
 /dist/
 /bin/
-/server/libs/
-/test-fixtures/profiler/out/
+/src/python/libs/
+/tests/profiler/out/
 .mypy_cache
 .pmg
 __pycache__/
 /examples/profiling-workloads/**/*_output/
+# Local run output: acceptance/overhead reports (tests/acceptance) and architecture-tool snapshots
+/.validation/
+/.archify/
+/images

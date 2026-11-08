@@ -22,16 +22,16 @@ rows = cur.fetchall()  # memory-guardian: ignore
 
 ## Rules
 
-The diagnostic code is the key in `server/messages.json`. Both language servers (Python and Rust) report the same codes with the same text.
+The diagnostic code is the key in `src/python/messages.json`. Both language servers (Python and Rust) report the same codes with the same text.
 
 | Code | Severity | Fires on |
 |---|---|---|
-| `heap-inflation` | Warning | `fetchall()`, `fetchone()` in loops, `for row in cur.execute(...)` |
-| `pointer-chasing` | Warning | pandas imports and row-oriented loaders, however aliased |
+| `heap-inflation` | Warning | `fetchall()` materializes remaining rows. Cursor iteration, `fetchone()` and bounded `fetchmany()` do not trigger it |
+| `pointer-chasing` | Warning | pandas loaders, `Series` or `DataFrame` with explicit `dtype=object`, `dtype="object"` or an object entry in a dtype mapping, however aliased. Imports, unknown input dtypes and explicit numeric dtypes do not trigger it |
 | `cyclic-reference` | Info | back-pointer classes instantiated in loops |
 | `gc-cycle-risk` | Info | class with a back reference and `__del__` |
 | `ram-fragmentation.append` | Warning | `rows.append({...})` / tuple / list per iteration |
-| `ram-fragmentation.no-slots` | Info | class without `__slots__` instantiated in a loop. Exceptions, Enums, NamedTuples and `dataclass(slots=True)` are exempt |
+| `ram-fragmentation.no-slots` | Info | class without `__slots__` instantiated in a loop. Exceptions, Enums, NamedTuples, `dataclass(slots=True)`, and classes with explicit `setattr(self, ...)` or `self.__dict__` use are exempt |
 | `text-inflation.concat` | Warning | `s += "..."` on a str inside a loop (bytes excluded) |
 | `text-inflation.whole-file` | Warning | `f.read().split()` / `.splitlines()`, `f.readlines()` |
 | `memory-swell.list-arg` | Warning | `sum/any/all/min/max([...])` |
@@ -51,6 +51,18 @@ The diagnostic code is the key in `server/messages.json`. Both language servers 
 
 These rules follow the [functools](https://docs.python.org/3/library/functools.html), [copy](https://docs.python.org/3/library/copy.html), [re](https://docs.python.org/3/library/re.html), [asyncio task](https://docs.python.org/3/library/asyncio-task.html), and [gc](https://docs.python.org/3/library/gc.html) documentation. The regex rule is limited to literal `re.compile` calls: Python already caches recent patterns passed to `re.match` and related functions. Ordinary `setdefault` grouping, `list.append`/`extend`, and a `__del__` method alone are not treated as leaks; the added rules require a specific extra allocation or back reference. Modern Python generally collects cycles with finalizers, so `gc-cycle-risk` describes delayed cleanup rather than an inevitable leak.
 
+### Structure warnings and compatible alternatives
+
+Structure warnings are static candidates. They do not measure target object counts, allocation volume, traversal time or hardware cache misses. Sized messages quote synthetic interpreter probes; those sizes do not describe the target query or class. The object-dtype rule requires explicit dtype evidence because a pandas import or loader can produce compact numeric or extension arrays. It does not infer dtypes from a file or follow subsequent dtype changes across modules.
+
+Every LSP diagnostic includes `data` metadata with its category, severity, `status="potential"`, `confidence="static"`, and source-span syntax evidence. Workload, measured impact and trace artifact are `null` with explicit `unavailable` markers. Static analysis cannot provide runtime evidence from an editor buffer. Both backends use the same metadata contract, and parity tests compare it as well as the message and source range.
+
+A cursor creates Python row objects as it advances, but iteration alone does not retain the whole result. The eager-result warning therefore applies to `fetchall()` only. Cursor iteration or bounded `fetchmany()` is a compatible alternative only when one-pass access meets the program's contract.
+
+A set index requires hashable values with stable hash/equality, compatible duplicate semantics, and synchronization with list mutations. Keep the original list when order or unhashable values are required. Slots require fixed attributes and compatible inheritance, serialization, `__dict__` access and weak references. Columnar alternatives must preserve ordering, mutability, mixed values, null handling and the required access pattern. The analyzer cannot prove these contracts from syntax; the messages state the conditions rather than promise a safe automatic replacement.
+
+`tests/fixtures/static/static_semantics_cases.py` supplies exact positive and negative syntax expectations to both language servers. `tests/static/static_regression_test.py` executes eager/streamed SQL and object/numeric pandas fixtures before it checks diagnostics, and exercises set/slots compatibility failures independently. Build the Rust server before the parity checks so changes to the embedded message catalog are tested.
+
 ### When the thread rule fires, and when threads are fine
 
 The rule looks at what the target function does with the data it's given:
@@ -65,7 +77,7 @@ The rule looks at what the target function does with the data it's given:
 
 ## Version awareness
 
-At startup the extension runs `server/probe.py` on your interpreter (inside the container in container mode). The probe **measures** object sizes, reads the runtime GIL state, and identifies the memory allocator. Messages quote those numbers; anything the probe can't determine falls back to wording without numbers. Nothing is hard-coded per Python version. To see what was detected, open **View → Output → Python Memory Guardian**:
+At startup the extension runs `src/python/probe.py` on your interpreter (inside the container in container mode). The probe **measures** object sizes, reads the runtime GIL state, and identifies the memory allocator. Messages quote those numbers; anything the probe can't determine falls back to wording without numbers. Nothing is hard-coded per Python version. To see what was detected, open **View → Output → Python Memory Guardian**:
 
 ```
 Interpreter profile: {"py_version": "3.12.3", "gil_state": "enabled", "int_size": 28, ...}

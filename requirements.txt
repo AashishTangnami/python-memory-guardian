@@ -1,7 +1,7 @@
 # Python Memory Guardian - runtime dependencies of the Python language server.
 #
 # These are NOT installed into anyone's environment. `npm run vendor:python` copies
-# them into server/libs/, and that folder ships inside the extension. End users only
+# them into src/python/libs/, and that folder ships inside the extension. End users only
 # need a Python interpreter (3.9+); the probe and the profiler use the standard library.
 #
 # Rules for this file (each one fixes a real failure):
@@ -16,7 +16,7 @@
 #    "No module named 'exceptiongroup'". It is listed unconditionally here; on 3.11+
 #    it simply defers to the built-in ExceptionGroup.
 # Validate changes with real LSP parity tests on the oldest and newest supported
-# Python, plus test-fixtures/package_test.py against the built VSIX.
+# Python, plus tests/packaging/package_test.py against the built VSIX.
 #
 # To update: change a version, then run `npm run vendor:python && npm test` on the
 # oldest and newest supported Python.

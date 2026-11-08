@@ -1,0 +1,2 @@
+# Development checks only; do not vendor into the extension.
+ruff==0.14.14

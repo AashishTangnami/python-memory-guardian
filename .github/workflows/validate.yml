@@ -1,0 +1,165 @@
+name: Validate
+# Pushes to main and every pull request; other branches run through a PR (or by hand), so a PR
+# push does not start the same jobs twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned: setup-python publishes no 3.9 build (EOL) for newer ubuntu-latest images,
+          # so the job failed in setup within seconds.
+          - { os: ubuntu-24.04, python: '3.9' }
+          - { os: ubuntu-latest, python: '3.13' }
+          - { os: windows-latest, python: '3.9' }
+          - { os: windows-latest, python: '3.13' }
+          - { os: macos-15-intel, python: '3.9' }
+          - { os: macos-latest, python: '3.13' }
+          # Free-threaded build: no sampled time per line (those checks print SKIP), and mimalloc and
+          # the non-generational collector get their own limits in the tests.
+          - { os: ubuntu-latest, python: '3.13t', experimental: true }
+    runs-on: ${{ matrix.os }}
+    env:
+      PMG_PYTHON: python    # scripts/py.js: the setup-python interpreter, also for 3.13t
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: python -m pip install --target src/python/libs -r requirements.txt
+      - run: python -m pip install -r requirements-acceptance.txt
+        if: ${{ !matrix.experimental }}
+      # memray 1.20 has no free-threaded 3.13 wheel; the allocation tests skip without it.
+      - run: grep -v '^memray' requirements-acceptance.txt > "$RUNNER_TEMP/acceptance.txt" && python -m pip install -r "$RUNNER_TEMP/acceptance.txt"
+        if: ${{ matrix.experimental }}
+      - run: python -m pip install uv
+      - run: python -m pip install -r requirements-quality.txt
+      - run: npm run lint
+      # The suites of `npm test`, one step each, so one failure does not hide the result of later
+      # suites (job logs need a sign-in; the step list shows every failing suite).
+      - run: npm run compile
+        if: ${{ !cancelled() }}
+      - run: npm run test:parity
+        if: ${{ !cancelled() }}
+      - run: node scripts/py.js tests/profiler/profiler_regression_test.py
+        if: ${{ !cancelled() }}
+      - run: node scripts/py.js tests/profiler/runtime_acceptance_test.py
+        if: ${{ !cancelled() }}
+      - run: node scripts/py.js tests/profiler/diagnostics_test.py
+        if: ${{ !cancelled() }}
+      - run: node scripts/py.js tests/profiler/allocation_backend_test.py
+        if: ${{ !cancelled() }}
+      - run: node scripts/py.js tests/static/server_lifecycle_test.py
+        if: ${{ !cancelled() }}
+      - run: node scripts/py.js tests/profiler/profiler_test.py
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_model.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_allocation_model.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_report.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_compare.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_summary.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_run_options.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_report_entry.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_editor_events.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_extension_lifecycle.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_container.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_staging.js
+        if: ${{ !cancelled() }}
+      - run: node tests/client/test_pmg_writes.js
+        if: ${{ !cancelled() }}
+      - run: node scripts/py.js tests/guard/memory_guard_test.py
+        if: ${{ !cancelled() }}
+      - run: node tests/guard/test_memory_guard.js
+        if: ${{ !cancelled() }}
+      # Also after a failed suite, so the package is always checked.
+      - run: npm run package -- --out guardian.vsix
+        if: ${{ !cancelled() }}
+      - run: python tests/packaging/package_test.py guardian.vsix
+        if: ${{ !cancelled() }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: runtime-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            guardian.vsix
+            tests/profiler/out/*.json
+  container:
+    # Container mode against real Docker: stage into the bind-mounted project, probe and profile
+    # in the container, and map the profile back to host paths.
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['python:3.9-slim', 'python:3.13-slim']
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - run: docker pull ${{ matrix.image }}
+      - run: node tests/client/test_container.js
+        env:
+          PMG_CONTAINER_TEST: docker
+          PMG_CONTAINER_IMAGE: ${{ matrix.image }}
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: python -m pip install --target src/python/libs -r requirements.txt
+      - run: python -m pip install -r requirements-acceptance.txt
+      - run: npm run compile
+      - run: npm run test:parity
+      # A failed, skipped or unsupported case blocks this job. Criteria that are partial only because
+      # of a documented coverage limit do not (the report still lists them as partial).
+      - run: python tests/acceptance/acceptance_suite.py --reuse-rust-build --gate regression
+      # Overhead budgets are preregistered for a serial, isolated host; a shared runner records the
+      # numbers in the evidence but does not block on them.
+      - run: python tests/acceptance/measure_overhead.py --include-memray --out .validation/acceptance-current/overhead
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 30
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: acceptance-evidence
+          path: .validation/acceptance-current/

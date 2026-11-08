@@ -53,7 +53,7 @@ npm ci                     # exact dependency versions from package-lock.json
 npx vsce package           # -> python-memory-guardian-<version>.vsix
 ```
 
-`npm run package` runs the same command. `vsce package` automatically runs the `vscode:prepublish` script first. That script bundles the version-pinned packages from `requirements.txt` into `server/libs/`, and bundles the TypeScript client into `dist/extension.js`. A successful run ends with:
+`npm run package` runs the same command. `vsce package` automatically runs the `vscode:prepublish` script first. That script bundles the version-pinned packages from `requirements.txt` into `src/python/libs/`, and bundles the TypeScript client into `dist/extension.js`. A successful run ends with:
 
 ```
  DONE  Packaged: python-memory-guardian-<version>.vsix
@@ -84,7 +84,7 @@ It runs `npm ci`, packages the current manifest version (including the Python ve
 ```bash
 npm run build:rust
 mkdir -p bin
-cp rust-server/target/release/guardian-server bin/        # Windows: copy ...\guardian-server.exe bin\
+cp src/rust/target/release/guardian-server bin/        # Windows: copy ...\guardian-server.exe bin\
 npx vsce package --target linux-x64                       # use YOUR platform from above
 ```
 
@@ -107,10 +107,10 @@ code --install-extension python-memory-guardian-<version>.vsix
 
 ### Check that it works
 
-1. Open a folder that contains Python files. The repository's `test-fixtures/` folder works well.
+1. Open a folder that contains Python files. The repository's `tests/fixtures/static/` folder works well.
 2. Open `native_patterns.py`. Warnings should appear within a second.
 3. Open **View → Output → Python Memory Guardian**. You should see an `Interpreter profile: {...}` line.
-4. Open `test-fixtures/profiler/holders_workload.py`, run **Python Memory Guardian: Profile Current File**, and choose **precise**. The inline labels should include `held by Service.history`.
+4. Open `tests/fixtures/profiler/holders_workload.py`, run **Python Memory Guardian: Profile Current File**, and choose **precise**. The inline labels should include `held by Service.history`.
 5. If you installed a platform-specific package, set `"pythonMemoryGuardian.backend": "rust"` and repeat step 2.
 
 **To test in a clean environment,** without your other extensions or settings:
@@ -118,7 +118,7 @@ code --install-extension python-memory-guardian-<version>.vsix
 ```bash
 code --user-data-dir /tmp/pmg-clean --extensions-dir /tmp/pmg-ext \
      --install-extension python-memory-guardian-<version>.vsix
-code --user-data-dir /tmp/pmg-clean --extensions-dir /tmp/pmg-ext test-fixtures
+code --user-data-dir /tmp/pmg-clean --extensions-dir /tmp/pmg-ext tests/fixtures/static
 ```
 
 On Windows, use folders such as `%TEMP%\pmg-clean` and `%TEMP%\pmg-ext`.
@@ -186,12 +186,12 @@ The published extension ID is `<publisher>.python-memory-guardian`. The manifest
 Find any you missed:
 
 ```bash
-rg -n --hidden --no-ignore -g '!**/.git/**' -g '!node_modules/**' -g '!rust-server/target/**' 'your-publisher-id|your-org|<copyright holder>' .
+rg -n --hidden --no-ignore -g '!**/.git/**' -g '!node_modules/**' -g '!src/rust/target/**' 'your-publisher-id|your-org|<copyright holder>' .
 ```
 
 ### Release steps
 
-1. **Set the version** in all four places, higher than the published version: `package.json` and `package-lock.json`, `rust-server/Cargo.toml` (the Rust server reports it at initialization; `Cargo.lock` follows on the next build), and the `LanguageServer(...)` call in `server/guardian_server.py`. Finalize its `CHANGELOG.md` section, which the Marketplace shows.
+1. **Set the version** in all four places, higher than the published version: `package.json` and `package-lock.json`, `src/rust/Cargo.toml` (the Rust server reports it at initialization; `Cargo.lock` follows on the next build), and the `LanguageServer(...)` call in `src/python/guardian_server.py`. Finalize its `CHANGELOG.md` section, which the Marketplace shows.
 2. **Build and test:**
 
    ```bash
@@ -204,7 +204,7 @@ rg -n --hidden --no-ignore -g '!**/.git/**' -g '!node_modules/**' -g '!rust-serv
    Rust is needed to verify both static-analysis backends. If you only distribute the Python backend, the Rust build is optional, but `npm run test:parity` will otherwise skip the Rust comparison. If you changed `requirements.txt`, also run `npm run vendor:python && npm run test:parity` on Python 3.9 (`PMG_PYTHON=/path/to/python3.9`).
 3. **Audit dependencies.** Review both `npm audit` and `npm audit --omit=dev`. The full audit includes the development-only VSIX packaging tool; the production-only audit checks the Node dependency tree shipped with the extension. Do not treat a production-only clean result as a fix for a vulnerable build tool.
 4. **Build the packages**: the universal VSIX, and platform VSIXs if you distribute the Rust backend.
-5. **Check the package.** Run `npx vsce ls --tree`, then `python test-fixtures/package_test.py path/to/package.vsix` with the oldest and the current supported Python; it checks runtime files, development-file exclusions, and real LSP diagnostics from the extracted server. Install the VSIX in a clean VS Code profile and repeat [Check that it works](#check-that-it-works).
+5. **Check the package.** Run `npx vsce ls --tree`, then `python tests/packaging/package_test.py path/to/package.vsix` with the oldest and the current supported Python; it checks runtime files, development-file exclusions, and real LSP diagnostics from the extracted server. Install the VSIX in a clean VS Code profile and repeat [Check that it works](#check-that-it-works).
 6. **Run the checklist below**, then publish.
 
 | Check | How |
@@ -286,8 +286,8 @@ Example for static Linux x64, on a Linux machine with Rust installed through `ru
 ```bash
 rustup target add x86_64-unknown-linux-musl
 sudo apt-get install -y musl-tools        # Debian/Ubuntu
-cargo build --release --manifest-path rust-server/Cargo.toml --target x86_64-unknown-linux-musl
-rm -rf bin && mkdir bin && cp rust-server/target/x86_64-unknown-linux-musl/release/guardian-server bin/
+cargo build --release --manifest-path src/rust/Cargo.toml --target x86_64-unknown-linux-musl
+rm -rf bin && mkdir bin && cp src/rust/target/x86_64-unknown-linux-musl/release/guardian-server bin/
 npx vsce package --target linux-x64
 npx vsce package --target alpine-x64      # same static binary, second package
 ```
@@ -394,7 +394,7 @@ Prefer *unpublish* unless you're certain.
 | `EACCES` / permission denied starting the Rust server | package built on Windows lost the executable bit, on a read-only install location where the extension can't fix it. Rebuild on Linux or macOS |
 | Extension fails to activate: `Cannot find module …/dist/extension.js` | packaged without the bundle step. Run `npm run compile` (or let `vsce package` run `vscode:prepublish`), and check `dist/extension.js` exists |
 | Python backend fails on 3.9/3.10 with `No module named 'exceptiongroup'` | the bundle was built without `requirements.txt` (e.g. an old `vendor:python` script). Run `npm run vendor:python` and package again |
-| `server/libs/` missing after packaging | the prepublish step did not run or failed; run `npm run vendor:python` and check its output |
+| `src/python/libs/` missing after packaging | the prepublish step did not run or failed; run `npm run vendor:python` and check its output |
 | `vsce login` fails on Linux with a keyring / `libsecret` error | use `VSCE_PAT=<token> npx vsce publish` instead of `login` |
 | CI: `azure/login` fails with `AADSTS70021` / no matching federated identity | the federated credential's subject doesn't match. It must be `repo:<owner>/<repo>:environment:marketplace` for this workflow |
 | CI: publish fails with 401 after login succeeds | the identity's profile `id` isn't a **Contributor** member of your publisher (method C, steps 3–4) |
@@ -418,7 +418,7 @@ Prefer *unpublish* unless you're certain.
 
 | Gate | Status |
 |---|---|
-| Version and notes | `package.json`, `package-lock.json`, `rust-server/Cargo.toml` and `Cargo.lock`, and `server/guardian_server.py` are all 1.4.2; `CHANGELOG.md` has a 1.4.2 section. Both language servers report 1.4.2 in their `initialize` response (the Rust server after a release rebuild). Confirm that 1.4.2 is newer than the live Marketplace version before upload. |
+| Version and notes | `package.json`, `package-lock.json`, `src/rust/Cargo.toml` and `Cargo.lock`, and `src/python/guardian_server.py` are all 1.4.2; `CHANGELOG.md` has a 1.4.2 section. Both language servers report 1.4.2 in their `initialize` response (the Rust server after a release rebuild). Confirm that 1.4.2 is newer than the live Marketplace version before upload. |
 | Source and runtime tests | `npm test` and the Rust-required parity check (`PMG_REQUIRE_RUST=1`) pass on Python 3.13.0 with a freshly built macOS release binary; `profiler_regression_test.py` also passes on Python 3.12 and 3.9.6 (3 line-event tests skip on 3.9). |
 | Packaging, clean install and audit | Not yet run for 1.4.2: build the VSIX, run the packaged Python-server smoke test, install it in a clean VS Code profile, and rerun `npm audit`. The publisher ID and `LICENSE` copyright holder are still placeholders, as in 1.4.1. |
 
@@ -450,3 +450,15 @@ Prefer *unpublish* unless you're certain.
 - [Retirement of global PATs](https://devblogs.microsoft.com/devops/retirement-of-global-personal-access-tokens-in-azure-devops/).
 - [vsce README: Trusted publishing](https://github.com/microsoft/vscode-vsce#trusted-publishing).
 - Trusted Publishing availability as reported in [japanese-novel/vscode-jpnov#130](https://github.com/japanese-novel/vscode-jpnov/issues/130), which links Microsoft's replies.
+
+## Acceptance gate
+
+The platform workflow packages and checks Python 3.9/3.13 runtimes on Linux,
+macOS and Windows. The separate acceptance job blocks on failed or incomplete
+cases (`--gate regression`) and records overhead without blocking; it saves the
+evidence either way. Release readiness still needs the full gate,
+`npm run test:acceptance`, with all criteria and original overhead budgets
+passing on a serial, isolated host. Definition of this matrix does not establish release readiness. Incomplete native timestamps,
+unannotated concurrency coverage or failed budgets keep the gate red. The VSIX
+contains `src/python/pmg_profiler/`, including `allocations.py`, and `src/python/pmg_diagnostics.py`; optional Memray binaries
+are installed in the target environment, not bundled in the extension.

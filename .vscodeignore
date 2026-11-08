@@ -1,16 +1,21 @@
 # The client and its npm runtime dependencies are bundled in dist/extension.js.
 node_modules/**
 out/**
-src/**
-rust-server/**
+# src/python/** ships: the language server, profiler, probe and bundled packages.
+src/typescript/**
+src/rust/**
 scripts/**
-test-fixtures/**
+tests/**
 examples/**
 requirements-dev.txt
+requirements-acceptance.txt
+requirements-quality.txt
+eslint.config.mjs
+pyproject.toml
 tsconfig.json
 package-lock.json
 
-# Keep server/libs (including licenses) and an optional bin/guardian-server.
+# Keep src/python/libs (including licenses) and an optional bin/guardian-server.
 # Exclude development caches, interpreter-specific bytecode, and build artifacts.
 .*
 .*/**
