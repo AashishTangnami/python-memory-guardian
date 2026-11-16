@@ -65,7 +65,7 @@ def system_memory():
                  'page_available', 'virtual_total', 'virtual_available', 'extended')]
         value = MemoryStatus()
         value.length = ctypes.sizeof(value)
-        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(value)):
+        if not _windows_memory_api()[0].GlobalMemoryStatusEx(ctypes.byref(value)):
             raise OSError('GlobalMemoryStatusEx failed')
         total, available = int(value.total), int(value.available)
     else:
@@ -86,9 +86,16 @@ def choose_budget(memory, requested_mib=0, reserve_mib=512):
     return budget, reserve
 
 
-def process_memory(pid, peak=False):
-    """Return (root RSS, group RSS). Shared pages may be counted more than once."""
-    if sys.platform == 'win32':
+_WINDOWS_MEMORY_API = None
+
+
+def _windows_memory_api():
+    """kernel32, GetProcessMemoryInfo and its counters structure, configured once on private library
+    instances. ctypes.windll.<name> gives every caller in the process the same function objects, so
+    argtypes set there also changed the profiler's own RSS reader, and would change the profiled
+    program's calls to the same function."""
+    global _WINDOWS_MEMORY_API
+    if _WINDOWS_MEMORY_API is None:
         import ctypes
         from ctypes import wintypes
 
@@ -96,12 +103,22 @@ def process_memory(pid, peak=False):
             _fields_ = [('cb', wintypes.DWORD), ('faults', wintypes.DWORD)] + [
                 (name, ctypes.c_size_t) for name in ('peak', 'rss', 'peak_paged',
                  'paged', 'peak_nonpaged', 'nonpaged', 'pagefile', 'peak_pagefile')]
-        kernel = ctypes.windll.kernel32
+        kernel = ctypes.WinDLL('kernel32')
         kernel.OpenProcess.restype = wintypes.HANDLE
         kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        api = ctypes.windll.psapi.GetProcessMemoryInfo
+        api = ctypes.WinDLL('psapi').GetProcessMemoryInfo
         api.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+        api.restype = wintypes.BOOL
+        _WINDOWS_MEMORY_API = (kernel, api, Counters)
+    return _WINDOWS_MEMORY_API
+
+
+def process_memory(pid, peak=False):
+    """Return (root RSS, group RSS). Shared pages may be counted more than once."""
+    if sys.platform == 'win32':
+        import ctypes
+        kernel, api, Counters = _windows_memory_api()
         handle = kernel.OpenProcess(0x410, False, pid)
         if not handle:
             raise OSError('OpenProcess failed')

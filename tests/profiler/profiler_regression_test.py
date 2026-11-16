@@ -408,7 +408,9 @@ class ProfileRegressions(unittest.TestCase):
             _, report = self.run_script(Path(tmp), source, memory='precise', guard='off')
             self.assertGreater(report['tracemalloc_peak_mb'], 20, 'bookkeeping is measured')
             self.assertIsNone(report['native_untraced_mb'],
-                              'ambiguous residual is unavailable, not a measured zero')
+                              'ambiguous residual is unavailable, not a measured zero '
+                              f"(RSS {report['rss_start_mb']} -> {report['rss_peak_mb']} MB, traced peak "
+                              f"{report['peak_traced_mb']} MB, bookkeeping {report['tracemalloc_peak_mb']} MB)")
             line = report['files'][next(iter(report['files']))]['2']
             self.assertNotIn('profiler_mb', line, 'profiler memory cannot be attributed to a user line')
 
@@ -947,6 +949,55 @@ class ProfileRegressions(unittest.TestCase):
             self.assertEqual(rows['1']['retention']['growth_mb'], 6)
             self.assertEqual(rows['2']['retention']['releases'], 1)
             self.assertNotIn('leak_runs', rows['2'])
+
+    def test_windows_memory_readers_do_not_share_api_function_objects(self):
+        # ctypes.windll.psapi is one object per process. guard.py set argtypes on its
+        # GetProcessMemoryInfo, and the profiler's own reader then failed on windows-latest with
+        # "expected LP_Counters instance instead of pointer to PMC". The Windows branches run here
+        # against stand-in libraries; any use of ctypes.windll fails the test.
+        import ctypes
+        from pmg_profiler import guard
+
+        class Function:
+            def __init__(self, name):
+                self.name, self.argtypes, self.restype = name, None, None
+
+            def __call__(self, *args):
+                if self.name != 'GetProcessMemoryInfo':
+                    return 7                                  # a handle; other results are not read
+                counters = args[1]._obj                       # the structure passed with byref()
+                setattr(counters, counters._fields_[2][0], 456 << 20)   # peak working set
+                setattr(counters, counters._fields_[3][0], 123 << 20)   # working set
+                return 1
+
+        class Library:
+            loaded = []
+
+            def __init__(self, name):
+                self.name, self.functions = name, {}
+                Library.loaded.append(self)
+
+            def __getattr__(self, name):
+                if name.startswith('__'):
+                    raise AttributeError(name)
+                return self.functions.setdefault(name, Function(name))
+
+        class NoSharedLibraries:
+            def __getattr__(self, name):
+                raise AssertionError('ctypes.windll shares its function objects across the process')
+
+        with patch.object(sys, 'platform', 'win32'), \
+                patch.object(ctypes, 'WinDLL', Library, create=True), \
+                patch.object(ctypes, 'windll', NoSharedLibraries(), create=True), \
+                patch.object(guard, '_WINDOWS_MEMORY_API', None):
+            read, kind = system.make_rss_reader()
+            self.assertEqual((kind, read()), ('current', 123 << 20))
+            self.assertEqual(guard.process_memory(1234), (123 << 20, 123 << 20))
+            self.assertEqual(guard.process_memory(1234, peak=True)[0], 456 << 20)
+            self.assertEqual(read(), 123 << 20, 'still readable after the guard configured its own function')
+        readers = [library.functions['GetProcessMemoryInfo'] for library in Library.loaded if library.name == 'psapi']
+        self.assertEqual(len(readers), 2, 'the profiler and the guard each load their own psapi')
+        self.assertIsNot(readers[0].argtypes[1], readers[1].argtypes[1], 'each keeps its own structure type')
 
     def test_idle_timer_calibration_ignores_one_scheduling_pause(self):
         elapsed = [.0025] * 8 + [.1]

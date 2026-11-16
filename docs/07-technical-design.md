@@ -120,7 +120,7 @@ Each sample also records the full call stack of each thread. The Stack Explorer 
 
 At each sample, the profiler reads the resident set size (RSS) of the process. RSS is the resident memory that the process uses. The profile records changes at process scope. A sample cannot identify the allocator, object, thread or Python line that caused a change.
 
-The profiler reads RSS from `/proc/self/statm` on Linux, from `task_info` on macOS, and from `GetProcessMemoryInfo` (the working set) on Windows. On other Unix systems, only the peak RSS (`ru_maxrss`) is available. Then RSS can only increase in the report.
+The profiler reads RSS from `/proc/self/statm` on Linux, from `task_info` on macOS, and from `GetProcessMemoryInfo` (the working set) on Windows. On Windows, the profiler and the memory guard each load their own instance of the system libraries (`ctypes.WinDLL`, not the shared `ctypes.windll`). Thus the argument types that one of them sets do not change the calls of the other, or the calls of your program. On other Unix systems, only the peak RSS (`ru_maxrss`) is available. Then RSS can only increase in the report.
 
 RSS has two limits:
 

@@ -34,18 +34,23 @@ def make_rss_reader():
                         "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
                         "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
                         "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
-            k32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+            # Private library instances. ctypes.windll.<name> gives every caller in the process the
+            # same function objects, so the argtypes that guard.py set on GetProcessMemoryInfo also
+            # applied here and each later read failed ("expected LP_Counters instance instead of
+            # pointer to PMC"), ending a guarded run at exit with a traceback.
+            k32, psapi = ctypes.WinDLL("kernel32"), ctypes.WinDLL("psapi")
             k32.GetCurrentProcess.restype = wintypes.HANDLE
+            read = psapi.GetProcessMemoryInfo
+            # Typed arguments: the pseudo-handle is the integer 2**64 - 1, and ctypes converts an
+            # untyped integer through a C long (32 bits on Windows): "int too long to convert".
+            read.argtypes = [wintypes.HANDLE, ctypes.POINTER(PMC), wintypes.DWORD]
+            read.restype = wintypes.BOOL
             proc = k32.GetCurrentProcess()
             pmc = PMC()
             pmc.cb = ctypes.sizeof(PMC)
 
             def windows():
-                # The handle goes in typed: GetCurrentProcess returns the pseudo-handle as the integer
-                # 2**64 - 1, and ctypes converts an untyped integer through a C long (32 bits on
-                # Windows), which raised "int too long to convert" and left the profile with no RSS.
-                # No argtypes on this shared function object: guard.py sets its own there.
-                if not psapi.GetProcessMemoryInfo(wintypes.HANDLE(proc), ctypes.byref(pmc), pmc.cb):
+                if not read(proc, ctypes.byref(pmc), pmc.cb):
                     raise OSError("GetProcessMemoryInfo failed")
                 return int(pmc.WorkingSetSize)
             windows()
