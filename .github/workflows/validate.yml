@@ -94,7 +94,21 @@ jobs:
       - run: node tests/client/test_pmg_writes.js
         if: ${{ !cancelled() }}
       - run: node scripts/py.js tests/guard/memory_guard_test.py
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+      # Windows: three cases need POSIX process groups or job objects and are always skipped there, and
+      # the script reports any skipped case as exit code 2 (incomplete). Only that code is accepted;
+      # a failed case exits 1 and still fails the job.
+      - name: Run node scripts/py.js tests/guard/memory_guard_test.py (Windows, exit code 2 accepted)
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          code=0
+          node scripts/py.js tests/guard/memory_guard_test.py || code=$?
+          if [ "$code" -eq 2 ]; then
+            echo "Skipped cases reported as incomplete (exit code 2): accepted on Windows."
+            exit 0
+          fi
+          exit "$code"
       - run: node tests/guard/test_memory_guard.js
         if: ${{ !cancelled() }}
       # Also after a failed suite, so the package is always checked.
