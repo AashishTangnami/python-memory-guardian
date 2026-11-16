@@ -414,6 +414,52 @@ class ProfileRegressions(unittest.TestCase):
             line = report['files'][next(iter(report['files']))]['2']
             self.assertNotIn('profiler_mb', line, 'profiler memory cannot be attributed to a user line')
 
+    def test_native_estimate_excludes_snapshot_memory_the_allocator_kept(self):
+        # reset_peak() keeps a snapshot's objects out of peak_traced, but RSS keeps the memory: the next
+        # sample's RSS rose more than traced memory and bookkeeping did. Linux runs of the 300k-dict workload
+        # above read a 146-150 MB residual against 72 MB of bookkeeping and exposed it as native memory.
+        MB = 1_000_000
+        rss0, book, traced, kept = 25 * MB, 72 * MB, 81.5 * MB, 60 * MB
+
+        def run(native_mb, native_in_snapshot_interval_mb=0, after=(60 * MB, 50 * MB), then_native_mb=0):
+            """Drive a snapshot sample, the sample after it and one more; return the native estimate."""
+            with tempfile.TemporaryDirectory() as tmp:
+                p = profiler.Profiler(tmp, .01, 'precise')
+            m = p.memory
+            readings = iter([(40 * MB, 40 * MB), (after[0], after[0]), (after[0], after[0])])
+            books = iter([40 * MB, after[1], after[1]])
+            with patch.object(tracemalloc, 'get_traced_memory', side_effect=lambda: next(readings)), \
+                    patch.object(tracemalloc, 'get_tracemalloc_memory', side_effect=lambda: next(books)), \
+                    patch.object(tracemalloc, 'is_tracing', return_value=True), \
+                    patch.object(tracemalloc, 'reset_peak'), \
+                    patch.object(m, 'snapshot'):
+                state = m.sample(10.0, 0.0, {}, {}, None, 150 * MB, 'current', 0, 0, 0, 0.0, 0)
+                self.assertTrue(m.snapped, 'the first sample takes a snapshot')
+                # 20 MB traced and 10 MB bookkeeping growth, plus snapshot memory kept and any native growth.
+                change = 30 * MB + kept + native_in_snapshot_interval_mb * MB
+                state = m.sample(10.01, 0.0, {}, {}, None, 150 * MB + change, 'current', change, *state)
+                self.assertFalse(m.snapped, 'the second sample takes no snapshot')
+                later = then_native_mb * MB      # growth in an interval that follows no snapshot
+                m.sample(10.02, 0.0, {}, {}, None, 150 * MB + change + later, 'current', later, *state)
+            m.peak_traced, m.book_max = traced, book
+            return m.native_estimate(rss0 + traced + book + native_mb * MB, rss0)
+
+        self.assertIsNone(run(146.3), 'a residual within the bookkeeping and the kept snapshot memory is ambiguous')
+        self.assertEqual(run(300), 300 * MB, 'a residual beyond both is still reported, unchanged')
+        # Native buffers growing while the snapshot ran cannot pass as snapshot memory: at most 2.5 times the
+        # snapshot's 40 MB of bookkeeping (100 MB) widens the margin, so 300 MB stays above 144 + 100 MB.
+        self.assertEqual(run(300, native_in_snapshot_interval_mb=240), 300 * MB)
+        # Memory the program freed meanwhile stays in the maxima, not in snapshot memory: traced memory and
+        # bookkeeping falling by 40 MB each, with RSS rising 90 MB, keeps the margin at 144 + 90 MB.
+        self.assertEqual(run(240, after=(0, 0)), 240 * MB, 'freed memory is not snapshot memory')
+        # The margin is exactly what was measured: 144 MB plus the kept 60 MB, not the whole RSS change
+        # (signs), not growth after a sample without a snapshot, and capped by the snapshot's bookkeeping
+        # (40 MB), not by the bookkeeping read afterwards (50 MB).
+        self.assertEqual(run(210), 210 * MB, 'the margin is the kept 60 MB, not the RSS change plus growth')
+        self.assertEqual(run(260, native_in_snapshot_interval_mb=240), 260 * MB, 'capped by the snapshot bookkeeping')
+        self.assertEqual(run(210, then_native_mb=200), 210 * MB,
+                         'growth after a sample without a snapshot is not snapshot memory')
+
     @needs_stacks
     def test_timeline_points_carry_the_main_thread_stack(self):
         source = ('import time\n'
@@ -1035,6 +1081,44 @@ class ProfileRegressions(unittest.TestCase):
                 self.assertAlmostEqual(getattr(line, expected + '_s'), .01)
                 other = 'python_s' if expected == 'native' else 'native_s'
                 self.assertEqual(getattr(line, other), 0)
+
+    @needs_stacks
+    def test_gil_holding_call_is_native_from_scripted_timings(self):
+        # Deterministic counterpart of profiler_test's sorted() line. A sampler can take no sample on a
+        # line while a C call holds the GIL, so the workload check reports that line as not observed
+        # when it has no entry; the classification itself is fixed here with scripted clocks. Both ways
+        # the sampler sees a held GIL must give native time: a sleep that overshoots while it waits to
+        # re-acquire the GIL, and a stall inside its own work after it lost the GIL there. The second
+        # case sleeps 5 ms over its baseline, which alone reads as Python code yielding at the switch
+        # interval, so only the stall can make it native.
+        cases = [('sleep overshoot', .05, 0), ('stall in the sampler work', .0175, .05)]
+        for name, sleep_duration, sample_work in cases:
+            with self.subTest(signal=name), tempfile.TemporaryDirectory() as tmp:
+                p = profiler.Profiler(tmp, .01, 'off')
+                p.sampler.split, p.sampler.switch, p.sampler.sleep_overhead = True, .005, .0025
+                p.sampler.rss, p.sampler.rss_kind = lambda: 0, None
+                ident = threading.get_ident() + 1
+                cpu = iter([1.0, 1.01])
+                p.sampler._clocks[ident] = lambda: next(cpu)
+                loc = (str(Path(tmp) / 'work.py'), 1)
+                sleeps = []
+
+                def sleep(_):
+                    sleeps.append(True)
+                    if len(sleeps) == 2:
+                        p.sampler._stop.set()
+
+                ticks = [0, 0, .0125, .0125 + sample_work, .0125 + sample_work + sleep_duration]
+                with patch.object(time, 'sleep', side_effect=sleep), \
+                        patch.object(time, 'perf_counter', side_effect=ticks), \
+                        patch.object(time, 'thread_time', return_value=0.0), \
+                        patch.object(sys, '_current_frames', return_value={ident: None}), \
+                        patch.object(p.sampler, '_walk', return_value=(loc, ('work', 1), ())):
+                    p.sampler._run()
+                self.assertIsNone(p.sampler.sampler_error)
+                line = p.sampler.lines[loc]
+                self.assertAlmostEqual(line.native_s, .01)
+                self.assertEqual(line.python_s, 0)
 
 
 if __name__ == '__main__':

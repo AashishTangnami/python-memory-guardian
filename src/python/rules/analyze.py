@@ -9,6 +9,7 @@ from .index import index_file
 from .list_once import _list_once
 from .messages import render
 from .positions import _range, _scopes, prefix, scope_label
+from .tables import DEFAULT_TRAITS, RULE_TRAITS
 from .visitor import Visitor
 
 SOURCE = "Python Memory Guardian"
@@ -41,15 +42,17 @@ def analyze(source: str, uri: str = "file:///untitled.py",
             for n, m in fd.related] or None
         start = (fd.span[0], fd.span[1]) if fd.span else (fd.node.lineno, fd.node.col_offset)
         head = prefix(scope_label(scopes, start), fd.subject)
+        strength, fix_safety = RULE_TRAITS.get(fd.key, DEFAULT_TRAITS)
         diags.append(lsp.Diagnostic(
             range=rng, message=head + render(fd.key, facts, fd.local), severity=fd.severity,
             source=SOURCE, code=fd.key, related_information=related,
-            data={"schema_version": 1, "analysis": "static", "category": fd.key,
+            data={"schema_version": 2, "analysis": "static", "category": fd.key,
                   "severity": int(fd.severity), "status": "potential", "confidence": "static",
+                  "fix_safety": fix_safety,
                   "workload": None, "impact": None, "trace_artifact": None,
                   "availability": {"workload": "unavailable", "impact": "unavailable",
                                    "trace_artifact": "unavailable"},
-                  "evidence": {"kind": "syntax", "measured": False,
+                  "evidence": {"kind": "syntax", "strength": strength, "measured": False,
                                "source": {"uri": uri, "line": rng.start.line + 1,
                                           "column": rng.start.character,
                                           "end_line": rng.end.line + 1,

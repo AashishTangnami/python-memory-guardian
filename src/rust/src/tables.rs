@@ -37,3 +37,35 @@ pub(crate) const CONCAT_SEQUENCE_CALLS: &[&str] = &["pandas.concat", "numpy.conc
     "numpy.hstack"];
 pub(crate) const CONCAT_FIRST_ARG_CALLS: &[&str] = &["numpy.append"];
 pub(crate) const STORE_METHODS: &[&str] = &["append", "appendleft", "add"];
+// Evidence strength and fix safety of every rule code, for the diagnostic `data` payload
+// (docs/06-rules.md); the meaning of each value is in src/python/rules/tables.py.
+pub(crate) const RULE_TRAITS: &[(&str, &str, &str)] = &[
+    ("heap-inflation", "syntactic", "manual"),
+    ("pointer-chasing", "syntactic", "manual"),
+    ("cyclic-reference", "structural", "manual"),
+    ("gc-cycle-risk", "structural", "manual"),
+    ("ram-fragmentation.append", "structural", "manual"),
+    ("ram-fragmentation.no-slots", "structural", "maybe-incorrect"),
+    ("text-inflation.concat", "structural", "maybe-incorrect"),
+    ("text-inflation.whole-file", "syntactic", "maybe-incorrect"),
+    ("memory-swell.list-arg", "syntactic", "maybe-incorrect"),
+    ("memory-swell.list-copy", "syntactic", "maybe-incorrect"),
+    ("memory-swell.list-once", "structural", "maybe-incorrect"),
+    ("memory-swell.method-cache", "structural", "manual"),
+    ("memory-swell.unbounded-cache", "syntactic", "manual"),
+    ("memory-swell.deepcopy-loop", "structural", "manual"),
+    ("memory-swell.recompile-loop", "structural", "maybe-incorrect"),
+    ("memory-swell.setdefault-loop", "structural", "maybe-incorrect"),
+    ("memory-swell.list-extend-loop", "structural", "maybe-incorrect"),
+    ("memory-swell.concat-loop", "structural", "maybe-incorrect"),
+    ("memory-swell.unbounded-queue", "syntactic", "manual"),
+    ("memory-swell.fork-start-method", "syntactic", "manual"),
+    ("task-retention.asyncio-task", "syntactic", "maybe-incorrect"),
+    ("frame-retention.stored-exception", "structural", "manual"),
+    ("resource-leak.file-handle", "structural", "maybe-incorrect"),
+    ("single-thread-stall.async-blocking", "structural", "maybe-incorrect"),
+    ("single-thread-stall.list-membership", "structural", "maybe-incorrect"),
+    ("single-thread-stall.cpu-thread", "structural", "manual"),
+];
+// A code that is missing above still gets a payload, with the weaker claim in both fields.
+pub(crate) const DEFAULT_TRAITS: (&str, &str) = ("syntactic", "manual");

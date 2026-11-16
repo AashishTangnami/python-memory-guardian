@@ -8,6 +8,7 @@ use crate::index::*;
 use crate::list_once::*;
 use crate::messages::*;
 use crate::positions::*;
+use crate::tables::{DEFAULT_TRAITS, RULE_TRAITS};
 use crate::visitor::*;
 
 const SOURCE: &str = "Python Memory Guardian";
@@ -43,6 +44,8 @@ pub(crate) fn analyze(text: &str, uri: &Url, facts: &Facts) -> Option<Vec<Diagno
             .map(|(s, e, m)| DiagnosticRelatedInformation {
                 location: Location::new(uri.clone(), lsp_range(&lines, s, e)), message: m })
             .collect();
+        let (strength, fix_safety) = RULE_TRAITS.iter().find(|row| row.0 == fd.key)
+            .map_or(DEFAULT_TRAITS, |row| (row.1, row.2));
         diags.push(Diagnostic {
             range,
             severity: Some(fd.sev),
@@ -51,12 +54,13 @@ pub(crate) fn analyze(text: &str, uri: &Url, facts: &Facts) -> Option<Vec<Diagno
             message: prefix(&fd.scope, &fd.subject) + &render(fd.key, facts, &fd.local),
             related_information: if related.is_empty() { None } else { Some(related) },
             data: Some(serde_json::json!({
-                "schema_version": 1, "analysis": "static", "category": fd.key,
+                "schema_version": 2, "analysis": "static", "category": fd.key,
                 "severity": fd.sev, "status": "potential", "confidence": "static",
+                "fix_safety": fix_safety,
                 "workload": null, "impact": null, "trace_artifact": null,
                 "availability": {"workload": "unavailable", "impact": "unavailable",
                                  "trace_artifact": "unavailable"},
-                "evidence": {"kind": "syntax", "measured": false,
+                "evidence": {"kind": "syntax", "strength": strength, "measured": false,
                     "source": {"uri": uri, "line": range.start.line + 1,
                                "column": range.start.character,
                                "end_line": range.end.line + 1,

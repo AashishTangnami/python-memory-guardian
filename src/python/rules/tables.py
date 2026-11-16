@@ -64,3 +64,43 @@ CONCAT_SEQUENCE_CALLS = {"pandas.concat", "numpy.concatenate", "numpy.vstack", "
 CONCAT_FIRST_ARG_CALLS = {"numpy.append"}
 # Methods that add their one argument to a collection.
 STORE_METHODS = {"append", "appendleft", "add"}
+
+# Evidence strength and fix safety of every rule code, for the diagnostic `data` payload
+# (docs/06-rules.md). Strength: "syntactic" = one call or expression decided the finding;
+# "structural" = the rule also checked the code around it in the same file (an enclosing loop,
+# class, handler or `async def`, or how a name is bound and used in its scope). Fix safety is about
+# the alternative that the message names, because the servers apply no edits: "maybe-incorrect" = a
+# local rewrite that usually keeps behaviour but can change it in a case the rule cannot see;
+# "manual" = the alternative changes what the code returns, when it runs, or its design.
+SYNTACTIC, STRUCTURAL = "syntactic", "structural"
+MAYBE_INCORRECT, MANUAL = "maybe-incorrect", "manual"
+RULE_TRAITS = {
+    "heap-inflation": (SYNTACTIC, MANUAL),
+    "pointer-chasing": (SYNTACTIC, MANUAL),
+    "cyclic-reference": (STRUCTURAL, MANUAL),
+    "gc-cycle-risk": (STRUCTURAL, MANUAL),
+    "ram-fragmentation.append": (STRUCTURAL, MANUAL),
+    "ram-fragmentation.no-slots": (STRUCTURAL, MAYBE_INCORRECT),
+    "text-inflation.concat": (STRUCTURAL, MAYBE_INCORRECT),
+    "text-inflation.whole-file": (SYNTACTIC, MAYBE_INCORRECT),
+    "memory-swell.list-arg": (SYNTACTIC, MAYBE_INCORRECT),
+    "memory-swell.list-copy": (SYNTACTIC, MAYBE_INCORRECT),
+    "memory-swell.list-once": (STRUCTURAL, MAYBE_INCORRECT),
+    "memory-swell.method-cache": (STRUCTURAL, MANUAL),
+    "memory-swell.unbounded-cache": (SYNTACTIC, MANUAL),
+    "memory-swell.deepcopy-loop": (STRUCTURAL, MANUAL),
+    "memory-swell.recompile-loop": (STRUCTURAL, MAYBE_INCORRECT),
+    "memory-swell.setdefault-loop": (STRUCTURAL, MAYBE_INCORRECT),
+    "memory-swell.list-extend-loop": (STRUCTURAL, MAYBE_INCORRECT),
+    "memory-swell.concat-loop": (STRUCTURAL, MAYBE_INCORRECT),
+    "memory-swell.unbounded-queue": (SYNTACTIC, MANUAL),
+    "memory-swell.fork-start-method": (SYNTACTIC, MANUAL),
+    "task-retention.asyncio-task": (SYNTACTIC, MAYBE_INCORRECT),
+    "frame-retention.stored-exception": (STRUCTURAL, MANUAL),
+    "resource-leak.file-handle": (STRUCTURAL, MAYBE_INCORRECT),
+    "single-thread-stall.async-blocking": (STRUCTURAL, MAYBE_INCORRECT),
+    "single-thread-stall.list-membership": (STRUCTURAL, MAYBE_INCORRECT),
+    "single-thread-stall.cpu-thread": (STRUCTURAL, MANUAL),
+}
+# A code that is missing above still gets a payload, with the weaker claim in both fields.
+DEFAULT_TRAITS = (SYNTACTIC, MANUAL)

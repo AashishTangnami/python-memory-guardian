@@ -21,6 +21,13 @@ MEMORY_STACK_CAP = 20_000
 # Peak-capture snapshot budgets, as shares of the traced time (see sample).
 PLATEAU_BUDGET = 1.0
 DOUBLING_BUDGET = 0.5
+# Most RSS that one snapshot is taken to leave resident, per byte of bookkeeping at that snapshot.
+# take_snapshot() copies every trace record with the raw allocator and builds one tuple per trace with
+# tracing suspended, so the copy is neither traced nor counted as bookkeeping. Measured on macOS only
+# (300k dicts, 3.9.6 and 3.13.0): RSS rose 2.25-2.51x the bookkeeping while a snapshot ran, and
+# 0.98-1.61x (25-66 MB) was still resident at the next sample. Not measured under glibc. Native growth
+# in the same interval cannot pass as snapshot memory beyond this bound, but can up to it.
+SNAPSHOT_RSS_PER_BOOK = 2.5
 
 
 class MemoryTracker:
@@ -52,6 +59,9 @@ class MemoryTracker:
         # weighted by the full call path, as deep as time stacks, independent of the traceback depth.
         self.alloc_stacks: dict[tuple, int] = {}
         self.book_max = 0            # largest tracemalloc bookkeeping seen (profiler memory, not the program's)
+        # Largest RSS growth across an interval that held a snapshot, beyond that interval's traced and
+        # bookkeeping growth: snapshot memory the allocator kept (profiler memory, not the program's).
+        self.snap_rss_max = 0
         self._last_rate = 0.0        # measured cost per bookkeeping byte of the last large snapshot, unclamped
         self.trace_lock = threading.Lock()   # sampler memory work vs. a traced-function window opening/closing
         self.traced_s = 0.0          # --trace-function: time inside closed windows
@@ -86,7 +96,7 @@ class MemoryTracker:
                prev_traced, prev_book, last_snap_t, last_snap_traced):
         """Memory work for one sample: traced memory and its attribution, the timeline point, and
         snapshots. Returns the carried state: previous traced and bookkeeping bytes, last snapshot."""
-        self.snapped = False
+        after_snapshot, self.snapped = self.snapped, False
         traced = book = 0
         precise = self.precise(now - t0)
         if precise:
@@ -95,6 +105,16 @@ class MemoryTracker:
             # profiler adds; it is subtracted from the native estimate (measured: 294 MB for 1M dicts).
             book = tracemalloc.get_tracemalloc_memory()
             self.book_max = max(self.book_max, book)
+            if after_snapshot and rss_kind:
+                # The previous sample took a snapshot. Its copy of the trace records was never traced
+                # (reset_peak() only removes the traced temporaries of snapshot()'s own loop), and the
+                # allocator can keep that memory resident: 25-66 MB at the next sample of a 300k-dict
+                # run on macOS, the largest part of its residual. Only growth is the program's: memory
+                # it freed meanwhile is already in peak_traced and book_max, and subtracting the fall
+                # counted resident free memory as snapshot memory (recomputed from a saved Linux
+                # profile of tests/fixtures/profiler/workload.py: 183 MB against 70 MB of RSS growth).
+                kept = rss_change - max(0, interval_peak - prev_traced) - max(0, book - prev_book)
+                self.snap_rss_max = max(self.snap_rss_max, min(kept, SNAPSHOT_RSS_PER_BOOK * prev_book))
             self.peak_traced = max(self.peak_traced, interval_peak, traced)
             if hasattr(tracemalloc, "reset_peak"):          # 3.9+
                 tracemalloc.reset_peak()
@@ -327,11 +347,16 @@ class MemoryTracker:
         """Process memory beyond the traced peak and tracemalloc's largest bookkeeping, in bytes.
         get_tracemalloc_memory() misstates tracing's real RSS cost in both directions (measured with 2
         frames: +52 MB unreported on 300k dicts with 72 MB of bookkeeping; -125 MB on 1M dicts), and in a
-        profiled 300k-dict run 102 MB remained. So an estimate within twice the bookkeeping cannot be told
-        apart from tracing overhead and is reported as 0; native buffers (PyArrow, Polars) clear it."""
+        profiled 300k-dict run 102 MB remained. Snapshot memory that the allocator keeps is also profiler
+        memory (snap_rss_max): on macOS it was 25-66 MB and the residual (2-111 MB) was larger when the
+        last snapshot came later; Linux runs of that workload reached 146-150 MB, just over twice the
+        bookkeeping (not reproduced, so whether this term explains them is unproven). So an estimate within
+        twice the bookkeeping plus the kept snapshot memory cannot be told apart from profiler overhead and
+        is unavailable (None, not 0); native buffers (PyArrow, Polars) clear it. A returned value still
+        includes the kept snapshot memory: only the limit accounts for it."""
         # The largest bookkeeping, like the largest traced memory: RSS rarely falls, so its peak reflects the
         # highest of both even when it is reached later (with the bookkeeping at the RSS peak instead, a
         # pure-Python run kept 492 MB of "native" memory).
         book = self.book_max
         native = rss_max - self.peak_traced - book - (rss0 or 0)
-        return native if native > 2 * book else None
+        return native if native > 2 * book + self.snap_rss_max else None

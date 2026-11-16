@@ -173,7 +173,7 @@ The bookkeeping is the memory that `tracemalloc` itself uses to record each allo
 
 The peaks can occur at different times. Arenas, resident free pages and profiler memory can contribute to the residual. It is not a measured native allocation. PMG never assigns it to a Python line. It is unavailable after lost or scoped traces, or when RSS is unavailable.
 
-PMG exposes a positive residual only above twice the tracer bookkeeping. A smaller residual is ambiguous and is `null`, not zero. The optional allocator backend provides separate native allocator evidence where its hooks work; see [allocator evidence](allocations.md).
+A snapshot copies every trace record into memory that `tracemalloc` does not trace and does not count as bookkeeping. The allocator can keep that memory resident after the snapshot. Thus PMG measures it. At the sample after each snapshot, PMG records the RSS change less the traced growth and the bookkeeping growth. The limit of this value is 2.5 times the bookkeeping at that snapshot. On macOS, 300,000 small dictionaries kept 25 to 66 MB; there is no measurement on Linux. PMG exposes a positive residual only above twice the largest tracer bookkeeping plus the largest snapshot memory that RSS kept. A smaller residual is ambiguous and is `null`, not zero. A reported residual still includes the snapshot memory. Native growth in the interval after a snapshot can increase the limit, by at most 2.5 times the bookkeeping at that snapshot; such a run reports `null` for a residual that is below the limit. The optional allocator backend provides separate native allocator evidence where its hooks work; see [allocator evidence](allocations.md).
 
 ### 5.7 Allocation by call path
 

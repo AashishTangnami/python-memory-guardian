@@ -55,6 +55,22 @@ The diagnostic code is the key in `src/python/messages.json`. Both language serv
 
 These rules follow the [functools](https://docs.python.org/3/library/functools.html), [copy](https://docs.python.org/3/library/copy.html), [re](https://docs.python.org/3/library/re.html), [asyncio task](https://docs.python.org/3/library/asyncio-task.html), and [gc](https://docs.python.org/3/library/gc.html) documentation. The regex rule is limited to literal `re.compile` calls: Python already caches recent patterns passed to `re.match` and related functions. Ordinary `setdefault` grouping, `list.append`/`extend`, and a `__del__` method alone are not treated as leaks; the added rules require a specific extra allocation or back reference. Modern Python generally collects cycles with finalizers, so `gc-cycle-risk` describes delayed cleanup rather than an inevitable leak.
 
+### Evidence strength and fix safety
+
+Severity says how much the pattern costs if the finding is right. Two more values in each diagnostic's `data` say how far to trust it and its advice. They do not change what the editor shows; tools that read the diagnostics can use them.
+
+- `evidence.strength`: `syntactic` means one call or expression decided the finding. `structural` means the rule also checked the code around it in the same file: an enclosing loop, class, `except` block or `async def`, or how a name is bound and used in its scope. Neither is a measurement; `confidence` stays `static` for both.
+- `fix_safety`: the servers apply no edits, so this describes the alternative that the message names. `maybe-incorrect` means a local rewrite of the reported code that usually keeps its behaviour, but can change it in a case the rule cannot see (for example a list that is iterated twice, or elements that cannot be hashed). `manual` means the alternative changes what the code returns, when it runs, or its design, so only the developer can decide.
+
+| Evidence strength | Fix safety | Rules |
+|---|---|---|
+| structural | manual | `cyclic-reference`, `gc-cycle-risk`, `ram-fragmentation.append`, `memory-swell.method-cache`, `memory-swell.deepcopy-loop`, `frame-retention.stored-exception`, `single-thread-stall.cpu-thread` |
+| structural | maybe-incorrect | `ram-fragmentation.no-slots`, `text-inflation.concat`, `memory-swell.list-once`, `memory-swell.recompile-loop`, `memory-swell.setdefault-loop`, `memory-swell.list-extend-loop`, `memory-swell.concat-loop`, `resource-leak.file-handle`, `single-thread-stall.async-blocking`, `single-thread-stall.list-membership` |
+| syntactic | manual | `heap-inflation`, `pointer-chasing`, `memory-swell.unbounded-cache`, `memory-swell.unbounded-queue`, `memory-swell.fork-start-method` |
+| syntactic | maybe-incorrect | `text-inflation.whole-file`, `memory-swell.list-arg`, `memory-swell.list-copy`, `task-retention.asyncio-task` |
+
+The table is `RULE_TRAITS` in `src/python/rules/tables.py`, mirrored in `src/rust/src/tables.rs`. A code that is missing from it reports `syntactic` and `manual`, the weaker claim in both fields.
+
 ### What the newer rules report, and what they leave alone
 
 Each rule reports one pattern with a known cost. Where the source does not show enough to decide, the rule stays quiet.
@@ -86,7 +102,7 @@ Each rule reports one pattern with a known cost. Where the source does not show 
 
 Structure warnings are static candidates. They do not measure target object counts, allocation volume, traversal time or hardware cache misses. Sized messages quote synthetic interpreter probes; those sizes do not describe the target query or class. The object-dtype rule requires explicit dtype evidence because a pandas import or loader can produce compact numeric or extension arrays. It does not infer dtypes from a file or follow subsequent dtype changes across modules.
 
-Every LSP diagnostic includes `data` metadata with its category, severity, `status="potential"`, `confidence="static"`, and source-span syntax evidence. Workload, measured impact and trace artifact are `null` with explicit `unavailable` markers. Static analysis cannot provide runtime evidence from an editor buffer. Both backends use the same metadata contract, and parity tests compare it as well as the message and source range.
+Every LSP diagnostic includes `data` metadata (`schema_version` 2) with its category, severity, `status="potential"`, `confidence="static"`, source-span syntax evidence, and two values that severity alone used to carry: `evidence.strength` and `fix_safety` (see [Evidence strength and fix safety](#evidence-strength-and-fix-safety)). Workload, measured impact and trace artifact are `null` with explicit `unavailable` markers. Static analysis cannot provide runtime evidence from an editor buffer. Both backends use the same metadata contract, and parity tests compare it as well as the message and source range.
 
 A cursor creates Python row objects as it advances, but iteration alone does not retain the whole result. The eager-result warning therefore applies to `fetchall()` only. Cursor iteration or bounded `fetchmany()` is a compatible alternative only when one-pass access meets the program's contract.
 

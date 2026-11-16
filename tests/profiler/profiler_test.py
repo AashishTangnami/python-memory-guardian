@@ -34,6 +34,16 @@ def check(name, cond):
     failures += not cond
     print(("PASS " if cond else "FAIL ") + name)
 
+not_observed = 0
+def unobserved(name, detail):
+    """A line the sampler never saw is neither a pass nor a failure. Report it in the output, in the
+    last line of the script, and on GitHub as a warning on the run page (job logs need a sign-in)."""
+    global not_observed
+    not_observed += 1
+    print(f"NOT OBSERVED {name}: {detail}")
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::warning title=profiler_test not observed::{name}: {detail}")
+
 IDLE_SLEEPS = 40
 def misread_idle_sleeps(baseline):
     """How many idle sleeps of the sampler's 10 ms interval overshoot by half a switch interval more
@@ -72,7 +82,21 @@ if SAMPLED:
             print(f"SKIP L7, L12 GIL split (the timer baseline of {p['sleep_overhead_s'] * 1000:.1f} ms misreads "
                   f"{misread} of {IDLE_SLEEPS} idle sleeps by half a switch interval or more; the split "
                   f"cannot be measured on this host)")
-        check("L16 sorted (holds GIL) -> native", dominant(f["16"]) == "native")
+        # A sampler can only credit a line it sampled: sys._current_frames() needs the GIL, so each
+        # sorted() call yields at most one sample (taken when the call returns), and a starved
+        # sampler thread can get none (a Linux CI run, CPython 3.13: no entry for line 16, KeyError).
+        # A missing entry is reported as "not observed", never as a crash and never as a pass. A
+        # sampler that died is a failure on its own, so it cannot hide behind the same message. The
+        # classification of a held GIL is fixed with scripted clocks in profiler_regression_test.py:
+        # test_gil_holding_call_is_native_from_scripted_timings.
+        check("sampler ran to the end without error", p.get("sampler_error") is None)
+        if "16" in f:
+            check("L16 sorted (holds GIL) -> native", dominant(f["16"]) == "native")
+        else:
+            unobserved("L16 sorted (holds GIL) -> native",
+                       f"no sample landed on line 16 ({p['samples']} samples in {p['wall_s']:.1f} s, "
+                       f"sampler_error={p.get('sampler_error')}); the classification is checked with scripted "
+                       f"timings by test_gil_holding_call_is_native_from_scripted_timings")
     else:
         print(f"SKIP L7, L12, L16 GIL split (timer overshoot {p['sleep_overhead_s'] * 1000:.0f} ms is above "
               f"4 switch intervals; the split cannot be measured on this host)")
@@ -91,7 +115,7 @@ check("temporary(): substantial process RSS growth",
 p, f = run("workload.py", "precise")
 check("L24 LEAK.append flagged as leak, 48 MB held", "leak_runs" in f["24"] and abs(f["24"]["end_mb"] - 48) < 2)
 # sorted()'s copy attribution depends on where the OS lets the sampler in, so it is checked
-# deterministically in profiler_regression_test.py: test_gil_holding_call_result_is_credited_once_to_its_line.
+# deterministically in profiler_regression_test.py: test_gil_holding_call_growth_stays_at_process_level.
 check("L28 temporary(): ~160 MB observed, then freed",
       p['peak_traced_mb'] > 150
       and f["28"]["end_mb"] < 1)
@@ -124,4 +148,6 @@ else:
     skip("function totals use qualified names")
 p, f = run("workload.py", "precise")
 check("workload L24 leak held by global LEAK", [h["holder"] for h in f["24"].get("held_by", [])] == ["global LEAK"])
+if not_observed:
+    print(f"{not_observed} check(s) not observed: the sampler took no sample on those lines in this run")
 sys.exit(1 if failures else 0)

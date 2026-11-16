@@ -55,7 +55,7 @@ Conventions:
 | `rss_start_mb`, `rss_end_mb`, `rss_peak_mb` | number or null | F, P | Process memory (RSS) at the start, end, and highest observation. Null in time-only mode or when the platform reader is unavailable |
 | `peak_traced_mb` | number | P | Highest traced Python memory |
 | `tracemalloc_peak_mb` | number | P | Largest bookkeeping of `tracemalloc` itself. This is profiler memory, not memory of your program |
-| `native_untraced_mb` | number or null | P | Legacy field name for an uncertain process RSS residual: peak RSS less initial RSS, peak traced bytes and tracer bookkeeping. `null` within the uncertainty margin, with lost tracing, or with `--trace-function`. A positive value is not a native allocation measurement and has no allocating Python line |
+| `native_untraced_mb` | number or null | P | Legacy field name for an uncertain process RSS residual: peak RSS less initial RSS, peak traced bytes and tracer bookkeeping. `null` within the uncertainty margin (twice the largest tracer bookkeeping plus the snapshot memory that stayed resident), with lost tracing, or with `--trace-function`. A reported value still includes that snapshot memory. A positive value is not a native allocation measurement and has no allocating Python line |
 | `native_memory` | object | all | `status: "unavailable"`, `reason`, and `rss_residual_mb` (number or null). Native allocation events require a separate allocator backend |
 | `unattributed_peak_mb` | number | P | Memory at the peak snapshot whose traceback has no frame of your code |
 | `snapshots`, `snapshot_cost_s` | integer, number | P | Number of snapshots and their total time. This time is in `wall_s`, but not in the time of any line |

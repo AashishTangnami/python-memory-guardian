@@ -161,6 +161,38 @@ class StaticRegressions(unittest.TestCase):
             for phrase in expected[row[4]][2]:
                 self.assertIn(phrase, row[6])
 
+    def test_every_rule_states_evidence_strength_and_fix_safety(self):
+        # The payload separates three things that severity alone carried: impact (severity), how
+        # much of the surrounding code the rule checked (evidence.strength), and whether the named
+        # alternative keeps behaviour (fix_safety). Every code needs both values in both servers.
+        import re
+        from rules import tables
+        codes = {key for key in json.loads((ROOT / "src/python/messages.json").read_text()) if not key.startswith("_")}
+        self.assertEqual(set(tables.RULE_TRAITS), codes, "one entry per rule code, no more")
+        for strength, safety in tables.RULE_TRAITS.values():
+            self.assertIn(strength, ("syntactic", "structural"))
+            self.assertIn(safety, ("maybe-incorrect", "manual"))
+        rust_rows = re.findall(r'\("([a-z.\-]+)", "(syntactic|structural)", "(maybe-incorrect|manual)"\)',
+                               (ROOT / "src/rust/src/tables.rs").read_text())
+        self.assertEqual({code: (strength, safety) for code, strength, safety in rust_rows}, tables.RULE_TRAITS,
+                         "src/rust/src/tables.rs holds the same table")
+        source = ('def load(cur):\n'
+                  '    rows = cur.fetchall()\n'
+                  '    return rows\n'
+                  'def total(xs):\n'
+                  '    values = [x * 2 for x in xs]\n'
+                  '    return sum(values)\n')
+        rows = parity_test.run(parity_test.SERVERS["python"], self.facts, source)
+        rust = parity_test.run(parity_test.SERVERS["rust"], self.facts, source)
+        record("static_analysis", fixture="rule_traits", source=source, python_rows=rows, rust_rows=rust)
+        self.assertEqual(rows, rust)
+        payloads = {row[4]: json.loads(row[8]) for row in rows}
+        self.assertEqual({code: (data["schema_version"], data["evidence"]["strength"], data["fix_safety"],
+                                 data["confidence"], data["status"])
+                          for code, data in payloads.items()},
+                         {"heap-inflation": (2, "syntactic", "manual", "static", "potential"),
+                          "memory-swell.list-once": (2, "structural", "maybe-incorrect", "static", "potential")})
+
     def test_structure_advice_names_a_concrete_alternative(self):
         concrete = {
             "heap-inflation": ("fetchmany()", "chunksize=N", "iter_batches=True", "fetch_record_batch()"),
