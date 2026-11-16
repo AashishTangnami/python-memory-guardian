@@ -3,12 +3,12 @@
     "module": "commonjs",
     "target": "ES2022",
     "outDir": "out",
-    "rootDir": "src",
+    "rootDir": "src/typescript",
     "lib": ["ES2022"],
     "sourceMap": true,
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true
   },
-  "include": ["src"]
+  "include": ["src/typescript"]
 }

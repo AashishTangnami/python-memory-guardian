@@ -51,12 +51,13 @@ import math
 import os
 import subprocess
 import sys
-import tempfile
 import time
 import tracemalloc
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+
+from _run_output import create_run_output
 
 # Override with the environment or --threads for the measured child processes.
 os.environ.setdefault("POLARS_MAX_THREADS", "4")
@@ -384,7 +385,6 @@ def main():
     parser.add_argument("--row-group-size", type=int, default=50_000)
     parser.add_argument("--columns", choices=["mixed"] + [str(i) for i in range(2, 13)], default="mixed")
     parser.add_argument("--mode", choices=("eager", "lazy", "python", "all"), default="lazy")
-    parser.add_argument("--output", type=Path, default=Path("polars_output"))
     parser.add_argument("--threads", type=int, default=int(os.environ["POLARS_MAX_THREADS"]))
     parser.add_argument("--trace-memory", action="store_true", help="Also trace Python allocations; excludes native buffers")
     parser.add_argument("--in-process", action="store_true", help="Run in the current process for editor profiling; RSS becomes cumulative")
@@ -399,8 +399,7 @@ def main():
             parser.error("workers require run-dir and a single mode")
         worker(args)
         return
-    args.output.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="run-", dir=args.output)).resolve()
+    root = create_run_output(Path(__file__).resolve().parent / "polars_output")
     raw = root / "raw"
     raw.mkdir()
     print(f"Polars {pl.__version__}; output: {root}", flush=True)

@@ -51,12 +51,13 @@ import json
 import math
 import subprocess
 import sys
-import tempfile
 import time
 import tracemalloc
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+
+from _run_output import create_run_output
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -453,7 +454,6 @@ def main():
     parser.add_argument("--json-block-size", type=int, default=1_048_576, help="JSON reader block bytes; individual records must fit")
     parser.add_argument("--columns", choices=["mixed"] + [str(i) for i in range(2, 13)], default="mixed")
     parser.add_argument("--mode", choices=("python", "eager", "streaming", "all"), default="streaming")
-    parser.add_argument("--output", type=Path, default=Path("pyarrow_output"))
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--trace-memory", action="store_true")
     parser.add_argument("--in-process", action="store_true", help="For editor profiling; reported RSS/pool peaks become cumulative")
@@ -471,8 +471,7 @@ def main():
         return
     pa.set_cpu_count(args.threads)
     pa.set_io_thread_count(args.threads)
-    args.output.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="run-", dir=args.output)).resolve()
+    root = create_run_output(Path(__file__).resolve().parent / "pyarrow_output")
     raw = root / "raw"
     raw.mkdir()
     print(f"PyArrow {pa.__version__}; output: {root}", flush=True)

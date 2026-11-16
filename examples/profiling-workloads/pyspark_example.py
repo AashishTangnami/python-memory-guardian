@@ -47,11 +47,12 @@ import hashlib
 import json
 import os
 import sys
-import tempfile
 import time
 import tracemalloc
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from _run_output import create_run_output
 
 from pyspark.sql import SparkSession, functions as F, types as T
 
@@ -323,7 +324,6 @@ def main():
     parser.add_argument("--mode", choices=("native", "python-udf", "both"), default="native")
     parser.add_argument("--raw-dir", type=Path)
     parser.add_argument("--reference-parquet", type=Path)
-    parser.add_argument("--output", type=Path, default=Path("pyspark_output"))
     parser.add_argument("--master", default="local[4]")
     parser.add_argument("--driver-memory", default="2g")
     parser.add_argument("--shuffle-partitions", type=int, default=8)
@@ -339,8 +339,7 @@ def main():
         parser.error("raw-dir must be an existing folder containing page-*.jsonl")
     if args.reference_parquet is not None and not args.reference_parquet.exists():
         parser.error("reference-parquet must exist")
-    args.output.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="run-", dir=args.output)).resolve()
+    root = create_run_output(Path(__file__).resolve().parent / "pyspark_output")
     print(f"Output: {root}", flush=True)
     generation_seconds = None
     if args.raw_dir is None:

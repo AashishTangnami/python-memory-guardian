@@ -6,7 +6,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["format", "generated_at", "generator", "profile", "run", "methods", "totals", "functions", "lines",
-    "memory_stacks", "phases", "retention", "largest_objects", "static_diagnostics", "source", "comparison", "next_steps"],
+    "memory_stacks", "memory_observations", "capabilities", "gc", "diagnostics", "phases", "retention", "largest_objects", "static_diagnostics", "source", "comparison", "next_steps"],
   "properties": {
     "format": { "const": "pmg-summary/1" },
     "generated_at": { "type": "string" },
@@ -34,7 +34,11 @@
           "type": ["object", "null"], "description": "Precise mode traced only while this function ran (--trace-function).",
           "required": ["name", "calls", "traced_s"],
           "properties": { "name": { "type": "string" }, "calls": { "type": "integer" }, "traced_s": { "type": "number" } }
-        }
+        },
+        "command": {"type": ["array", "null"], "items": {"type": "string"}},
+        "cwd": {"type": ["string", "null"]},
+        "process_id": {"type": ["integer", "null"]},
+        "memory_snapshot_at_exit": {"type": ["boolean", "null"]}
       }
     },
     "methods": {
@@ -49,13 +53,14 @@
     },
     "totals": {
       "type": "object",
-      "description": "Run-level values; a value the run's mode does not measure is omitted.",
-      "additionalProperties": { "$ref": "#/$defs/measured" },
+      "description": "Run-level values. Unavailable observations are null; they never become measured zero.",
+      "additionalProperties": { "$ref": "#/$defs/measuredNullable" },
       "properties": {
-        "run_duration_s": { "$ref": "#/$defs/measured" }, "process_cpu_s": { "$ref": "#/$defs/measured" },
-        "peak_traced_mb": { "$ref": "#/$defs/measured" }, "held_at_exit_mb": { "$ref": "#/$defs/measured" },
-        "native_estimate_mb": { "$ref": "#/$defs/measured" }, "rss_peak_mb": { "$ref": "#/$defs/measured" },
-        "unattributed_peak_mb": { "$ref": "#/$defs/measured" }, "tracemalloc_peak_mb": { "$ref": "#/$defs/measured" }
+        "run_duration_s": { "$ref": "#/$defs/measuredNullable" }, "process_cpu_s": { "$ref": "#/$defs/measuredNullable" },
+        "peak_traced_mb": { "$ref": "#/$defs/measuredNullable" }, "held_at_exit_mb": { "$ref": "#/$defs/measuredNullable" },
+        "native_estimate_mb": { "$ref": "#/$defs/measuredNullable", "description": "Legacy field name. Positive process RSS residual, uncertain; not measured native allocations." }, "rss_peak_mb": { "$ref": "#/$defs/measuredNullable" },
+        "unattributed_peak_mb": { "$ref": "#/$defs/measuredNullable" }, "tracemalloc_peak_mb": { "$ref": "#/$defs/measuredNullable" },
+        "held_at_last_snapshot_mb": {"$ref": "#/$defs/measuredNullable"}
       }
     },
     "functions": {
@@ -68,8 +73,8 @@
           "end_line": { "type": ["integer", "null"] }, "samples": { "type": "integer", "minimum": 0 },
           "time_s": { "type": "number" }, "share": { "type": "number" },
           "python_s": { "type": "number" }, "native_s": { "type": "number" }, "system_s": { "type": "number" },
-          "allocated_mb": { "type": "number" }, "held_at_peak_mb": { "type": "number" }, "spike_mb": { "type": "number" },
-          "native_estimate_mb": { "type": "number" }, "rss_growth_mb": { "type": "number" }
+          "allocated_mb": { "type": "null" }, "held_at_peak_mb": { "type": ["number", "null"] }, "spike_mb": { "type": "null" },
+          "native_estimate_mb": { "type": "null" }, "rss_growth_mb": { "type": "null" }
         }
       }
     },
@@ -80,19 +85,21 @@
         "properties": {
           "file": { "type": "string" }, "line": { "type": "integer" }, "scope": { "type": ["string", "null"] },
           "samples": { "type": "integer", "minimum": 0 }, "time_s": { "type": "number" }, "share": { "type": "number" },
-          "allocated_mb": { "type": "number" }, "held_at_peak_mb": { "type": "number" }, "spike_mb": { "type": "number" },
-          "native_estimate_mb": { "type": "number" }, "rss_growth_mb": { "type": "number" },
-          "suspected_leak": { "const": true }, "held_at_exit_mb": { "type": "number" }, "line_events": { "type": "integer" }
+          "allocated_mb": { "type": "null" }, "held_at_peak_mb": { "type": ["number", "null"] }, "spike_mb": { "type": "null" },
+          "native_estimate_mb": { "type": "null" }, "rss_growth_mb": { "type": "null" },
+          "suspected_leak": { "const": true }, "held_at_exit_mb": { "type": ["number", "null"] }, "line_events": { "type": "integer" }
         }
       }
     },
     "memory_stacks": {
       "type": ["object", "null"], "description": "Precise mode only.",
-      "required": ["method", "limits", "peak", "exit"],
+      "required": ["method", "limits", "peak", "exit", "last_snapshot", "snapshot_at_exit"],
       "properties": {
         "method": { "type": "string" }, "limits": { "$ref": "#/$defs/limits" },
         "peak": { "anyOf": [{ "$ref": "#/$defs/stackTable" }, { "type": "null" }] },
-        "exit": { "$ref": "#/$defs/stackTable" }
+        "exit": {"anyOf": [{"$ref": "#/$defs/stackTable"}, {"type": "null"}]},
+        "last_snapshot": {"$ref": "#/$defs/stackTable"},
+        "snapshot_at_exit": {"type": "boolean"}
       }
     },
     "phases": {
@@ -126,8 +133,17 @@
             "properties": {
               "file": { "type": "string" }, "line": { "type": "integer" }, "scope": { "type": "string" },
               "status": { "enum": ["growing", "retained", "released"] },
-              "held_at_exit_mb": { "type": "number" }, "largest_snapshot_mb": { "type": "number" },
-              "evidence": { "$ref": "#/$defs/strings" }, "holders": { "$ref": "#/$defs/strings" }, "recommendations": { "$ref": "#/$defs/strings" }
+              "held_at_exit_mb": { "type": ["number", "null"] }, "largest_snapshot_mb": { "type": "number" },
+              "evidence": { "$ref": "#/$defs/strings" }, "holders": { "$ref": "#/$defs/strings" }, "recommendations": { "$ref": "#/$defs/strings" },
+              "held_at_last_snapshot_mb": {"type": "number"},
+              "snapshot_at_exit": {"type": "boolean"},
+              "category": {"const": "retention"},
+              "severity": {"enum": ["warning", "information"]},
+              "confidence": {"enum": ["medium", "high"]},
+              "evidence_status": {"const": "measured"},
+              "source": {"type": "object"},
+              "workload": {"type": "object"},
+              "reproduction": {"type": "object"}
             }
           }
         }
@@ -203,7 +219,63 @@
         }
       }
     },
-    "next_steps": { "$ref": "#/$defs/strings" }
+    "next_steps": { "$ref": "#/$defs/strings" },
+    "memory_observations": {
+      "type": ["array", "null"],
+      "description": "Bounded process observations. They have no allocating source or thread identity.",
+      "items": {
+        "type": "object",
+        "required": ["t", "traced_bytes", "traced_growth_bytes", "transient_bytes", "rss_bytes", "rss_change_bytes", "bookkeeping_bytes"],
+        "properties": {
+          "t": {"type": "number"},
+          "traced_bytes": {"type": ["number", "null"]},
+          "traced_growth_bytes": {"type": ["number", "null"]},
+          "transient_bytes": {"type": ["number", "null"]},
+          "rss_bytes": {"type": ["number", "null"]},
+          "rss_change_bytes": {"type": ["number", "null"]},
+          "bookkeeping_bytes": {"type": ["number", "null"]}
+        }
+      }
+    },
+    "capabilities": {"type": "object", "additionalProperties": {"$ref": "#/$defs/capability"}},
+    "gc": {
+      "type": ["object", "null"],
+      "required": ["method", "limits", "supported", "events", "dropped_events", "total_collections", "total_pause_s", "collected", "uncollectable"],
+      "properties": {
+        "method": {"type": "string"},
+        "limits": {"$ref": "#/$defs/limits"},
+        "supported": {"const": true},
+        "events": {"type": "array", "items": {"type": "object"}},
+        "dropped_events": {"type": "integer"},
+        "total_collections": {"type": "integer"},
+        "total_pause_s": {"type": "number"},
+        "collected": {"type": "integer"},
+        "uncollectable": {"type": "integer"}
+      }
+    },
+    "diagnostics": {
+      "type": ["object", "null"],
+      "description": "Cooperative diagnostic event trace and findings. The profile parser validates its event and finding contract.",
+      "required": ["schema", "instrumentation", "trace_path", "events", "findings", "dropped_events", "scan_limits", "capabilities"],
+      "properties": {
+        "schema": {"const": 1},
+        "instrumentation": {"const": "cooperative"},
+        "trace_path": {"type": ["string", "null"]},
+        "events": {"type": "array", "items": {"type": "object"}},
+        "findings": {"type": "array", "items": {"type": "object"}},
+        "dropped_events": {"type": "integer"},
+        "scan_limits": {"type": "object"},
+        "capabilities": {"type": "object", "additionalProperties": {"$ref": "#/$defs/capability"}}
+      }
+    },
+    "memory_guard": {
+      "type": ["object", "null"],
+      "description": "External budget policy, observed RSS pressure and stop reason. Includes profiler memory. A guard stop is not an OOM/leak finding; polling may overshoot."
+    },
+    "allocation_backend": {
+      "type": ["object", "null"],
+      "description": "Validated allocator request capture, distinct from object counts, RSS and leak evidence."
+    }
   },
   "$defs": {
     "strings": { "type": "array", "items": { "type": "string" } },
@@ -240,6 +312,12 @@
             "properties": { "mb": { "type": "number" }, "truncated": { "type": "boolean" }, "frames": { "$ref": "#/$defs/strings" } } }
         }
       }
+    },
+    "measuredNullable": {"anyOf": [{"$ref": "#/$defs/measured"}, {"type": "null"}]},
+    "capability": {
+      "type": "object",
+      "required": ["status", "reason"],
+      "properties": {"status": {"enum": ["supported", "partial", "unavailable"]}, "reason": {"type": "string"}}
     }
   }
 }

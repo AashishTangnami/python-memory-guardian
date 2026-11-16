@@ -11,7 +11,7 @@ locally: no HTTP server, credentials, network access, or third-party packages.
 Raw records have 2..12 fields (mixed by default). Pages are persisted as JSONL,
 then read, validated, normalized to a fixed 12-field schema, serialized, and
 compressed into .jsonl.gz shards. schema.json documents the output contract.
-Each run uses a new directory beneath --output, so existing runs are preserved.
+Each run writes under pipeline_output/ beside this script and deletes its data on exit.
 
 Generators bound retained data; several generator frames, the current API page,
 JSON decoding temporaries, and I/O/compression buffers can still coexist.
@@ -44,6 +44,8 @@ import tracemalloc
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+
+from _run_output import create_run_output
 
 N = 2_000_000
 
@@ -430,14 +432,12 @@ def main():
     parser.add_argument("--rows-per-file", type=int, default=50_000)
     parser.add_argument("--columns", choices=["mixed"] + [str(n) for n in range(2, 13)], default="mixed")
     parser.add_argument("--mode", choices=("streaming", "eager", "both"), default="streaming")
-    parser.add_argument("--output", type=Path, default=Path("pipeline_output"))
     parser.add_argument("--trace-memory", action="store_true", help="Measure Python allocation peaks; adds overhead")
     parser.add_argument("--basics", action="store_true", help="Also run the original list/generator examples")
     args = parser.parse_args()
     if args.records < 0 or args.page_size < 1 or args.rows_per_file < 1:
         parser.error("records must be >= 0; page-size and rows-per-file must be >= 1")
-    args.output.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="run-", dir=args.output)).resolve()
+    root = create_run_output(Path(__file__).resolve().parent / "pipeline_output")
     print(f"Output: {root}", flush=True)
     if args.basics:
         run_basics(args.records, args.trace_memory)

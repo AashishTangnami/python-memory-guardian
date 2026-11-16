@@ -30,7 +30,7 @@ If no diagnostics appear, open **View → Output**, select **Python Memory Guard
 
 ## 4. Run a profile
 
-Save a Python file that can run as a script. Click the pulse icon in the editor title bar or run **Python Memory Guardian: Profile Current File**. Choose **fast** to measure time, or **precise** to find which code keeps memory ([all modes](02-using-the-extension.md#profile-a-script)), then enter the script's arguments, if any.
+Save a Python file that can run as a script. Click the pulse icon in the editor title bar or run **Python Memory Guardian: Profile Current File**. Choose **fast** to measure time, or **precise** to find which code keeps memory ([all modes](02-using-the-extension.md#profile-a-script)). The script runs with no arguments; use **Profile Current File with Arguments...** when it needs some.
 
 The script runs in a VS Code terminal. After it finishes, the report opens and measured lines receive inline labels. The profile is written to `.pmg/profile.json` in the project folder. Add `.pmg/` to `.gitignore` if you do not want to commit profiles.
 
