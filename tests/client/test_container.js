@@ -26,6 +26,13 @@ const cmd = c.containerCommand({ execPrefix: ["docker", "compose", "exec", "-T",
                                "/app/.pmg/pmg_profile.py", ["--out", "/app/.pmg/profile.json"]);
 assert.deepStrictEqual([cmd.command, ...cmd.args],
   ["docker", "compose", "exec", "-T", "app", "python3", "/app/.pmg/pmg_profile.py", "--out", "/app/.pmg/profile.json"]);
+// Round trip on a Windows host, with the key a Windows Python writes for the script (os.path.abspath: backslashes).
+{ const hostW = "D:\\a\\_temp\\pmg-ctr\\host-project", aliasW = "D:\\a\\_temp\\pmg-ctr\\app";
+  const mp = c.resolveMappings([{ local: "${workspaceFolder}", container: aliasW }], hostW);
+  assert.strictEqual(c.toContainer(hostW + "\\service.py", mp, true), "D:/a/_temp/pmg-ctr/app/service.py");
+  assert.strictEqual(c.toLocal(aliasW + "\\service.py", mp, true), hostW + "\\service.py", "Windows host rules give back the host file");
+  assert.strictEqual(c.toLocal(aliasW + "\\service.py", mp, false), "D:/a/_temp/pmg-ctr/host-project/service.py",
+    "POSIX host rules keep forward slashes: not the host file on Windows"); }
 console.log("PASS path rules (Windows host, longest match, boundaries, unmapped, argv)");
 
 { const original = { script: '/app/main.py', files: {},
@@ -64,7 +71,9 @@ const cfg = { execPrefix: docker
 const extension = { asAbsolutePath: (p) => path.join(__dirname, "..", "..", p) };
 stageHelper(extension, host, "probe.py");
 stageProfiler(extension, host);
-const toC = (p) => c.toContainer(p, cfg.mappings, false);
+// Host rules as the extension applies them: on a Windows host local paths compare without case and come
+// back with backslashes. Forcing POSIX rules here returned D:/... for a host file that is D:\... there.
+const toC = (p) => c.toContainer(p, cfg.mappings);
 
 const probe = c.containerCommand(cfg, toC(path.join(host, ".pmg", "probe.py")), []);
 const pr = spawnSync(probe.command, probe.args, { encoding: "utf8" });
@@ -83,7 +92,7 @@ const r = spawnSync(run.command, run.args, { encoding: "utf8" });
 assert.strictEqual(r.status, 0, failed("profile run", run, r));
 const raw = m.parseProfile(fs.readFileSync(out, "utf8"));
 assert(Object.keys(raw.files).every((k) => k.startsWith(alias)), "profile is written with container paths");
-const p = c.remapProfileKeys(raw, (k) => c.toLocal(k, cfg.mappings, false));
+const p = c.remapProfileKeys(raw, (k) => c.toLocal(k, cfg.mappings));
 const idx = new m.ProfileIndex(p);
 const hostFile = path.join(host, "service.py");
 assert.strictEqual(idx.state(hostFile, fs.readFileSync(hostFile, "utf8")), "fresh", "remapped to the host file");

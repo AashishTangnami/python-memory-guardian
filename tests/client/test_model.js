@@ -22,7 +22,9 @@ for (const mode of ["fast", "precise"]) {
   const idx = new m.ProfileIndex(p);
   const file = WL;
   assert.strictEqual(idx.state(file, src), "fresh");
-  assert.strictEqual(idx.state(file, src.replace(/\n/g, "\r\n")), "fresh", "CRLF-insensitive");
+  // \r?\n: a Windows checkout already has CRLF, and \n alone would turn it into \r\r\n.
+  assert.strictEqual(idx.state(file, src.replace(/\r?\n/g, "\r\n")), "fresh", "CRLF-insensitive");
+  assert.strictEqual(idx.state(file, src.replace(/\r\n/g, "\n")), "fresh", "and LF when the checkout has CRLF");
   assert.strictEqual(idx.state(file, src + "\n# edit"), "stale", "edits invalidate");
   assert.strictEqual(idx.state("/elsewhere.py", src), "absent");
   const invalidated = new m.ProfileIndex({ ...p, file_hashes: {} });
@@ -33,7 +35,7 @@ for (const mode of ["fast", "precise"]) {
     const e = idx.line(file, ln), h = m.heat(e, p.memory_mode, th, idx.insideSampledFunction(file, ln));
     console.log(`L${ln} [${h.padEnd(7)}] ${e ? m.lineLabel(e, p) : "(no data)"}`);
   }
-  const f = Object.values(idx.functions.get(file)).find(f => f.name === "temporary");
+  const f = Object.values(idx.functions.get(m.normPath(file))).find(f => f.name === "temporary");   // the index keys are normalised (Windows: lower case, forward slashes)
   if (f) console.log("func:", m.funcLabel(f, p));
 }
 // severity rules
@@ -84,6 +86,11 @@ for (const e of [undefined, { samples: 0, line_events: 0, rss_growth_mb: 0 }])
   assert(m.parseProfile(JSON.stringify(older)), "older profiles without stack_sampling are accepted");
   assert.strictEqual(m.parseProfile(JSON.stringify({ ...p, stack_sampling: { active: "no", reason: null } })), undefined, "non-boolean active is rejected"); }
 assert.strictEqual(m.normPath("C:\\Proj\\a.py", "win32"), m.normPath("c:/proj/A.py", "win32"));
+{ // On Windows the index keys are lower case with forward slashes, so a raw path is not a key of its maps.
+  const winIdx = new m.ProfileIndex({ files: { "C:\\Proj\\Work.py": { 3: {} } }, functions: { "C:\\Proj\\Work.py": { 1: { name: "f" } } }, file_hashes: {} }, "win32");
+  assert(winIdx.has("c:/proj/work.py", "win32") && winIdx.line("C:/PROJ/Work.py", 3, "win32"), "lookups normalise the path");
+  assert.strictEqual(winIdx.functions.get(m.normPath("C:\\Proj\\Work.py", "win32"))[1].name, "f");
+  assert.strictEqual(winIdx.functions.get("C:\\Proj\\Work.py"), undefined, "the maps need normPath"); }
 const pp = m.parseProfile(fs.readFileSync(require("path").join(__dirname, "../profiler/out/workload_precise.json"), "utf8"));
 console.log("leak msg:", m.leakMessage(new m.ProfileIndex(pp).line(WL, 24)).slice(0, 120) + "…");
 { const p = m.parseProfile(fs.readFileSync(require("path").join(__dirname, "../profiler/out/workload_fast.json"), "utf8")), idx = new m.ProfileIndex(p);

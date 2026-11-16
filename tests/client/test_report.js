@@ -73,7 +73,7 @@ for (const t of [capped])
   for (const n of t.nodes) assert.strictEqual(n.value, n.self + n.omitted + n.children.reduce((sum, id) => sum + t.nodes[id].value, 0), 'value = self + omitted + children');
 const recursive = structuredClone(p); recursive.stacks.samples[0].frames = [0, 1, 1, 3];
 assert.strictEqual(named(callTree(recursive, 'python'), 'left').length, 2);
-const mapped = remapProfileKeys(p, s => toLocal(s, [{ local: '/host', container: '/app' }]));
+const mapped = remapProfileKeys(p, s => toLocal(s, [{ local: '/host', container: '/app' }], false));   // a POSIX host, also when the test runs on Windows
 assert.strictEqual(mapped.stacks.frames[0].file, '/host/work.py');
 const old = { ...p, schema: 2 }; delete old.stacks;
 assert(m.parseProfile(JSON.stringify(old)), 'existing reports remain readable');

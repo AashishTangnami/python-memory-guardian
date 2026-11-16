@@ -52,7 +52,7 @@ The analyzer can confirm a **logical lost update** only when two different actor
 
 `critical_section(lock, key)` acquires the supplied lock and releases it on exit. It records actual lock identity. `async_critical_section(lock, key)` does the same for `asyncio.Lock`. The whole read-modify-write sequence must lie inside the context. Locks that cover only a read or only a write do not protect the full operation.
 
-Events distinguish threads from asynchronous tasks. Process workers must use `actor("process", identity)`, start their own recorder and save a distinct trace path. `merge_traces(paths, workload=None)` analyzes parent and child traces together. Merge only traces from the same host: their timestamps use the host monotonic clock. The merged findings identify every source trace. The profiler does not automatically instrument child processes.
+Events distinguish threads from asynchronous tasks. Process workers must use `actor("process", identity)`, start their own recorder and save a distinct trace path. `merge_traces(paths, workload=None)` analyzes parent and child traces together. Merge only traces from the same host: `timestamp_s` is on a clock that all processes on that host share. On Python 3.9 on Windows and macOS, where `time.perf_counter()` starts near zero in each process, the recorder adds the offset to the host counter once at import. The merged findings identify every source trace. The profiler does not automatically instrument child processes.
 
 ## Validation and limits
 

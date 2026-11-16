@@ -102,7 +102,9 @@ PMG_REQUIRE_RUST=1 npm run test:parity
 The [acceptance validation suite](acceptance-validation.md) adds independent positive and corrected-negative witnesses for memory, GC, structure costs and concurrent conflicts. It preserves commands, outputs and profile artifacts, separates unsupported observations from passes, and measures runtime and peak RSS against a baseline with budgets set before the run. These fixtures assess measurement limits as well as rule recognition; they do not add capabilities to PMG. Each run writes its report, with the recorded environment and results, to `.validation/` (local, not tracked by git).
 
 A failing check in `profiler_test.py` stops the later JavaScript tests, because `npm test` chains them with `&&` (CI runs each suite as its own step).
-`profiler_test.py` checks the off-CPU lines of `workload.py` against the wall time that the fixture measures for its own sleeping calls (`PMG_WORKLOAD_WALL`), because a CI host can oversleep. It skips the python/native split checks when the measured timer overshoot (`sleep_overhead_s`) is above four switch intervals, because the GIL signal is then smaller than the timer jitter.
+`profiler_test.py` checks the off-CPU lines of `workload.py` against the wall time that the fixture measures for its own sleeping calls (`PMG_WORKLOAD_WALL`), because a CI host can oversleep. It skips the python/native split checks when the measured timer overshoot (`sleep_overhead_s`) is above four switch intervals, because the GIL signal is then smaller than the timer jitter. Below that limit it takes 40 idle 10 ms sleeps and skips the checks for lines 7 and 12 when 10 or more of them differ from that overshoot by half a switch interval or more: a coarse timer can produce a low baseline by chance (at utility priority on macOS, 11 of 24 runs, with a wrong split in 8). The `sorted()` check on line 16 still runs, because that call holds the GIL for 250 ms or more. The stack test in `profiler_regression_test.py` gives each call path a 0.4 s sleep, so that a sampler slowed by 40–108 ms of timer overshoot still records every path.
+
+`profiler_test.py` writes the profiles in `tests/profiler/out/` that `test_model.js` and `test_summary.js` read, so a crash in it shows as three failed steps. Client tests also run on Windows, with CRLF sources and backslash paths: pass the host type to `toLocal` and `toContainer` explicitly when a test fixes it, and look up `ProfileIndex` maps through `normPath`.
 
 ## Change a static rule
 
@@ -113,6 +115,7 @@ The Python and Rust servers must produce the same diagnostic code, range, severi
 3. Mirror it in the module of the same name in `src/rust/src/` (tree-sitter). To check node shapes, install the optional development tools (see [Install and build](#install-and-build)) and print the parse tree; don't guess them.
 4. Add positive **and** negative cases to a fixture in `tests/fixtures/static/`, marked with `# expect: <code>`.
 5. Run `npm run build:rust && PMG_REQUIRE_RUST=1 npm run test:parity`. Both servers must produce the same output.
+6. Run `npm run lint:python`. The fixtures are only parsed, never run, so the tests pass on a case that reads a name before it is assigned (`total = total + x` with no earlier `total`), but Ruff rejects it as an undefined name and `npm run lint` fails on every CI runner. Pass such a name in as a function parameter.
 
 The [rules reference](06-rules.md) lists the current codes. Runtime profiling lives separately in `src/python/pmg_profile.py` and `src/python/pmg_profiler/`.
 

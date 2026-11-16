@@ -30,6 +30,47 @@ _actor_override = contextvars.ContextVar('pmg_diagnostic_actor', default=None)
 _critical = contextvars.ContextVar('pmg_diagnostic_critical', default=())
 
 
+def _host_clock_offset():
+    """Seconds to add to time.perf_counter() so that every process on this host shares one time base.
+
+    merge_traces orders the events of several processes by timestamp_s. Before Python 3.10,
+    perf_counter starts near zero in each process on Windows and macOS (docs.python.org, time: "Changed
+    in version 3.10: On Windows, the function is now system-wide"; macOS uses the monotonic clock, with
+    the same note). Two workers' events were then ordered by how long each process had been running, and
+    a real lost update between processes was reported as 'potential' in about 1 run in 12 (3.9, macOS).
+    The offset is zero where perf_counter is already shared, and when the host clock cannot be read.
+    """
+    if sys.version_info >= (3, 10) or sys.platform not in ('win32', 'darwin'):
+        return 0.0
+    try:
+        if sys.platform == 'darwin':
+            def host():
+                return time.clock_gettime(time.CLOCK_UPTIME_RAW)   # mach_absolute_time, as perf_counter
+        else:
+            import ctypes
+            kernel = ctypes.WinDLL('kernel32')
+            ticks, frequency = ctypes.c_longlong(), ctypes.c_longlong()
+            if not kernel.QueryPerformanceFrequency(ctypes.byref(frequency)) or frequency.value <= 0:
+                return 0.0
+
+            def host():
+                kernel.QueryPerformanceCounter(ctypes.byref(ticks))  # the counter perf_counter reads
+                return ticks.value / frequency.value
+        best = None
+        for _ in range(5):                    # keep the reading that the two perf_counter calls bracket tightest
+            before = time.perf_counter()
+            value = host()
+            after = time.perf_counter()
+            if best is None or after - before < best[0]:
+                best = (after - before, value - (before + after) / 2)
+        return best[1]
+    except Exception:
+        return 0.0
+
+
+_HOST_CLOCK_OFFSET = _host_clock_offset()
+
+
 def _create_fresh(path):
     """Open a new file at `path` for writing, never through a link planted there (for example in a cloned
     repository). An existing file or link at `path` is removed first, so an existing trace is still replaced;
@@ -242,7 +283,7 @@ class Recorder:
         with self._lock:
             self._counter += 1
             event = {'id': str(os.getpid()) + ':' + str(self._counter),
-                     'timestamp_s': timestamp, 'elapsed_s': timestamp - self._started,
+                     'timestamp_s': timestamp + _HOST_CLOCK_OFFSET, 'elapsed_s': timestamp - self._started,
                      't': timestamp - self._started,
                      **identity, 'source': source, 'stack': stack,
                      'category': category, 'payload': payload}

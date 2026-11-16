@@ -274,7 +274,7 @@ def grow_arrays(rows, state):
     return values
 
 
-def build_once(chunks):
+def build_once(chunks, stacked, joined):
     parts = []
     second = None
     for chunk in chunks:

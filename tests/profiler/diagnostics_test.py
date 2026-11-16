@@ -14,6 +14,7 @@ import sys
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import weakref
 
@@ -47,6 +48,32 @@ class TraceFileSafety(unittest.TestCase):
             recorder = diagnostics.Recorder(trace_path=str(trace))   # an existing trace is still replaced
             recorder.close()
             self.assertNotIn('workload', trace.read_text())
+
+
+def clock_worker(trace_path, lead_in_s):
+    """Spawned process: live for lead_in_s, then save one event."""
+    time.sleep(lead_in_s)
+    recorder = diagnostics.Recorder(trace_path=trace_path)
+    recorder.event('workload', {'order': os.path.basename(trace_path)})
+    recorder.close()
+
+
+class TraceClock(unittest.TestCase):
+    def test_merged_traces_keep_real_order_across_processes(self):
+        # Before Python 3.10, time.perf_counter() starts near zero in each process on Windows and macOS.
+        # The first worker lives 0.3 s before its event; the second starts after the first has exited and
+        # saves its event at once. A per-process clock puts the second event first.
+        context = multiprocessing.get_context('spawn')
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = [str(Path(tmp) / name) for name in ('first.jsonl', 'second.jsonl')]
+            for path, lead_in_s in zip(paths, (.3, 0)):
+                worker = context.Process(target=clock_worker, args=(path, lead_in_s))
+                worker.start()
+                worker.join(timeout=20)
+                self.assertEqual(worker.exitcode, 0)
+            merged = diagnostics.merge_traces(reversed(paths))
+            self.assertEqual([event['payload']['order'] for event in merged['events']],
+                             ['first.jsonl', 'second.jsonl'])
 
 
 class OwnerGraphContracts(unittest.TestCase):

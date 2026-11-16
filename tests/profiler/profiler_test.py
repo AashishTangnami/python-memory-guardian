@@ -1,5 +1,5 @@
 """Validate pmg_profile.py against workloads whose correct answers are known."""
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROF = os.path.join(HERE, "..", "..", "src", "python", "pmg_profile.py")
@@ -34,6 +34,17 @@ def check(name, cond):
     failures += not cond
     print(("PASS " if cond else "FAIL ") + name)
 
+IDLE_SLEEPS = 40
+def misread_idle_sleeps(baseline):
+    """How many idle sleeps of the sampler's 10 ms interval overshoot by half a switch interval more
+    or less than `baseline`, the overshoot the profiler measured at its start."""
+    limit, misread = 0.5 * sys.getswitchinterval(), 0
+    for _ in range(IDLE_SLEEPS):
+        start = time.perf_counter()
+        time.sleep(0.01)
+        misread += abs(time.perf_counter() - start - 0.01 - baseline) >= limit
+    return misread
+
 def skip(*names):
     for name in names:
         print("SKIP " + name + " (free-threaded build: no sampled time per line)")
@@ -45,8 +56,22 @@ if SAMPLED:
     # that baseline is several switch intervals, its jitter is larger than the signal, so the
     # python/native split is not checked on that host (macos-latest runners: 40-65 ms).
     if p["sleep_overhead_s"] <= 4 * sys.getswitchinterval():
-        check("L7  pure-Python loop -> python", dominant(f["7"]) == "python")
-        check("L12 hashlib (releases GIL) -> native", dominant(f["12"]) == "native")
+        # A baseline under that limit can still be a low draw from a coarse timer: at utility priority
+        # on macOS, idle overshoot ranged 0.2-40 ms, the 3-sleep baseline was under the limit in 11 of
+        # 24 runs, and line 7 or 12 was misreported in 8 of those. A pure-Python sample waits about one
+        # switch interval for the GIL and a GIL-free one does not wait, so a timer error of half an
+        # interval moves a sample into another class. Lines 7 and 12 are checked only when the baseline
+        # reads idle sleeps correctly (measured: 0 of 40 misread in 21 desktop runs, 29-40 of 40 on such
+        # a timer). sorted() holds the GIL for 250 ms or more, far above that error (native in 24 of 24
+        # runs on that timer), so line 16 is still checked.
+        misread = misread_idle_sleeps(p["sleep_overhead_s"])
+        if misread < IDLE_SLEEPS // 4:
+            check("L7  pure-Python loop -> python", dominant(f["7"]) == "python")
+            check("L12 hashlib (releases GIL) -> native", dominant(f["12"]) == "native")
+        else:
+            print(f"SKIP L7, L12 GIL split (the timer baseline of {p['sleep_overhead_s'] * 1000:.1f} ms misreads "
+                  f"{misread} of {IDLE_SLEEPS} idle sleeps by half a switch interval or more; the split "
+                  f"cannot be measured on this host)")
         check("L16 sorted (holds GIL) -> native", dominant(f["16"]) == "native")
     else:
         print(f"SKIP L7, L12, L16 GIL split (timer overshoot {p['sleep_overhead_s'] * 1000:.0f} ms is above "
@@ -58,7 +83,10 @@ if SAMPLED:
     check("fast memory has no invented per-function attribution", 'rss_growth_mb' not in fn['temporary'])
 else:
     skip("L7, L12, L16, L19, L25 time split", "fast memory has no invented per-function attribution")
-check("temporary(): substantial process RSS growth", p['rss_peak_mb'] - p['rss_start_mb'] > 80)
+# Without an RSS reader both values are None: report that as a failed check, not as a TypeError that
+# ends the script before the later runs write the profiles that the client tests read.
+check("temporary(): substantial process RSS growth",
+      p["rss_kind"] is not None and p['rss_peak_mb'] - p['rss_start_mb'] > 80)
 
 p, f = run("workload.py", "precise")
 check("L24 LEAK.append flagged as leak, 48 MB held", "leak_runs" in f["24"] and abs(f["24"]["end_mb"] - 48) < 2)

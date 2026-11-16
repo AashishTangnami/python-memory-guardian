@@ -913,8 +913,12 @@ class ProfileRegressions(unittest.TestCase):
     @needs_stacks
     def test_stacks_preserve_call_paths_and_full_function_extent(self):
         with tempfile.TemporaryDirectory() as tmp:
+            # Each call path must last several sampler periods. A period is the 10 ms interval plus
+            # the host's timer overshoot: 2.5 ms on a desktop, but 40-90 ms on macOS CI runners and
+            # 70-108 ms at background priority, where a 0.08 s sleep fell between two samples in
+            # 2 of 10 runs and its call path was never recorded.
             script, report = self.run_script(Path(tmp),
-                'import time\ndef leaf():\n    time.sleep(.08)\n    return 42\n'
+                'import time\ndef leaf():\n    time.sleep(.4)\n    return 42\n'
                 'def left():\n    leaf()\ndef right():\n    leaf()\nleft()\nright()\n')
             frames = report['stacks']['frames']
             paths = [[frames[i]['name'] for i in row['frames']] for row in report['stacks']['samples']]

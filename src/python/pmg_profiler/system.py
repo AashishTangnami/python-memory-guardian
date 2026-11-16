@@ -41,7 +41,12 @@ def make_rss_reader():
             pmc.cb = ctypes.sizeof(PMC)
 
             def windows():
-                psapi.GetProcessMemoryInfo(proc, ctypes.byref(pmc), pmc.cb)
+                # The handle goes in typed: GetCurrentProcess returns the pseudo-handle as the integer
+                # 2**64 - 1, and ctypes converts an untyped integer through a C long (32 bits on
+                # Windows), which raised "int too long to convert" and left the profile with no RSS.
+                # No argtypes on this shared function object: guard.py sets its own there.
+                if not psapi.GetProcessMemoryInfo(wintypes.HANDLE(proc), ctypes.byref(pmc), pmc.cb):
+                    raise OSError("GetProcessMemoryInfo failed")
                 return int(pmc.WorkingSetSize)
             windows()
             return windows, "current"
