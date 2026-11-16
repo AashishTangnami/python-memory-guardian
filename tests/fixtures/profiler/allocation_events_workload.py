@@ -73,7 +73,7 @@ def threads(count, size, fixed):
 
 
 def unhooked_native(count, size, fixed):
-    libc = ctypes.CDLL(None)
+    libc = ctypes.cdll.msvcrt if sys.platform == "win32" else ctypes.CDLL(None)   # CDLL(None) is POSIX-only
     libc.malloc.argtypes = [ctypes.c_size_t]
     libc.malloc.restype = ctypes.c_void_p
     libc.free.argtypes = [ctypes.c_void_p]

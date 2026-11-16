@@ -14,6 +14,28 @@ use crate::threads::*;
 pub(crate) const W: DiagnosticSeverity = DiagnosticSeverity::WARNING;
 pub(crate) const I: DiagnosticSeverity = DiagnosticSeverity::INFORMATION;
 
+/// `lru_cache(None)` / `lru_cache(maxsize=None)` (= rules/visitor.py `_maxsize_none`).
+fn maxsize_none(args: &[Node], kws: &[Node], src: &[u8]) -> bool {
+    args.first().is_some_and(|a| a.kind() == "none")
+        || kwarg(kws, "maxsize", src).is_some_and(|v| v.kind() == "none")
+}
+
+/// `Queue()` / `Queue(0)` / `Queue(maxsize=0)` (= rules/visitor.py `_maxsize_zero`).
+fn maxsize_zero(args: &[Node], kws: &[Node], src: &[u8]) -> bool {
+    if args.iter().any(|a| matches!(a.kind(), "list_splat" | "dictionary_splat")) {
+        return false;
+    }
+    match args.first().copied().or_else(|| kwarg(kws, "maxsize", src)) {
+        Some(size) => is_zero_literal(size, src),
+        None => true,
+    }
+}
+
+/// `set_start_method("fork")` / `get_context(method="fork")` (= rules/visitor.py `_names_fork`).
+fn names_fork(args: &[Node], kws: &[Node], src: &[u8]) -> bool {
+    args.first().copied().or_else(|| kwarg(kws, "method", src)).is_some_and(|m| is_str_literal(m, src, "fork"))
+}
+
 // ---------------------------------------------------------------- pass 2: visitor
 pub(crate) struct Finding {
     pub(crate) start: Point,
@@ -215,6 +237,10 @@ impl<'t, 's> Visitor<'t, 's> {
                 }
                 self.children(n);
             }
+            "except_clause" => {
+                self.check_stored_exception(n);
+                self.children(n);
+            }
             "augmented_assignment" => {
                 let plus = field(n, "operator").is_some_and(|o| txt(o, src) == "+=");
                 if self.loop_depth > 0 && plus {
@@ -265,6 +291,44 @@ impl<'t, 's> Visitor<'t, 's> {
         }
     }
 
+    /// `self.err = e` / `d[k] = e` / `errors.append(e)` inside `except ... as e` (= rules/visitor.py
+    /// `_check_stored_exception`). A nested `except ... as` block is left to its own check, so every node
+    /// is searched once.
+    fn check_stored_exception(&mut self, clause: Node<'t>) {
+        let src = self.src;
+        let body = named_children(clause).into_iter().find(|c| c.kind() == "block");
+        let (Some(alias), Some(body)) = (caught_alias(clause), body) else { return };
+        let name = txt(alias, src).to_string();
+        let (loads, binds) = occurrences(body, &name, src, true);
+        if binds > 0 {
+            return; // rebound inside the handler: the name may no longer be the exception
+        }
+        for load in loads {
+            if let Some(place) = stored_into(load, src).filter(|_| !in_nested_scope(load, body)) {
+                self.add_s(load, "frame-retention.stored-exception", I, vec![("name", name.clone())],
+                           dotted(place, src));
+            }
+        }
+    }
+
+    /// `df = pandas.concat([df, part])` / `arr = numpy.append(arr, x)` (= rules/visitor.py `_check_concat_loop`).
+    fn check_concat_loop(&mut self, n: Node<'t>, q: &str, args: &[Node<'t>]) {
+        let src = self.src;
+        let (Some(assign), Some(first)) = (sole_assignment(n), args.first().map(|a| unwrap(*a))) else { return };
+        let Some(name) = field(assign, "left").and_then(|l| dotted(unwrap_target(l), src)) else { return };
+        let inputs = if CONCAT_FIRST_ARG_CALLS.contains(&q) {
+            vec![first]
+        } else if matches!(first.kind(), "list" | "tuple") {
+            named_children(first)
+        } else {
+            vec![]
+        };
+        if inputs.into_iter().any(|x| dotted(x, src).as_deref() == Some(name.as_str())) {
+            self.add_s(n, "memory-swell.concat-loop", W, vec![("call", format!("{q}()")), ("name", name.clone())],
+                       Some(name));
+        }
+    }
+
     fn check_cache_decorators(&mut self, def: Node<'t>) {
         let src = self.src;
         for d in decorators(def) {
@@ -273,8 +337,7 @@ impl<'t, 's> Visitor<'t, 's> {
                     && field(d, "function").is_some_and(|f| self.q(f) == "functools.lru_cache")
                     && {
                         let (args, kws) = call_args(d);
-                        args.first().is_some_and(|a| a.kind() == "none")
-                            || kwarg(&kws, "maxsize", src).is_some_and(|v| v.kind() == "none")
+                        maxsize_none(&args, &kws, src)
                     });
             if !unbounded {
                 continue;
@@ -289,11 +352,49 @@ impl<'t, 's> Visitor<'t, 's> {
         }
     }
 
+    /// `functools.cache(g)` / `lru_cache(maxsize=None)(g)` (= rules/visitor.py `_check_cache_call`).
+    fn check_cache_call(&mut self, n: Node<'t>, q: &str, args: &[Node<'t>], kws: &[Node<'t>]) {
+        let src = self.src;
+        let parent = n.parent();
+        if parent.is_some_and(|p| p.kind() == "decorator") {
+            return; // reported by check_cache_decorators
+        }
+        let subject = if q == "functools.cache" {
+            if args.len() != 1 {
+                return;
+            }
+            dotted(args[0], src)
+        } else if q == "functools.lru_cache" && maxsize_none(args, kws, src) {
+            match parent {
+                Some(p) if p.kind() == "call" && field(p, "function") == Some(n) => {
+                    call_args(p).0.first().and_then(|a| dotted(*a, src))
+                }
+                Some(p) if p.kind() == "assignment" && field(p, "right") == Some(n) => {
+                    field(p, "left").and_then(|l| dotted(l, src))
+                }
+                _ => None,
+            }
+        } else {
+            return;
+        };
+        self.add_s(n, "memory-swell.unbounded-cache", I, vec![], subject);
+    }
+
     fn visit_call(&mut self, n: Node<'t>) {
         let src = self.src;
         let Some(f) = field(n, "function") else { return };
         let q = self.q(f);
         let (args, kws) = call_args(n);
+        self.check_cache_call(n, &q, &args, &kws);
+        if QUEUE_CTORS.contains(&q.as_str()) && maxsize_zero(&args, &kws, src) {
+            self.add(n, "memory-swell.unbounded-queue", I, vec![("call", format!("{q}()"))]);
+        }
+        if START_METHOD_CALLS.contains(&q.as_str()) && names_fork(&args, &kws, src) {
+            self.add(n, "memory-swell.fork-start-method", I, vec![("call", q.clone())]);
+        }
+        if self.loop_depth > 0 && (CONCAT_SEQUENCE_CALLS.contains(&q.as_str()) || CONCAT_FIRST_ARG_CALLS.contains(&q.as_str())) {
+            self.check_concat_loop(n, &q, &args);
+        }
         if self.loop_depth > 0 && q == "copy.deepcopy" {
             self.add(n, "memory-swell.deepcopy-loop", W, vec![]);
         }

@@ -39,6 +39,10 @@
         "icon": "$(pulse)"
       },
       {
+        "command": "pythonMemoryGuardian.profileFileWithArgs",
+        "title": "Python Memory Guardian: Profile Current File with Arguments..."
+      },
+      {
         "command": "pythonMemoryGuardian.showReport",
         "title": "Python Memory Guardian: Open Profile Report",
         "icon": "$(graph)"
@@ -185,7 +189,10 @@
         },
         "pythonMemoryGuardian.profile.memoryGuard": {
           "type": "string",
-          "enum": ["auto", "off"],
+          "enum": [
+            "auto",
+            "off"
+          ],
           "default": "auto",
           "description": "Supervise the profiled process externally and stop on a measured RSS budget or low system headroom. Polling can overshoot; Linux also applies a virtual-address-space limit."
         },
@@ -218,6 +225,11 @@
           "command": "pythonMemoryGuardian.profileFile",
           "when": "resourceLangId == python",
           "group": "navigation"
+        },
+        {
+          "command": "pythonMemoryGuardian.profileFileWithArgs",
+          "when": "resourceLangId == python",
+          "group": "1_pmg"
         },
         {
           "command": "pythonMemoryGuardian.visualizeReport",
@@ -264,6 +276,14 @@
     "esbuild": "^0.28.2",
     "eslint": "^9.39.5",
     "typescript": "^5.4.0"
+  },
+  "overrides": {
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "^11.0.8"
+    },
+    "@vscode/vsce": {
+      "minimatch": "^11.0.8"
+    }
   },
   "extensionKind": [
     "workspace"

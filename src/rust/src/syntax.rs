@@ -271,3 +271,164 @@ pub(crate) fn scope_nodes(root: Node) -> Vec<Node> {
     }
     out
 }
+
+pub(crate) fn same(a: Option<Node>, b: Node) -> bool {
+    a.is_some_and(|a| a.id() == b.id())
+}
+
+/// An identifier that names a variable: not an attribute name (`obj.name`) or a keyword name (`f(name=1)`).
+pub(crate) fn is_variable(n: Node) -> bool {
+    match n.parent() {
+        Some(p) if p.kind() == "attribute" => !same(field(p, "attribute"), n),
+        Some(p) if p.kind() == "keyword_argument" => !same(field(p, "name"), n),
+        _ => true,
+    }
+}
+
+/// Whether a variable identifier binds the name here: assignment, for and comprehension targets, walrus,
+/// with/except/match `as`, del, global/nonlocal, parameters, def/class names, and any name in an import.
+pub(crate) fn is_binding(n: Node) -> bool {
+    let mut cur = n;
+    while let Some(p) = cur.parent() {
+        match p.kind() {
+            "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern" | "dictionary_splat_pattern"
+            | "tuple" | "list" | "parenthesized_expression" | "as_pattern_target" | "dotted_name" => { cur = p; }
+            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => return same(field(p, "left"), cur),
+            "named_expression" => return same(field(p, "name"), cur),
+            "as_pattern" | "except_clause" => return same(field(p, "alias"), cur),
+            "default_parameter" | "typed_default_parameter" => return same(field(p, "name"), cur),
+            "typed_parameter" => return !same(field(p, "type"), cur),
+            "function_definition" | "class_definition" => return same(field(p, "name"), cur),
+            "delete_statement" | "global_statement" | "nonlocal_statement" | "parameters" | "lambda_parameters"
+            | "import_statement" | "import_from_statement" | "aliased_import" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The name bound by `except ... as name`, if the clause has one.
+pub(crate) fn caught_alias(clause: Node) -> Option<Node> {
+    field(clause, "value").filter(|v| v.kind() == "as_pattern")
+        .and_then(|v| field(v, "alias")).and_then(|a| a.named_child(0)).filter(|a| a.kind() == "identifier")
+}
+
+/// Loads of `name` in a scope's body, or in a block itself (nested scopes included, so closures count), and
+/// how often it is bound (= rules/syntax.py `_occurrences`). With `skip_handlers`, a nested `except ... as`
+/// block is not searched; only its own name is counted.
+pub(crate) fn occurrences<'t>(scope: Node<'t>, name: &str, src: &[u8], skip_handlers: bool) -> (Vec<Node<'t>>, usize) {
+    fn walk<'t>(n: Node<'t>, name: &str, src: &[u8], skip_handlers: bool, loads: &mut Vec<Node<'t>>, binds: &mut usize) {
+        if n.kind() == "identifier" && txt(n, src) == name && is_variable(n) {
+            if is_binding(n) { *binds += 1; } else { loads.push(n); }
+        }
+        if let Some(alias) = caught_alias(n).filter(|_| skip_handlers && n.kind() == "except_clause") {
+            if txt(alias, src) == name { *binds += 1; }
+            return;
+        }
+        for c in named_children(n) { walk(c, name, src, skip_handlers, loads, binds); }
+    }
+    let (mut loads, mut binds) = (Vec::new(), 0);
+    let body = if matches!(scope.kind(), "module" | "block") { Some(scope) } else { field(scope, "body") };
+    if let Some(b) = body { walk(b, name, src, skip_handlers, &mut loads, &mut binds); }
+    (loads, binds)
+}
+
+/// Whether `n` sits in a function, lambda or class nested inside `root` (= rules/syntax.py `in_nested_scope`).
+pub(crate) fn in_nested_scope(n: Node, root: Node) -> bool {
+    let mut up = n.parent();
+    while let Some(p) = up {
+        if p.id() == root.id() { return false; }
+        if ["function_definition", "lambda", "class_definition"].contains(&p.kind()) { return true; }
+        up = p.parent();
+    }
+    false
+}
+
+/// The node with any redundant parentheses around it: the reverse of `unwrap`.
+pub(crate) fn wrapped(mut n: Node) -> Node {
+    while let Some(p) = n.parent().filter(|p| p.kind() == "parenthesized_expression") {
+        n = p;
+    }
+    n
+}
+
+/// An assignment target without redundant parentheses: `(x) = v` parses as a one-element `tuple_pattern`
+/// with no comma, which CPython's ast reads as the plain target `x`.
+pub(crate) fn unwrap_target(mut n: Node) -> Node {
+    loop {
+        n = unwrap(n);
+        let inner = named_children(n);
+        let comma = (0..n.child_count()).filter_map(|i| n.child(i)).any(|c| c.kind() == ",");
+        if n.kind() != "tuple_pattern" || inner.len() != 1 || comma {
+            return n;
+        }
+        n = inner[0];
+    }
+}
+
+/// The plain (not annotated, not chained) assignment whose whole right side is `value`, = an
+/// `ast.Assign` with one target.
+pub(crate) fn sole_assignment(value: Node) -> Option<Node> {
+    let value = wrapped(value);
+    value.parent().filter(|p| p.kind() == "assignment" && same(field(*p, "right"), value)
+        && field(*p, "type").is_none() && p.parent().filter(|outer| outer.kind() == "assignment").is_none())
+}
+
+/// Where the value `n` is kept (= rules/syntax.py `stored_into`): `obj.attr` for `obj.attr = n`, `obj` for
+/// `obj[key] = n` and for `obj.append(n)` (STORE_METHODS). `n` may be one element of a tuple or list display.
+pub(crate) fn stored_into<'t>(n: Node<'t>, src: &[u8]) -> Option<Node<'t>> {
+    let mut value = wrapped(n);
+    if let Some(display) = value.parent().filter(|p| matches!(p.kind(), "tuple" | "list" | "expression_list")) {
+        value = wrapped(display);
+    }
+    if let Some(assign) = sole_assignment(value) {
+        let target = unwrap_target(field(assign, "left")?);
+        return match target.kind() {
+            "attribute" => Some(target),
+            "subscript" => field(target, "value"),
+            _ => None,
+        };
+    }
+    let call = value.parent().filter(|p| p.kind() == "argument_list")?.parent().filter(|c| c.kind() == "call")?;
+    let f = unwrap(field(call, "function")?);
+    let (args, kws) = call_args(call);
+    if STORE_METHODS.contains(&attr_name(f, src)) && kws.is_empty() && args.len() == 1 && args[0].id() == value.id() {
+        return field(f, "object");
+    }
+    None
+}
+
+/// A str literal with exactly this text, = an `ast.Constant` equal to `text`. Adjacent literals are joined
+/// as CPython joins them; bytes, f-strings and literals with escape sequences do not match.
+pub(crate) fn is_str_literal(n: Node, src: &[u8], text: &str) -> bool {
+    let n = unwrap(n);
+    let pieces = match n.kind() {
+        "string" => vec![n],
+        "concatenated_string" => named_children(n),
+        _ => return false,
+    };
+    let mut joined = String::new();
+    for piece in pieces {
+        let plain = piece.kind() == "string"
+            && piece.child(0).is_some_and(|start| !txt(start, src).to_ascii_lowercase().contains(['b', 'f']));
+        if !plain {
+            return false;
+        }
+        for part in named_children(piece) {
+            match part.kind() {
+                "string_start" | "string_end" => {}
+                "string_content" => joined.push_str(txt(part, src)),
+                _ => return false,
+            }
+        }
+    }
+    joined == text
+}
+
+/// The integer literal zero in any spelling (`0`, `00`, `0_0`, `0x0`), = an `ast.Constant` int equal to 0.
+pub(crate) fn is_zero_literal(n: Node, src: &[u8]) -> bool {
+    let n = unwrap(n);
+    let text = txt(n, src).to_ascii_lowercase();
+    let digits = ["0x", "0o", "0b"].iter().find_map(|p| text.strip_prefix(p)).unwrap_or(&text);
+    n.kind() == "integer" && !digits.is_empty() && digits.chars().all(|c| c == '0' || c == '_')
+}

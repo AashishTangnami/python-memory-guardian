@@ -12,7 +12,7 @@ Three realistic pipelines to try Python Memory Guardian on. Each fetches records
 pip install -r examples/profiling-workloads/requirements.txt   # for the pyarrow and polars scripts
 ```
 
-Install the packages into the interpreter the extension profiles with (`pythonMemoryGuardian.interpreter`). Each run writes its output under a new folder in `--output` (default `pipeline_output/` in the working directory) and keeps earlier runs. Folders named `*_output/` here are ignored by git.
+Install the packages into the interpreter the extension profiles with (`pythonMemoryGuardian.interpreter`). The data these scripts write is scratch; the result is the profile. Every script runs with no arguments. Each run writes under a new `run-*` folder in a `*_output/` folder beside the script (`pipeline_output/`, `polars_output/`, `pyarrow_output/`, `pyspark_output/`) and the script deletes it when it exits, including after an error or Ctrl+C. A run killed by a signal (for example when the memory guard stops it) cannot clean up, so each run first deletes the `run-*` folders whose process has ended; runs still in progress are left alone. The `*_output/` folder is removed once no run folder is left in it. [`_run_output.py`](_run_output.py) holds this logic for all four scripts. Folders named `*_output/` here are ignored by git.
 
 ## Profiling them from the editor
 

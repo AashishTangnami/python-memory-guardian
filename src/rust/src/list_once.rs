@@ -13,55 +13,6 @@ use crate::visitor::*;
 // with len(), or rebound.
 pub(crate) const ITERATING_CALLS: &[&str] = &["sum", "any", "all", "min", "max", "iter", "enumerate", "zip"];
 
-pub(crate) fn same(a: Option<Node>, b: Node) -> bool {
-    a.is_some_and(|a| a.id() == b.id())
-}
-
-/// An identifier that names a variable: not an attribute name (`obj.name`) or a keyword name (`f(name=1)`).
-pub(crate) fn is_variable(n: Node) -> bool {
-    match n.parent() {
-        Some(p) if p.kind() == "attribute" => !same(field(p, "attribute"), n),
-        Some(p) if p.kind() == "keyword_argument" => !same(field(p, "name"), n),
-        _ => true,
-    }
-}
-
-/// Whether a variable identifier binds the name here: assignment, for and comprehension targets, walrus,
-/// with/except/match `as`, del, global/nonlocal, parameters, def/class names, and any name in an import.
-pub(crate) fn is_binding(n: Node) -> bool {
-    let mut cur = n;
-    while let Some(p) = cur.parent() {
-        match p.kind() {
-            "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern" | "dictionary_splat_pattern"
-            | "tuple" | "list" | "parenthesized_expression" | "as_pattern_target" | "dotted_name" => { cur = p; }
-            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => return same(field(p, "left"), cur),
-            "named_expression" => return same(field(p, "name"), cur),
-            "as_pattern" | "except_clause" => return same(field(p, "alias"), cur),
-            "default_parameter" | "typed_default_parameter" => return same(field(p, "name"), cur),
-            "typed_parameter" => return !same(field(p, "type"), cur),
-            "function_definition" | "class_definition" => return same(field(p, "name"), cur),
-            "delete_statement" | "global_statement" | "nonlocal_statement" | "parameters" | "lambda_parameters"
-            | "import_statement" | "import_from_statement" | "aliased_import" => return true,
-            _ => return false,
-        }
-    }
-    false
-}
-
-/// Loads of `name` in a scope's body (nested scopes included, so closures count) and how often it is bound.
-pub(crate) fn occurrences<'t>(scope: Node<'t>, name: &str, src: &[u8]) -> (Vec<Node<'t>>, usize) {
-    fn walk<'t>(n: Node<'t>, name: &str, src: &[u8], loads: &mut Vec<Node<'t>>, binds: &mut usize) {
-        if n.kind() == "identifier" && txt(n, src) == name && is_variable(n) {
-            if is_binding(n) { *binds += 1; } else { loads.push(n); }
-        }
-        for c in named_children(n) { walk(c, name, src, loads, binds); }
-    }
-    let (mut loads, mut binds) = (Vec::new(), 0);
-    let body = if scope.kind() == "module" { Some(scope) } else { field(scope, "body") };
-    if let Some(b) = body { walk(b, name, src, &mut loads, &mut binds); }
-    (loads, binds)
-}
-
 pub(crate) fn call_name(call: Node, src: &[u8]) -> Option<String> {
     field(call, "function").filter(|f| f.kind() == "identifier").map(|f| txt(f, src).to_string())
 }
@@ -121,7 +72,7 @@ pub(crate) fn single_use(n: Node, src: &[u8], funcs: &HashMap<String, Node>) -> 
     if positional.iter().any(|a| a.kind() == "list_splat") { return None; }
     let i = positional.iter().position(|a| a.id() == n.id())?;
     let param = positional_params(func, src).into_iter().nth(i)?;
-    let (loads, binds) = occurrences(func, &param, src);
+    let (loads, binds) = occurrences(func, &param, src, false);
     if binds == 0 && loads.len() == 1 && direct_iteration(loads[0], src).is_some() {
         return Some(format!("{name}(), which only iterates it"));
     }
@@ -160,17 +111,10 @@ pub(crate) fn list_once(root: Node, src: &[u8]) -> Vec<Finding> {
                 _ => continue,
             };
             let name = txt(left, src).to_string();
-            let (loads, binds) = occurrences(scope, &name, src);
+            let (loads, binds) = occurrences(scope, &name, src, false);
             if binds != 1 || loads.len() != 1 || loads[0].start_byte() <= node.start_byte() { continue; }
             // Used inside a nested function, which may run many times.
-            let mut up = loads[0].parent();
-            let mut nested = false;
-            while let Some(p) = up {
-                if p.id() == scope.id() { break; }
-                if ["function_definition", "lambda", "class_definition"].contains(&p.kind()) { nested = true; break; }
-                up = p.parent();
-            }
-            if nested { continue; }
+            if in_nested_scope(loads[0], scope) { continue; }
             if let Some(use_) = single_use(loads[0], src, &funcs) {
                 out.push(Finding { start: right.start_position(), end: right.end_position(), key: "memory-swell.list-once",
                     sev: I, local: vec![("name", name.clone()), ("call", call.into()), ("use", use_)], related: vec![],

@@ -13,6 +13,8 @@ requirements-quality.txt
 eslint.config.mjs
 pyproject.toml
 tsconfig.json
+Dockerfile
+docker-compose.yml
 package-lock.json
 
 # Keep src/python/libs (including licenses) and an optional bin/guardian-server.

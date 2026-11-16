@@ -158,16 +158,26 @@ class Sampler:
         # Tuned loop: one bound name per collaborator, so the split adds no call per sample.
         memory = self.memory
         memory_sample, trace_lock = memory.sample, memory.trace_lock
+        work_cpu = time.thread_time()
         while not self._stop.is_set():
             sleep_started = time.perf_counter()
+            # The sampler can also lose the GIL during its own work (a waiting thread takes it after
+            # one switch interval) and then wait out a whole GIL-holding C call, such as sorted()
+            # (0.4-1.4 s on 3.9), which the sleep overshoot below does not see. Against Python code
+            # the sampler waits at most about as long as it ran (one switch interval per interval of
+            # its own CPU), so only the stall beyond its own CPU twice over, plus 4 switch intervals
+            # (one hand-off, and thread_time() is 15.6 ms coarse on Windows), counts as a held GIL.
+            own = time.thread_time() - work_cpu
+            held = max(0.0, sleep_started - last_wall - 2 * own - 4 * self.switch)
             time.sleep(self.interval)
             now = time.perf_counter()          # first thing after re-acquiring the GIL
+            work_cpu = time.thread_time()
             proc = time.process_time()
             dw, dproc = now - last_wall, proc - last_proc
             last_wall, last_proc = now, proc
-            # Only sleep overshoot is a possible GIL signal. The preceding
-            # sample/snapshot work and the idle timer baseline are not GIL waits.
-            wait = max(0.0, now - sleep_started - self.interval - self.sleep_overhead)
+            # Sleep overshoot and the GIL waits inside the sampler's own work are GIL signals. The
+            # sample/snapshot work itself and the idle timer baseline are not GIL waits.
+            wait = max(0.0, now - sleep_started - self.interval - self.sleep_overhead) + held
             self.samples += 1
 
             per_thread = []

@@ -6,7 +6,7 @@ Python Memory Guardian (PMG) is a VS Code extension that finds Python code that 
 
 ## Key capabilities
 
-- **Warnings while you type.** 22 rules find memory and concurrency patterns that cost more than they appear to. Examples are a full table in memory at one time, a new object per row, a list made only for one loop, a cache that only grows, and a call that blocks in `async def`. Each warning names the function and the variable, and gives a better pattern. The numbers in the warnings come from your own Python interpreter.
+- **Warnings while you type.** 26 rules find memory and concurrency patterns that cost more than they appear to. Examples are a full table in memory at one time, a new object per row, a list made only for one loop, a cache that only grows, and a call that blocks in `async def`. Each warning names the function and the variable, and gives a better pattern. The numbers in the warnings come from your own Python interpreter.
 - **Time for each line.** A sampler measures each line and divides its time into Python time, native time (C code) and wait time.
 - **Memory evidence.** Fast mode observes process RSS. Precise snapshots show live traced block bytes and allocation source paths. Sampled growth stays at process scope; it cannot identify an allocating line or thread.
 - **Retention and GC.** PMG identifies recent sustained-growth candidates and bounded owner paths. GC callbacks measure collection frequency, pauses, collected objects and uncollectable objects. A cycle alone is not a leak.

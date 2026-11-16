@@ -516,6 +516,7 @@ class ProfileRegressions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = profiler.Profiler(tmp, .01, 'precise')
             p.sampler.rss, p.sampler.rss_kind = lambda: 0, None
+            p.memory.snap_rate, p.memory._rate_bounds = 8e-9, (4e-9, 20e-9)   # the GIL-build prior (3.13t: 150 ns)
             clock, sleeps = [0.0], []
 
             def sleep(seconds):

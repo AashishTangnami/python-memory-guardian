@@ -1,0 +1,44 @@
+# Local testing tool for .github/workflows/validate.yml: each Linux CI environment is its own image
+# and service, running the same job script (scripts/ci/) on your current code, uncommitted edits
+# included. Run one service at a time (the profiler and memory-guard tests depend on timing and
+# memory, so parallel jobs on one Docker VM interfere):
+#   docker compose run --rm --build runtime-py39      # runtime-py313, runtime-py313t, acceptance
+# Evidence is copied to .validation/ci/<service>/.
+name: pmg-ci
+
+x-job: &job
+  build: &build
+    context: .
+    dockerfile: Dockerfile
+  init: true
+  environment:
+    PMG_CI_OUT: /out
+
+services:
+  runtime-py39:
+    <<: *job
+    image: pmg-ci:runtime-py3.9
+    build: { <<: *build, args: { PYTHON: '3.9' } }
+    command: [runtime]
+    volumes: [.:/repo:ro, ./.validation/ci/runtime-py39:/out, cargo-registry:/root/.cargo/registry]
+  runtime-py313:
+    <<: *job
+    image: pmg-ci:runtime-py3.13
+    build: { <<: *build, args: { PYTHON: '3.13' } }
+    command: [runtime]
+    volumes: [.:/repo:ro, ./.validation/ci/runtime-py313:/out, cargo-registry:/root/.cargo/registry]
+  runtime-py313t:
+    <<: *job
+    image: pmg-ci:runtime-py3.13t
+    build: { <<: *build, args: { PYTHON: '3.13', FREE_THREADED: '1' } }
+    command: [runtime]
+    volumes: [.:/repo:ro, ./.validation/ci/runtime-py313t:/out, cargo-registry:/root/.cargo/registry]
+  acceptance:
+    <<: *job
+    image: pmg-ci:acceptance
+    build: { <<: *build, args: { PYTHON: '3.13' } }
+    command: [acceptance]
+    volumes: [.:/repo:ro, ./.validation/ci/acceptance:/out, cargo-registry:/root/.cargo/registry]
+
+volumes:
+  cargo-registry:

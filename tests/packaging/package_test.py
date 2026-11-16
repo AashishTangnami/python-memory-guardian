@@ -33,7 +33,8 @@ def check_package(archive):
         )}
         assert required <= names, 'Missing runtime files: ' + str(required - names)
         forbidden = {'node_modules', '__pycache__', '.mypy_cache',
-                     'eslint.config.mjs', 'pyproject.toml', 'requirements-quality.txt', 'requirements-acceptance.txt'}
+                     'eslint.config.mjs', 'pyproject.toml', 'requirements-quality.txt', 'requirements-acceptance.txt',
+                     'Dockerfile', 'docker-compose.yml'}
         forbidden_roots = ('extension/src/typescript/', 'extension/src/rust/', 'extension/tests/', 'extension/scripts/', 'extension/examples/')
         leaked = [name for name in names if forbidden.intersection(Path(name).parts) or name.startswith(forbidden_roots)]
         assert not leaked, 'Development files in VSIX: ' + str(leaked[:10])

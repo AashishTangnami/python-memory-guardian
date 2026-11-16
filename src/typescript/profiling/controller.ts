@@ -76,10 +76,8 @@ export class ProfileView implements vscode.Disposable {
       vscode.commands.registerCommand("pythonMemoryGuardian.showReport", () => this.report.show()),
       vscode.commands.registerCommand("pythonMemoryGuardian.openSavedReport", () => this.openSavedReport()),
       vscode.commands.registerCommand("pythonMemoryGuardian.visualizeReport", (uri?: vscode.Uri) => this.visualizeReport(uri)),
-      vscode.commands.registerCommand("pythonMemoryGuardian.profileFile", () => runProfiler({
-        ctx: this.ctx, interpreter: this.interpreter, container: this.container,
-        started: () => { this.showNextReport = true; },
-      })),
+      vscode.commands.registerCommand("pythonMemoryGuardian.profileFile", () => this.profile(false)),
+      vscode.commands.registerCommand("pythonMemoryGuardian.profileFileWithArgs", () => this.profile(true)),
       vscode.commands.registerCommand("pythonMemoryGuardian.toggleProfileOverlay", () => {
         this.overlay = !this.overlay;
         this.render();
@@ -91,6 +89,13 @@ export class ProfileView implements vscode.Disposable {
   }
 
   /** Re-apply thresholds after a profile.* setting change; the language server is unaffected. */
+  private profile(askArgs: boolean): Promise<void> {
+    return runProfiler({
+      ctx: this.ctx, interpreter: this.interpreter, container: this.container,
+      started: () => { this.showNextReport = true; },
+    }, { askArgs });
+  }
+
   settingsChanged(): void {
     this.staticDiagnostics.refresh();
     this.render();

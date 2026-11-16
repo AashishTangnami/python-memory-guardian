@@ -119,6 +119,61 @@ class StaticRegressions(unittest.TestCase):
         self.assertEqual([x["hits"] for x in red], [x["hits"] for x in green])
         self.assertFalse(self.findings("membership", "fixed", "single-thread-stall.list-membership"))
 
+    def test_stored_exception_keeps_frame_locals(self):
+        red = [self.witness("stored_exception", "positive", n) for n in (1000, 10000)]
+        self.assertEqual([x["errors"] for x in red], [1000, 10000])
+        self.assertTrue(all(x["python_current_bytes"] > x["n"] * x["payload_bytes"] for x in red))
+        self.assertTrue(self.findings("stored_exception", "positive", "frame-retention.stored-exception"))
+        green = [self.witness("stored_exception", "fixed", n) for n in (1000, 10000)]
+        self.assertTrue(all(g["python_current_bytes"] < r["python_current_bytes"] / 10
+                            for r, g in zip(red, green)))
+        self.assertEqual([x["messages"] for x in red], [x["messages"] for x in green])
+        self.assertFalse(self.findings("stored_exception", "fixed", "frame-retention.stored-exception"))
+
+    def test_new_rules_have_documented_severity_and_alternative(self):
+        warning, information = 2, 3
+        source = ('import multiprocessing, queue\n'
+                  'import pandas as pd\n'
+                  'jobs = queue.Queue()\n'
+                  'multiprocessing.set_start_method("fork")\n'
+                  'def collect(chunks, errors):\n'
+                  '    frame = pd.DataFrame()\n'
+                  '    for chunk in chunks:\n'
+                  '        try:\n'
+                  '            frame = pd.concat([frame, chunk])\n'
+                  '        except ValueError as exc:\n'
+                  '            errors.append(exc)\n'
+                  '    return frame\n')
+        rows = parity_test.run(parity_test.SERVERS["python"], self.facts, source)
+        rust = parity_test.run(parity_test.SERVERS["rust"], self.facts, source)
+        record("static_analysis", fixture="new_rules", source=source, python_rows=rows, rust_rows=rust)
+        self.assertEqual(rows, rust)
+        expected = {
+            "memory-swell.unbounded-queue": (2, information, ("queue.Queue()", "maxsize", "backpressure")),
+            "memory-swell.fork-start-method": (3, information, ("reference count", "shared_memory", "forkserver")),
+            "memory-swell.concat-loop": (8, warning, ("pandas.concat()", "`frame`", "once after the loop")),
+            "frame-retention.stored-exception": (10, information, ("`errors`", "traceback", "str(exc)",
+                                                                   "traceback.clear_frames(exc.__traceback__)")),
+        }
+        self.assertEqual({row[4]: (row[0], row[5]) for row in rows},
+                         {code: (line, severity) for code, (line, severity, _) in expected.items()})
+        for row in rows:
+            for phrase in expected[row[4]][2]:
+                self.assertIn(phrase, row[6])
+
+    def test_structure_advice_names_a_concrete_alternative(self):
+        concrete = {
+            "heap-inflation": ("fetchmany()", "chunksize=N", "iter_batches=True", "fetch_record_batch()"),
+            "pointer-chasing": ('"category"', '"string[pyarrow]"', '"Int64"', 'dtype_backend="pyarrow"'),
+            "ram-fragmentation.append": ("one list per column", "array.array", "pyarrow.table(", "polars.DataFrame("),
+        }
+        for code, phrases in concrete.items():
+            for facts in ({}, self.facts):  # the neutral wording, then the sized wording where it exists
+                message = rules.render(code, facts, {})
+                for phrase in phrases:
+                    self.assertIn(phrase, message)
+                self.assertIn("preserve", message)  # the compatibility conditions stay in the advice
+
     def test_set_advice_requires_hashability_and_stable_keys(self):
         values = [[1], None]
         self.assertIn([1], values)

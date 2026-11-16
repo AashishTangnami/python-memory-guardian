@@ -29,3 +29,11 @@ pub(crate) const SLOTS_EXEMPT_BASES: &[&str] = &["NamedTuple", "Enum", "IntEnum"
     "IntFlag", "TypedDict", "Protocol", "Exception", "BaseException"];
 pub(crate) const COMPREHENSIONS: &[&str] = &["list_comprehension", "set_comprehension",
     "dictionary_comprehension", "generator_expression"];
+pub(crate) const QUEUE_CTORS: &[&str] = &["queue.Queue", "queue.LifoQueue", "queue.PriorityQueue",
+    "asyncio.Queue", "asyncio.LifoQueue", "asyncio.PriorityQueue", "multiprocessing.Queue",
+    "multiprocessing.JoinableQueue"];
+pub(crate) const START_METHOD_CALLS: &[&str] = &["multiprocessing.set_start_method", "multiprocessing.get_context"];
+pub(crate) const CONCAT_SEQUENCE_CALLS: &[&str] = &["pandas.concat", "numpy.concatenate", "numpy.vstack",
+    "numpy.hstack"];
+pub(crate) const CONCAT_FIRST_ARG_CALLS: &[&str] = &["numpy.append"];
+pub(crate) const STORE_METHODS: &[&str] = &["append", "appendleft", "add"];

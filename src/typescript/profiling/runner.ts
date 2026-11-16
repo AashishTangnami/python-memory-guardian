@@ -14,7 +14,12 @@ export interface RunnerContext {
   started: () => void;
 }
 
-export async function runProfiler({ ctx, interpreter, container, started }: RunnerContext): Promise<void> {
+/**
+ * `askArgs` false ("Profile Current File"): run the script with no arguments, no prompt.
+ * `askArgs` true ("Profile Current File with Arguments..."): ask for them first.
+ */
+export async function runProfiler({ ctx, interpreter, container, started }: RunnerContext,
+  { askArgs = false }: { askArgs?: boolean } = {}): Promise<void> {
   const editor = vscode.window.activeTextEditor;
   if (!editor || editor.document.languageId !== "python" || editor.document.isUntitled) {
     vscode.window.showWarningMessage("Open a saved Python file to profile it.");
@@ -34,18 +39,22 @@ export async function runProfiler({ ctx, interpreter, container, started }: Runn
   ], { placeHolder: `Memory mode (default: ${cfg.get("memoryMode", "fast")})` });
   if (!picked) return;
 
-  // Script arguments, remembered per file; Escape cancels the run.
+  // Script arguments only when asked for: remembered per file; Escape cancels the run.
   const file = editor.document.uri.fsPath;
-  const argsKey = `pmg.args:${file}`;
-  const typed = await vscode.window.showInputBox({
-    prompt: `Arguments for ${path.basename(file)} (optional)`,
-    placeHolder: "e.g. --records 20000 --mode both", value: ctx.workspaceState.get<string>(argsKey, ""),
-    validateInput: (v) => { const r = splitArgs(v); return Array.isArray(r) ? undefined : r.error; },
-  });
-  if (typed === undefined) return;
-  const scriptArgs = splitArgs(typed);
-  if (!Array.isArray(scriptArgs)) return;
-  await ctx.workspaceState.update(argsKey, typed);
+  let scriptArgs: string[] = [];
+  if (askArgs) {
+    const argsKey = `pmg.args:${file}`;
+    const typed = await vscode.window.showInputBox({
+      prompt: `Arguments for ${path.basename(file)}`,
+      value: ctx.workspaceState.get<string>(argsKey, ""),
+      validateInput: (v) => { const r = splitArgs(v); return Array.isArray(r) ? undefined : r.error; },
+    });
+    if (typed === undefined) return;
+    const parsed = splitArgs(typed);
+    if (!Array.isArray(parsed)) return;
+    await ctx.workspaceState.update(argsKey, typed);
+    scriptArgs = parsed;
+  }
   const scope = "traceFunction" in picked && picked.traceFunction ? ["--trace-function", picked.traceFunction] : [];
 
   const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);

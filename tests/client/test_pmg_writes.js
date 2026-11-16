@@ -7,7 +7,7 @@ const assert = require('assert'), fs = require('fs'), os = require('os'), path =
 const Module = require('module'), originalLoad = Module._load;
 
 const errors = [], warnings = [], tasks = [];
-let editor, answers = {};
+let editor, answers = {}, prompts = 0;
 const disposable = () => ({ dispose() {} });
 const uri = (p) => ({ scheme: 'file', fsPath: p, toString: () => `file://${p}` });
 let root;
@@ -27,7 +27,7 @@ const vscode = {
     createTextEditorDecorationType: disposable,
     onDidChangeVisibleTextEditors: disposable,
     showQuickPick: async (items) => items[0],
-    showInputBox: async () => answers.input,
+    showInputBox: async () => { prompts += 1; return answers.input; },
     showWarningMessage: async (text) => { warnings.push(text); return answers.warning; },
     showErrorMessage: async (text) => { errors.push(text); },
     showInformationMessage: async () => undefined,
@@ -93,6 +93,24 @@ const linkedProject = (name) => {
   await runIn(real);
   assert.strictEqual(tasks.length, 1, 'a real (or missing) .pmg runs as before');
   console.log('PASS a profile run refuses a linked .pmg and runs with a real one');
+
+  // 1b. Profile Current File runs without asking for arguments; "with Arguments..." asks and passes them.
+  const runner = { ctx, interpreter: () => 'python3', container: () => undefined, started: () => {} };
+  const mainPy = path.join(real, 'main.py');
+  const scriptArgsOf = (task) => { const a = task.args[4].args; return a.slice(a.indexOf(mainPy) + 1); };
+  prompts = 0;
+  await runProfiler(runner);
+  assert.strictEqual(prompts, 0, 'Profile Current File does not ask for arguments');
+  assert.deepStrictEqual(scriptArgsOf(tasks.at(-1)), [], 'and runs the script with none');
+  answers = { input: '--records 20 --mode both' };
+  await runProfiler(runner, { askArgs: true });
+  assert.strictEqual(prompts, 1, 'Profile Current File with Arguments... asks once');
+  assert.deepStrictEqual(scriptArgsOf(tasks.at(-1)), ['--records', '20', '--mode', 'both'], 'and passes them');
+  const before = tasks.length;
+  answers = { input: undefined };
+  await runProfiler(runner, { askArgs: true });
+  assert.strictEqual(tasks.length, before, 'Escape in the arguments box cancels the run');
+  console.log('PASS Profile Current File runs without an arguments prompt; the with-arguments command asks');
 
   // 2. Save as baseline: a linked .pmg is refused, and a link planted at the baseline's name is replaced.
   const profile = { script: path.join(tmp, 'work.py') };

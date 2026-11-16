@@ -12,8 +12,10 @@ Rule families (diagnostic `code` = messages.json key):
   gc-cycle-risk           back-pointer classes with finalizers
   ram-fragmentation.*     per-row dict/tuple/list appends; no-__slots__ classes in loops
   text-inflation.*        str += in loops; read().split*() / readlines()
-  memory-swell.*          list materialization, unbounded caches, deepcopy/re.compile in loops
+  memory-swell.*          list materialization, unbounded caches and queues, deepcopy/re.compile
+                          in loops, a frame or array rebuilt from itself in a loop, explicit fork
   resource-leak.*         file opens without visible cleanup
+  frame-retention.*       `except ... as` exceptions stored beyond their handler
   task-retention.*        discarded asyncio tasks
   single-thread-stall.*   blocking calls in async def; `x in list` in loops;
                           CPU-bound pure-Python functions handed to threads

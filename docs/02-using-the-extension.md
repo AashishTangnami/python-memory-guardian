@@ -35,9 +35,10 @@ To practice, profile one of the scripts in [`examples/profiling-workloads/`](../
    | **precise, only while `f()` runs** | Retained tracebacks for one function; offered when the cursor is inside it (Python 3.12+) | Lower cost outside `f`; exit retention and whole-run growth/native residuals are unavailable |
    | **time only** | Sampled time, call stacks and Python GC callbacks | Process RSS and Python allocation observations are unavailable |
 
-4. Enter the script's arguments, if any (for example `--records 20000 --mode both`). They are remembered per file; press Enter for none, or Escape to cancel. A smaller input usually shows the same memory pattern in a fraction of the time.
-5. Your program runs in a terminal panel. To stop it early, press **Ctrl+C**; a partial profile is still saved.
-6. When it finishes, the **Memory Guardian Report** opens and measured lines get inline labels. The data is stored in `.pmg/profile.json` under the workspace folder; add `.pmg/` to your `.gitignore`.
+4. Your program runs in a terminal panel. To stop it early, press **Ctrl+C**; a partial profile is still saved.
+5. When it finishes, the **Memory Guardian Report** opens and measured lines get inline labels. The data is stored in `.pmg/profile.json` under the workspace folder; add `.pmg/` to your `.gitignore`.
+
+The pulse icon runs the script with no arguments. If your script needs some, run **Python Memory Guardian: Profile Current File with Arguments...** from the Command Palette or the editor title bar's **...** menu and enter them (for example `--records 20000 --mode both`). They are remembered per file for that command; press Escape to cancel. A smaller input usually shows the same memory pattern in a fraction of the time.
 
 Use **fast** for timing comparisons and **precise** when investigating who retains memory. Memory growth alone does not establish a leak.
 

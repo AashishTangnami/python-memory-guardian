@@ -16,6 +16,7 @@ The suite executes each positive fixture at 1,000 and 10,000 records before it c
 | `pandas_numeric`, `pandas_loader` | Object dtype and `memory_usage(deep=True)` versus numeric dtype, 8 bytes per value, same sum | `pointer-chasing` |
 | `slots` | Traced Python storage for fixed-field instances; values, mutation, nulls and order remain compatible | `ram-fragmentation.no-slots` |
 | `membership` | Count of equality calls with a list versus a separate set index; the original ordered list remains available | `single-thread-stall.list-membership` |
+| `stored_exception` | Traced Python memory still held after `gc.collect()` when each caught exception is stored, versus when its text is stored; the same messages are kept | `frame-retention.stored-exception` |
 
 Run any fixture independently, for example:
 

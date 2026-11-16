@@ -3,39 +3,12 @@ from __future__ import annotations
 
 import ast
 
-from .syntax import scope_nodes
+from .syntax import _occurrences, scope_nodes
 from .tables import AGGREGATORS
 from .visitor import Finding, I
 
 
 ITERATING_CALLS = AGGREGATORS | {"iter", "enumerate", "zip"}
-
-
-def _occurrences(scope, name: str) -> tuple[list[ast.Name], int]:
-    """Loads of `name` anywhere in `scope` (nested scopes included, so closures count), and how many
-    times it is bound or rebound there: assignment targets, deletes, parameters, def/class names,
-    import aliases, except-as names and global/nonlocal declarations."""
-    loads, binds = [], 0
-    for stmt in scope.body:
-        for n in ast.walk(stmt):
-            if isinstance(n, ast.Name) and n.id == name:
-                if isinstance(n.ctx, ast.Load):
-                    loads.append(n)
-                else:
-                    binds += 1
-            elif isinstance(n, ast.arg) and n.arg == name:
-                binds += 1
-            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name:
-                binds += 1
-            elif isinstance(n, ast.alias) and (name == n.asname or name in n.name.split(".")):
-                binds += 1      # any name in an import counts, as in the Rust server
-            elif isinstance(n, ast.ImportFrom) and name in (n.module or "").split("."):
-                binds += 1
-            elif isinstance(n, ast.ExceptHandler) and n.name == name:
-                binds += 1
-            elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
-                binds += 1
-    return loads, binds
 
 
 def _direct_iteration(n: ast.AST, parents: dict) -> str | None:

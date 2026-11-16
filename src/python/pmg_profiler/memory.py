@@ -13,6 +13,7 @@ import tracemalloc
 from typing import Literal
 
 from .common import UserFiles, own_memory_paths
+from .system import free_threaded_build
 from .timeline import Timeline
 
 # Distinct allocation stacks kept per memory-stack table; smaller ones are summed as other_bytes.
@@ -32,7 +33,11 @@ class MemoryTracker:
         # s per byte of tracemalloc bookkeeping: measured at 5-8 ns on macOS/CPython 3.13 at 2 and 6 frames.
         # Refined only from snapshots with at least 8 MB of bookkeeping: small snapshots are dominated by
         # fixed costs, and learning from them inflated predictions 20x, blocking every large snapshot.
-        self.snap_rate = 8e-9
+        # Free-threaded builds cost far more: 113-256 ns on a state's first snapshot (15 ns repeated) on
+        # 3.13.18t. With the GIL-build prior a first 22 MB snapshot was predicted at 0.9 s, took 3.05 s
+        # and spent the routine budget past the end of the run.
+        self._rate_bounds = (10e-9, 300e-9) if free_threaded_build() else (4e-9, 20e-9)
+        self.snap_rate = 150e-9 if free_threaded_build() else 8e-9
         # (elapsed s, bytes held per allocating user line, bytes held with no user frame)
         self.snapshots: list[tuple[float, dict[tuple[str, int], int], int]] = []
         self.snap_cost = 0.0
@@ -178,7 +183,8 @@ class MemoryTracker:
                 self._last_rate = cost / book
                 # A slow average clamped to 2-3x the measured range: one snapshot slowed by GC or
                 # first-time path resolution must not block the next (plateau) snapshot.
-                self.snap_rate = min(20e-9, max(4e-9, 0.8 * self.snap_rate + 0.2 * (cost / book)))
+                low, high = self._rate_bounds
+                self.snap_rate = min(high, max(low, 0.8 * self.snap_rate + 0.2 * (cost / book)))
             last_snap_t, last_snap_traced = elapsed, traced
             self._snap_high = max(self._snap_high, traced)
             self.snapped = True
@@ -259,19 +265,25 @@ class MemoryTracker:
             self._peak_stacks_held, self._peak_stacks = total_held, self._last_stacks
 
     def leaks(self):
-        """Recent sustained-growth candidates. A plateau erases old warmup rises."""
+        """Recent sustained-growth candidates. A plateau erases old warmup rises.
+
+        Both callers run after the exit snapshot, which adds a point but no time: the window is one
+        snapshot longer and the last rise may be one change earlier. Otherwise growth that ended just
+        before exit (then one more snapshot, such as a later line's spike, and the exit) had 2 rises
+        in 5 points and was not reported (3.13t: 1 run in 5; any build when a snapshot lands there).
+        """
         out = {}
         if len(self.snapshots) < 4:
             return out
         for loc, size_end in self.snapshots[-1][1].items():
             if size_end < 1 << 20:
                 continue
-            series = [s.get(loc, 0) for _, s, _ in self.snapshots[-5:]]
+            series = [s.get(loc, 0) for _, s, _ in self.snapshots[-6:]]
             changes = [b - a for a, b in zip(series, series[1:])]
             limits = [max(1024, .001 * a) for a in series[:-1]]
             meaningful = [change > limit for change, limit in zip(changes, limits)]
             rises = sum(meaningful)
-            if (rises >= 3 and any(meaningful[-2:])
+            if (rises >= 3 and any(meaningful[-3:])
                     and not any(change < -limit for change, limit in zip(changes, limits))
                     and series[-1] - series[0] >= max(64 << 10, .01 * size_end)):
                 out[loc] = rises

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import ast
 
-from .tables import WEAKREF_CALLS
+from .tables import STORE_METHODS, WEAKREF_CALLS
 
 
 def qualname(node: ast.AST, imports: dict[str, str]) -> str | None:
@@ -78,4 +78,64 @@ def dotted(n: ast.AST) -> str | None:
     if isinstance(n, ast.Attribute):
         base = dotted(n.value)
         return f"{base}.{n.attr}" if base else None
+    return None
+
+
+def _occurrences(scope, name: str, skip_handlers: bool = False) -> tuple[list[ast.Name], int]:
+    """Loads of `name` anywhere in `scope` (nested scopes included, so closures count), and how many
+    times it is bound or rebound there: assignment targets, deletes, parameters, def/class names,
+    import aliases, except-as names and global/nonlocal declarations. With `skip_handlers`, a nested
+    `except ... as` block is not searched; only its own name is counted."""
+    loads, binds = [], 0
+    pending = list(scope.body)
+    while pending:
+        n = pending.pop()
+        if isinstance(n, ast.Name) and n.id == name:
+            if isinstance(n.ctx, ast.Load):
+                loads.append(n)
+            else:
+                binds += 1
+        elif isinstance(n, ast.arg) and n.arg == name:
+            binds += 1
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name:
+            binds += 1
+        elif isinstance(n, ast.alias) and (name == n.asname or name in n.name.split(".")):
+            binds += 1      # any name in an import counts, as in the Rust server
+        elif isinstance(n, ast.ImportFrom) and name in (n.module or "").split("."):
+            binds += 1
+        elif isinstance(n, ast.ExceptHandler) and n.name == name:
+            binds += 1
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
+            binds += 1
+        if not (skip_handlers and isinstance(n, ast.ExceptHandler) and n.name):
+            pending.extend(ast.iter_child_nodes(n))
+    return loads, binds
+
+
+def in_nested_scope(n: ast.AST, root: ast.AST, parents: dict) -> bool:
+    """Whether `n` sits in a function, lambda or class nested inside `root`."""
+    p = parents.get(n)
+    while p is not None and p is not root:
+        if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            return True
+        p = parents.get(p)
+    return False
+
+
+def stored_into(n: ast.AST, parents: dict) -> ast.AST | None:
+    """Where the value `n` is kept: `obj.attr` for `obj.attr = n`, `obj` for `obj[key] = n` and for
+    `obj.append(n)` (STORE_METHODS). `n` may be one element of a tuple or list display. None for
+    any other use, and for a chained or annotated assignment."""
+    value, p = n, parents.get(n)
+    if isinstance(p, (ast.Tuple, ast.List)) and isinstance(p.ctx, ast.Load):
+        value, p = p, parents.get(p)
+    if isinstance(p, ast.Assign) and p.value is value and len(p.targets) == 1:
+        target = p.targets[0]
+        if isinstance(target, ast.Attribute):
+            return target
+        if isinstance(target, ast.Subscript):
+            return target.value
+    if (isinstance(p, ast.Call) and isinstance(p.func, ast.Attribute) and p.func.attr in STORE_METHODS
+            and not p.keywords and len(p.args) == 1 and p.args[0] is value):
+        return p.func.value
     return None

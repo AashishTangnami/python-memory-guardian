@@ -7,9 +7,13 @@ from dataclasses import dataclass, field
 from lsprotocol import types as lsp
 
 from .index import FileIndex, _cycle_edge, bound_names, scoped_index
-from .syntax import _is_listish, _is_strish, _object_dtype, dotted, qualname, scope_nodes
+from .syntax import (
+    _is_listish, _is_strish, _object_dtype, _occurrences, dotted, in_nested_scope, qualname,
+    scope_nodes, stored_into,
+)
 from .tables import (
-    AGGREGATORS, BLOCKING_CALLS, EXECUTOR_CTORS, EXECUTOR_METHODS, PANDAS_LOADERS, THREAD_CTORS,
+    AGGREGATORS, BLOCKING_CALLS, CONCAT_FIRST_ARG_CALLS, CONCAT_SEQUENCE_CALLS, EXECUTOR_CTORS,
+    EXECUTOR_METHODS, PANDAS_LOADERS, QUEUE_CTORS, START_METHOD_CALLS, THREAD_CTORS,
 )
 from .threads import classify
 
@@ -34,6 +38,31 @@ def _file_open(node: ast.Call, q: str, idx: FileIndex) -> bool:
     return (isinstance(f, ast.Attribute) and f.attr == "open"
             and isinstance(f.value, ast.Call)
             and qualname(f.value.func, idx.imports) == "pathlib.Path")
+
+
+def _maxsize_none(call: ast.Call) -> bool:
+    """`lru_cache(None)` / `lru_cache(maxsize=None)`: a cache that never evicts."""
+    return bool((call.args and isinstance(call.args[0], ast.Constant) and call.args[0].value is None)
+                or any(k.arg == "maxsize" and isinstance(k.value, ast.Constant)
+                       and k.value.value is None for k in call.keywords))
+
+
+def _maxsize_zero(call: ast.Call) -> bool:
+    """`Queue()` / `Queue(0)` / `Queue(maxsize=0)`: a queue that never fills. A size that is not
+    an integer literal, or that `*args` / `**kwargs` may supply, is unknown and counts as bounded."""
+    if any(isinstance(a, ast.Starred) for a in call.args) or any(k.arg is None for k in call.keywords):
+        return False
+    size = call.args[0] if call.args else next(
+        (k.value for k in call.keywords if k.arg == "maxsize"), None)
+    return size is None or (isinstance(size, ast.Constant) and type(size.value) is int
+                            and size.value == 0)
+
+
+def _names_fork(call: ast.Call) -> bool:
+    """`set_start_method("fork")` / `get_context(method="fork")`: the method given as a literal."""
+    method = call.args[0] if call.args else next(
+        (k.value for k in call.keywords if k.arg == "method"), None)
+    return isinstance(method, ast.Constant) and method.value == "fork"
 
 
 class Visitor(ast.NodeVisitor):
@@ -206,6 +235,24 @@ class Visitor(ast.NodeVisitor):
 
     visit_AsyncWith = visit_With
 
+    # ---- frame retention: an `except ... as` name stored beyond its handler
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self._check_stored_exception(node)
+        self.generic_visit(node)
+
+    def _check_stored_exception(self, handler: ast.ExceptHandler) -> None:
+        """`self.err = e` / `d[k] = e` / `errors.append(e)` inside `except ... as e`. A nested
+        `except ... as` block is left to its own check, so every node is searched once."""
+        loads, binds = _occurrences(handler, handler.name, skip_handlers=True)
+        if binds:
+            return  # rebound inside the handler: the name may no longer be the exception
+        for load in loads:
+            place = stored_into(load, self.parents)
+            if place is not None and not in_nested_scope(load, handler, self.parents):
+                self.add(load, "frame-retention.stored-exception", I, {"name": handler.name},
+                         subject=dotted(place))
+
     # ---- text inflation: str += in loops
     def visit_AugAssign(self, node):
         if self.loop_depth and isinstance(node.op, ast.Add):
@@ -235,10 +282,8 @@ class Visitor(ast.NodeVisitor):
     def _check_cache_decorators(self, fn):
         for d in fn.decorator_list:
             unbounded = self.q(d) == "functools.cache" or (
-                isinstance(d, ast.Call) and self.q(d.func) == "functools.lru_cache" and (
-                    (d.args and isinstance(d.args[0], ast.Constant) and d.args[0].value is None)
-                    or any(k.arg == "maxsize" and isinstance(k.value, ast.Constant)
-                           and k.value.value is None for k in d.keywords)))
+                isinstance(d, ast.Call) and self.q(d.func) == "functools.lru_cache"
+                and _maxsize_none(d))
             if not unbounded:
                 continue
             a = fn.args.posonlyargs + fn.args.args
@@ -248,10 +293,56 @@ class Visitor(ast.NodeVisitor):
             else:
                 self.add(d, "memory-swell.unbounded-cache", I, subject=fn.name)
 
+    def _check_cache_call(self, node: ast.Call, q: str) -> None:
+        """`functools.cache(g)` / `lru_cache(maxsize=None)(g)`: the decorator rule's call form."""
+        parent = self.parents.get(node)
+        if (isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node in parent.decorator_list):
+            return  # reported by _check_cache_decorators
+        if q == "functools.cache":
+            if len(node.args) != 1:
+                return
+            subject = dotted(node.args[0])
+        elif q == "functools.lru_cache" and _maxsize_none(node):
+            subject = None
+            if isinstance(parent, ast.Call) and parent.func is node and parent.args:
+                subject = dotted(parent.args[0])
+            elif isinstance(parent, ast.Assign) and parent.value is node:
+                subject = dotted(parent.targets[-1])
+            elif isinstance(parent, ast.AnnAssign) and parent.value is node:
+                subject = dotted(parent.target)
+        else:
+            return
+        self.add(node, "memory-swell.unbounded-cache", I, subject=subject)
+
+    # ---- memory swell: a result rebuilt from itself in a loop
+    def _check_concat_loop(self, node: ast.Call, q: str) -> None:
+        """`df = pandas.concat([df, part])` / `arr = numpy.append(arr, x)`: the assigned name is
+        also an input, so each call copies everything accumulated so far."""
+        parent = self.parents.get(node)
+        if not (isinstance(parent, ast.Assign) and parent.value is node
+                and len(parent.targets) == 1 and node.args):
+            return
+        name, first = dotted(parent.targets[0]), node.args[0]
+        if q in CONCAT_FIRST_ARG_CALLS:
+            inputs = [first]
+        else:
+            inputs = first.elts if isinstance(first, (ast.List, ast.Tuple)) else []
+        if name and any(dotted(x) == name for x in inputs):
+            self.add(node, "memory-swell.concat-loop", W, {"call": f"{q}()", "name": name},
+                     subject=name)
+
     # ---- calls
     def visit_Call(self, node):
         f = node.func
         q = self.q(f) or ""
+        self._check_cache_call(node, q)
+        if q in QUEUE_CTORS and _maxsize_zero(node):
+            self.add(node, "memory-swell.unbounded-queue", I, {"call": f"{q}()"})
+        if q in START_METHOD_CALLS and _names_fork(node):
+            self.add(node, "memory-swell.fork-start-method", I, {"call": q})
+        if self.loop_depth and (q in CONCAT_SEQUENCE_CALLS or q in CONCAT_FIRST_ARG_CALLS):
+            self._check_concat_loop(node, q)
         if self.loop_depth and q == "copy.deepcopy":
             self.add(node, "memory-swell.deepcopy-loop", W)
         if (self.loop_depth and q == "re.compile" and node.args

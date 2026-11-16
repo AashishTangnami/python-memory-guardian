@@ -1,0 +1,9 @@
+# Build context of /Dockerfile: only the dependency manifests the image installs. The
+# code itself is bind-mounted at run time, so editing it never rebuilds the image.
+*
+!package.json
+!package-lock.json
+!requirements.txt
+!requirements-acceptance.txt
+!requirements-quality.txt
+!scripts/ci/entrypoint.sh

@@ -5,6 +5,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROF = os.path.join(HERE, "..", "..", "src", "python", "pmg_profile.py")
 W = os.path.join(HERE, "..", "fixtures", "profiler")
 OUT = os.path.join(HERE, "out")
+os.makedirs(OUT, exist_ok=True)   # gitignored; workload.py writes its .wall file here before the profiler creates it
 
 def run(script, mode):
     out = os.path.join(OUT, f"{os.path.splitext(script)[0]}_{mode}.json")

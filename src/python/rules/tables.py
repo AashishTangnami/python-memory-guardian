@@ -48,3 +48,19 @@ SLOTS_EXEMPT_BASES = {
     "NamedTuple", "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "TypedDict",
     "Protocol", "Exception", "BaseException",
 }
+
+# Queues whose maxsize defaults to 0, which means no limit (docs: library/queue,
+# library/asyncio-queue, library/multiprocessing).
+QUEUE_CTORS = {
+    "queue.Queue", "queue.LifoQueue", "queue.PriorityQueue",
+    "asyncio.Queue", "asyncio.LifoQueue", "asyncio.PriorityQueue",
+    "multiprocessing.Queue", "multiprocessing.JoinableQueue",
+}
+# Calls that choose a multiprocessing start method by name (docs: library/multiprocessing).
+START_METHOD_CALLS = {"multiprocessing.set_start_method", "multiprocessing.get_context"}
+# Calls that return a new object holding a copy of their inputs: a sequence of pieces as the
+# first argument, or the array to extend as the first argument (docs: pandas.concat, numpy.append).
+CONCAT_SEQUENCE_CALLS = {"pandas.concat", "numpy.concatenate", "numpy.vstack", "numpy.hstack"}
+CONCAT_FIRST_ARG_CALLS = {"numpy.append"}
+# Methods that add their one argument to a collection.
+STORE_METHODS = {"append", "appendleft", "add"}

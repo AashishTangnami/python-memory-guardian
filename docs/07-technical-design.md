@@ -77,7 +77,7 @@ The facts make the messages specific. For example, a message gives the size of a
 
 ### 4.2 Rules
 
-PMG has 22 rule codes in 8 families. The [rules reference](06-rules.md) lists each code, its trigger, and how to stop one warning.
+PMG has 26 rule codes in 8 families. The [rules reference](06-rules.md) lists each code, its trigger, and how to stop one warning.
 
 A rule gives a warning only when its pattern is clear. For example, `memory-swell.list-once` gives no warning if the code uses `len()` on the list. It also gives no warning if the code gets an item by index or uses the list two times. Then the list is necessary.
 
@@ -110,7 +110,7 @@ The profiler divides the time into three types:
 - **Native time.** The thread used the CPU in C code, for example in NumPy or in a compression library.
 - **Python time.** The thread used the CPU to run Python bytecode.
 
-To find native time, the profiler measures how long its own thread waits for the GIL. A long wait tells that C code held the GIL. A wait near zero, with CPU use, tells that C code released the GIL. Before the script starts, the profiler measures the normal delay of the timer, and it removes this delay from each wait. On a Python build without a GIL, the profiler cannot divide CPU time. It shows "unsplit" time.
+To find native time, the profiler measures how long its own thread waits for the GIL. A long wait tells that C code held the GIL. A wait near zero, with CPU use, tells that C code released the GIL. Before the script starts, the profiler measures the normal delay of the timer, and it removes this delay from each wait. The profiler thread can also lose the GIL while it records a sample, before it sleeps again. Then it waits for the full C call, for example `sorted()`. The profiler adds this wait too: the wall time of its work, less two times its own CPU time and four switch intervals. Normal changes of the GIL with Python code are shorter than this limit, so they do not change the result. On a Python build without a GIL, the profiler cannot divide CPU time. It shows "unsplit" time.
 
 The time split also needs a CPU clock for each thread. Linux has this clock. macOS and Windows do not have it. On these systems, the profiler uses the CPU time of the process for the main thread, and other threads get "unsplit" time. The profile field `per_thread_cpu` tells which case applies.
 
@@ -144,15 +144,15 @@ PMG does not use historical sampled `alloc`, `spike` or RSS fields as source all
 
 A snapshot stops your program while the profiler makes it. The profiler does not add this stop to the time of your lines.
 
-Snapshot cost increases with the traced memory. It is approximately 5 to 8 ns for each byte of `tracemalloc` bookkeeping. At 400 MB, one snapshot takes approximately 1.6 s. Thus normal snapshots have a limit of 10% of the traced time. The profiler checks this limit with the measured cost of the last large snapshot. A normal snapshot can use a maximum of half of the remaining limit. Thus a snapshot that costs two times the prediction stays inside the limit, and one large snapshot cannot stop the small snapshots that show a later leak. The peak snapshots have a separate limit. A short peak inside one C call that holds the GIL is not visible to the sampler. A snapshot each time the memory doubles captures this peak at half of its size or more.
+Snapshot cost increases with the traced memory. It is approximately 5 to 8 ns for each byte of `tracemalloc` bookkeeping. At 400 MB, one snapshot takes approximately 1.6 s. On a free-threaded build, the cost is much higher: 113 to 256 ns for each byte on the first snapshot of a state. Thus the profiler starts from a different prediction on these builds. Thus normal snapshots have a limit of 10% of the traced time. The profiler checks this limit with the measured cost of the last large snapshot. A normal snapshot can use a maximum of half of the remaining limit. Thus a snapshot that costs two times the prediction stays inside the limit, and one large snapshot cannot stop the small snapshots that show a later leak. The peak snapshots have a separate limit. A short peak inside one C call that holds the GIL is not visible to the sampler. A snapshot each time the memory doubles captures this peak at half of its size or more.
 
 **Memory without a line of your code.** A library can allocate memory deep in its own code. Then the 2-frame stack often has no frame of your code. An example is `import pandas`. The profile gives this memory as `unattributed_peak_mb`, and the status bar tooltip shows it. A larger traceback depth finds more of it, but it is slower. On a pandas import, 32 frames found 8 MB of 39 MB.
 
 **Leaks.** The profiler marks a line as a "suspected leak" when all these conditions are true:
 
-- The last five snapshots have no decrease above the noise limit.
+- The last six snapshots, which include the snapshot at exit, have no decrease above the noise limit.
 - At least three transitions increase by more than 1 KiB or 0.1% of the preceding value, whichever is larger.
-- At least one of the last two transitions increases. Total recent growth exceeds 64 KiB or 1% of the final value, whichever is larger.
+- At least one of the last three transitions increases. The snapshot at exit adds one transition but no time, so the rule accepts one more flat transition at the end. Total recent growth exceeds 64 KiB or 1% of the final value, whichever is larger.
 - At least 1 MB of it was in use at the end.
 
 This needs at least four snapshots. Thus a very short run can show no suspected leak. If your script stops `tracemalloc`, the precise data stops at that time, and the report tells when.

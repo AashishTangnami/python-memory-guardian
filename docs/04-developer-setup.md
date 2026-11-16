@@ -13,7 +13,7 @@ This guide is for working on the extension, its Python and Rust language servers
 | VS Code | 1.82+ | Extension Development Host |
 | VS Code extensions | Python + Python Debugger (`ms-python.debugpy`); rust-analyzer (optional) | Debugging |
 
-The example under `examples/containerized-app/` has a Dev Container configuration. This checkout has no root `.devcontainer/`, `.vscode/` (launch or tasks) or `.github/` folder; set up the tools above on your machine.
+The example under `examples/containerized-app/` has a Dev Container configuration. This checkout has no root `.devcontainer/` or `.vscode/` (launch or tasks) folder; set up the tools above on your machine. To run the Linux CI jobs in Docker instead, see [Run the Linux CI jobs in Docker](#run-the-linux-ci-jobs-in-docker).
 
 ## Install and build
 
@@ -86,7 +86,7 @@ npm test            # compile, parity, then all runtime tests
 | `node tests/client/test_editor_events.js`, `test_extension_lifecycle.js`, `test_report_entry.js`, `test_run_options.js` | editor events, lifecycle, the JSON-tab entry and Profile Current File options, with a simulated VS Code |
 | `node tests/client/test_container.js` | container path mapping, plus a simulated container run through an exec prefix |
 | `node tests/client/test_staging.js` | writes into `.pmg/`: stale profiler files removed, user files kept, symbolic links, hard links and pipes at a helper's path replaced and never followed or read (the pipe case runs in a child process with a timeout, so a regression fails instead of hanging), a linked `.pmg` refused, `writeFileAtomic` replacing a link at its target |
-| `node tests/client/test_pmg_writes.js` | the callers use those helpers: a profile run (host mode), a baseline save and the `summary.json` write each refuse a linked `.pmg` and replace a link planted at the target name |
+| `node tests/client/test_pmg_writes.js` | the callers use those helpers: a profile run (host mode), a baseline save and the `summary.json` write each refuse a linked `.pmg` and replace a link planted at the target name; it also checks that **Profile Current File** runs without an arguments prompt and the with-arguments command asks, passes them, and cancels on Escape |
 | `python tests/packaging/package_test.py path/to/extension.vsix` | a packaged VSIX: runtime files, development-file exclusions, and real LSP diagnostics from the extracted server. Not part of `npm test`; see [release steps](05-build-and-release.md#release-steps) |
 | `npm run test:acceptance` | compile, fresh Rust build and parity, then saved-artifact acceptance checks and overhead measurements. The runner verifies the reused Rust build is current. Exit 1 means failed cases; exit 2 means incomplete coverage. Add `--gate regression` to the runner to exit 0 when only documented coverage limits or an unrequested overhead run keep criteria from passing (CI uses this) |
 | `npm run test:guard` | independent growth/fixed and GIL/descendant-pressure witnesses, memory-budget enforcement and report validation. Unsupported OS cases exit 2 and remain incomplete; OS RSS observations require process visibility |
@@ -212,3 +212,26 @@ partial only because of a documented limit do not. It then runs
 `measure_overhead.py` as a non-blocking step, because the preregistered budgets
 assume a serial, isolated host; the numbers are saved with the evidence. The
 full gate (`npm run test:acceptance`) still requires every criterion and budget. Local validation does not establish matrix success.
+
+### Run the Linux CI jobs in Docker
+
+The root `docker-compose.yml` and `Dockerfile` are a local testing tool for the Linux jobs of `validate.yml`, with one Docker image per CI environment. Each image holds the toolchains and the pinned npm and pip dependencies; a container from it runs one job on your current code:
+
+```bash
+docker compose run --rm --build runtime-py39    # also runtime-py313, runtime-py313t, acceptance
+```
+
+| Service | Image | Python | Job script |
+|---|---|---|---|
+| `runtime-py39` | `pmg-ci:runtime-py3.9` | 3.9 (official image) | `runtime.sh` |
+| `runtime-py313` | `pmg-ci:runtime-py3.13` | 3.13 (official image) | `runtime.sh` |
+| `runtime-py313t` | `pmg-ci:runtime-py3.13t` | 3.13t (CPython source build with `--disable-gil`, as setup-python; no memray wheel) | `runtime.sh` |
+| `acceptance` | `pmg-ci:acceptance` | 3.13 (official image) | `acceptance.sh` |
+
+- The job scripts in `scripts/ci/` hold the steps. `runtime.sh` runs lint, compile, parity, each command of the `test:runtime` and `test:guard` npm scripts as its own step (read from `package.json`, so the list is kept in one place), then the package check. `acceptance.sh` runs the `--gate regression` acceptance suite, then the overhead measurement, which does not block. `lib.sh` runs every step even after a failure, prints a pass/FAIL list at the end, and exits 1 if a required step failed.
+- The `Dockerfile` builds from the repository root, and `/.dockerignore` sends only the dependency manifests. `.vscodeignore` keeps both files out of the VSIX, and `package_test.py` fails if they leak into it. Editing code never rebuilds an image; changing `package-lock.json` or a `requirements*.txt` does. Node is the latest release of major 22, as `setup-node` with `node-version: '22'` (`vsce` needs 22.12 or later).
+- `scripts/ci/entrypoint.sh` lays a clean tree from the read-only checkout over the installed dependencies: tracked and new files with your uncommitted edits, but nothing git ignores. Like a CI checkout, the tree has no `tests/profiler/out/` or Rust build, so failures that local build output hides also show here (for example `workload.py` writing into the ignored `tests/profiler/out/`).
+- Evidence (`guardian.vsix`, `tests/profiler/out/`, acceptance reports) is copied to `.validation/ci/<service>/`.
+- Run one service at a time: the profiler and memory-guard tests depend on timing and memory, so parallel jobs on one Docker VM interfere. Give the VM at least 4 GB of memory; each image takes about 3 GB of disk.
+- The images run on the host architecture. To match the x64 runners, set `DOCKER_DEFAULT_PLATFORM=linux/amd64`, which is slower under emulation. setup-python builds can differ from the official images: their debug symbols made memray site summaries larger on CI.
+- Not covered: Windows and macOS, which have no Linux containers, and the `container` job, which needs a Docker daemon whose bind-mount paths match the checkout.
