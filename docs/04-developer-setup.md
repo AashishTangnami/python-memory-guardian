@@ -115,7 +115,7 @@ The Python and Rust servers must produce the same diagnostic code, range, severi
 3. Mirror it in the module of the same name in `src/rust/src/` (tree-sitter). To check node shapes, install the optional development tools (see [Install and build](#install-and-build)) and print the parse tree; don't guess them.
 4. Add positive **and** negative cases to a fixture in `tests/fixtures/static/`, marked with `# expect: <code>`.
 5. Run `npm run build:rust && PMG_REQUIRE_RUST=1 npm run test:parity`. Both servers must produce the same output.
-6. Run `npm run lint:python`. The fixtures are only parsed, never run, so the tests pass on a case that reads a name before it is assigned (`total = total + x` with no earlier `total`), but Ruff rejects it as an undefined name and `npm run lint` fails on every CI runner. Pass such a name in as a function parameter.
+6. Run `npm run lint:python`. The fixtures are only parsed, never run, so the tests pass on a case that reads a name before it is assigned (`total = total + x` with no earlier `total`), but Ruff rejects it as an undefined name and `npm run lint` fails on every CI runner. Pass such a name in as a function parameter. Ruff also reports an `except ... as exc` name used inside a lambda or nested function, because Python unbinds it when the handler ends; when that use is the case under test, mark the line `# noqa: F821`.
 
 The [rules reference](06-rules.md) lists the current codes. Runtime profiling lives separately in `src/python/pmg_profile.py` and `src/python/pmg_profiler/`.
 

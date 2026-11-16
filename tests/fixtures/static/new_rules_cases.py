@@ -169,7 +169,7 @@ class Collector:
             self.errors.append(exc, *key)
             pending.put(exc)
             future.set_exception(exc)
-            self.callbacks.append(lambda: self.errors.append(exc))
+            self.callbacks.append(lambda: self.errors.append(exc))  # noqa: F821  (Python unbinds `exc` after the handler)
         except Exception:
             self.errors.append(key)
 
